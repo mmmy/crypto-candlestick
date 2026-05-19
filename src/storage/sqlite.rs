@@ -123,17 +123,25 @@ impl SqliteStore {
         end_time: Option<i64>,
         limit: u32,
     ) -> Result<Vec<StoredKline>, sqlx::Error> {
-        let mut sql = String::from(
-            "SELECT symbol, interval, open_time, close_time, open, high, low, close, volume, quote_volume, trade_count, is_closed \
-             FROM klines WHERE symbol = ? AND interval = ?",
-        );
+        let select_columns = "symbol, interval, open_time, close_time, open, high, low, close, volume, quote_volume, trade_count, is_closed";
+        let mut sql = if start_time.is_some() {
+            format!("SELECT {select_columns} FROM klines WHERE symbol = ? AND interval = ?")
+        } else {
+            format!(
+                "SELECT {select_columns} FROM (SELECT {select_columns} FROM klines WHERE symbol = ? AND interval = ?"
+            )
+        };
         if start_time.is_some() {
             sql.push_str(" AND open_time >= ?");
         }
         if end_time.is_some() {
             sql.push_str(" AND open_time <= ?");
         }
-        sql.push_str(" ORDER BY open_time ASC LIMIT ?");
+        if start_time.is_some() {
+            sql.push_str(" ORDER BY open_time ASC LIMIT ?");
+        } else {
+            sql.push_str(" ORDER BY open_time DESC LIMIT ?) ORDER BY open_time ASC");
+        }
 
         let mut query = sqlx::query(&sql).bind(symbol).bind(interval);
         if let Some(value) = start_time {
@@ -146,13 +154,15 @@ impl SqliteStore {
 
         let rows = query.fetch_all(&self.pool).await?;
         let mut items = Vec::with_capacity(rows.len());
+        let now_ms = chrono::Utc::now().timestamp_millis();
         for row in rows {
+            let close_time = row.try_get::<i64, _>("close_time")?;
             items.push(StoredKline {
                 symbol: row.try_get::<String, _>("symbol")?,
                 interval: row.try_get::<String, _>("interval")?,
                 candle: Candle {
                     open_time: row.try_get::<i64, _>("open_time")?,
-                    close_time: row.try_get::<i64, _>("close_time")?,
+                    close_time,
                     open: row.try_get::<f64, _>("open")?,
                     high: row.try_get::<f64, _>("high")?,
                     low: row.try_get::<f64, _>("low")?,
@@ -160,7 +170,7 @@ impl SqliteStore {
                     volume: row.try_get::<f64, _>("volume")?,
                     quote_volume: row.try_get::<f64, _>("quote_volume")?,
                     trade_count: row.try_get::<i64, _>("trade_count")? as u64,
-                    is_closed: row.try_get::<i64, _>("is_closed")? != 0,
+                    is_closed: row.try_get::<i64, _>("is_closed")? != 0 && close_time < now_ms,
                 },
             });
         }
@@ -184,13 +194,15 @@ impl SqliteStore {
         .await?;
 
         let mut items = Vec::with_capacity(rows.len());
+        let now_ms = chrono::Utc::now().timestamp_millis();
         for row in rows {
+            let close_time = row.try_get::<i64, _>("close_time")?;
             items.push(StoredKline {
                 symbol: row.try_get::<String, _>("symbol")?,
                 interval: row.try_get::<String, _>("interval")?,
                 candle: Candle {
                     open_time: row.try_get::<i64, _>("open_time")?,
-                    close_time: row.try_get::<i64, _>("close_time")?,
+                    close_time,
                     open: row.try_get::<f64, _>("open")?,
                     high: row.try_get::<f64, _>("high")?,
                     low: row.try_get::<f64, _>("low")?,
@@ -198,7 +210,7 @@ impl SqliteStore {
                     volume: row.try_get::<f64, _>("volume")?,
                     quote_volume: row.try_get::<f64, _>("quote_volume")?,
                     trade_count: row.try_get::<i64, _>("trade_count")? as u64,
-                    is_closed: row.try_get::<i64, _>("is_closed")? != 0,
+                    is_closed: row.try_get::<i64, _>("is_closed")? != 0 && close_time < now_ms,
                 },
             });
         }

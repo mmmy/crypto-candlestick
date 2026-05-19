@@ -82,3 +82,19 @@ fn exposes_native_kline_sources_for_rest_sync() {
     assert!(sources.contains(&("BTCUSDT".to_string(), "D".to_string(), "1d".to_string())));
     assert!(sources.contains(&("BTCUSDT".to_string(), "3D".to_string(), "3d".to_string())));
 }
+
+#[test]
+fn builds_market_stream_url_for_usdm_market_data() {
+    let plan = SubscriptionPlan::new(
+        vec!["BTCUSDT".to_string()],
+        vec![
+            Interval::parse("1").unwrap(),
+            Interval::parse("10").unwrap(),
+        ],
+    );
+
+    assert_eq!(
+        plan.stream_url(),
+        "wss://fstream.binance.com/market/stream?streams=btcusdt@kline_1m/btcusdt@kline_5m"
+    );
+}

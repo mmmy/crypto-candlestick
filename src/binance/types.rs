@@ -1,4 +1,7 @@
-use crate::{domain::candle::Candle, engine::aggregator::TradeTick};
+use crate::{
+    domain::{candle::Candle, interval::Interval},
+    engine::aggregator::TradeTick,
+};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -109,10 +112,13 @@ pub fn parse_combined_stream_message(
     match message.data {
         StreamEvent::Kline(event) => {
             let k = event.kline;
+            let interval = Interval::from_binance_interval(&k.interval)
+                .map(|interval| interval.canonical())
+                .unwrap_or(k.interval);
             let event = if k.is_closed {
                 MarketEvent::ClosedKline {
                     symbol: event.symbol,
-                    interval: k.interval,
+                    interval,
                     candle: Candle {
                         open_time: k.open_time,
                         close_time: k.close_time,
@@ -129,7 +135,7 @@ pub fn parse_combined_stream_message(
             } else {
                 MarketEvent::OpenKline {
                     symbol: event.symbol,
-                    interval: k.interval,
+                    interval,
                     candle: Candle {
                         open_time: k.open_time,
                         close_time: k.close_time,

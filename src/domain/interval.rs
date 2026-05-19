@@ -129,6 +129,26 @@ impl Interval {
         }
     }
 
+    pub fn from_binance_interval(input: &str) -> Option<Self> {
+        match input {
+            "1m" => Some(Self::Minutes(1)),
+            "3m" => Some(Self::Minutes(3)),
+            "5m" => Some(Self::Minutes(5)),
+            "15m" => Some(Self::Minutes(15)),
+            "30m" => Some(Self::Minutes(30)),
+            "1h" => Some(Self::Minutes(60)),
+            "2h" => Some(Self::Minutes(120)),
+            "4h" => Some(Self::Minutes(240)),
+            "6h" => Some(Self::Minutes(360)),
+            "8h" => Some(Self::Minutes(480)),
+            "12h" => Some(Self::Minutes(720)),
+            "1d" => Some(Self::Days(1)),
+            "3d" => Some(Self::Days(3)),
+            "1w" => Some(Self::Weeks(1)),
+            _ => None,
+        }
+    }
+
     pub fn aggregation_base(&self) -> Option<Self> {
         if self.binance_interval().is_some() {
             return None;

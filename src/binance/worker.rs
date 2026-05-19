@@ -13,6 +13,8 @@ use std::{
 use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
+const BINANCE_USDM_MARKET_WS_BASE: &str = "wss://fstream.binance.com/market/stream";
+
 #[derive(Debug, Clone)]
 pub struct KlineSource {
     pub symbol: String,
@@ -61,6 +63,13 @@ impl SubscriptionPlan {
         }
 
         streams.into_iter().collect()
+    }
+
+    pub fn stream_url(&self) -> String {
+        format!(
+            "{BINANCE_USDM_MARKET_WS_BASE}?streams={}",
+            self.streams().join("/")
+        )
     }
 
     pub fn aggregation_targets(&self) -> Vec<(String, String, String)> {
@@ -169,10 +178,11 @@ impl BinanceWorker {
             return;
         }
 
-        let url = format!(
-            "wss://fstream.binance.com/stream?streams={}",
-            streams.join("/")
-        );
+        if let Err(err) = self.seed_custom_aggregators().await {
+            tracing::warn!("failed to seed custom aggregators: {}", err);
+        }
+
+        let url = self.plan.stream_url();
 
         let mut backoff_secs = 1u64;
         loop {
@@ -217,15 +227,11 @@ impl BinanceWorker {
                 if let Ok(source_interval) = Interval::parse(&interval) {
                     let source = source_interval.canonical();
                     self.latest.upsert(&symbol, &source, candle.clone()).await;
-
-                    for (key, agg) in self.custom_aggregators.iter_mut() {
-                        if key.0 == symbol && key.1 == source {
-                            if agg.ingest_candle(candle.clone()).is_ok() {
-                                if let Some(current) = agg.current() {
-                                    self.latest.upsert(&symbol, &key.2, current).await;
-                                }
-                            }
-                        }
+                    if let Err(err) = self
+                        .refresh_custom_latest_from_open(&symbol, &source, candle)
+                        .await
+                    {
+                        tracing::warn!("failed to refresh custom latest: {}", err);
                     }
                 }
             }
@@ -245,7 +251,20 @@ impl BinanceWorker {
                                 let _ = self.store.upsert_candle(&symbol, &key.2, &closed).await;
                                 self.latest.remove(&symbol, &key.2).await;
                             }
-                            if let Some(current) = agg.current() {
+                            if agg
+                                .current()
+                                .map(|current| current.close_time <= candle.close_time)
+                                .unwrap_or(false)
+                            {
+                                if let Some(closed) = agg.flush() {
+                                    let _ =
+                                        self.store.upsert_candle(&symbol, &key.2, &closed).await;
+                                    self.latest.remove(&symbol, &key.2).await;
+                                }
+                            } else if let Some(mut current) = agg.current() {
+                                if chrono::Utc::now().timestamp_millis() <= current.close_time {
+                                    current.is_closed = false;
+                                }
                                 self.latest.upsert(&symbol, &key.2, current).await;
                             }
                         }
@@ -273,5 +292,86 @@ impl BinanceWorker {
             }
             MarketEvent::Ignored => {}
         }
+    }
+
+    async fn seed_custom_aggregators(&mut self) -> Result<(), sqlx::Error> {
+        for (key, agg) in self.custom_aggregators.iter_mut() {
+            let Ok(target_interval) = Interval::parse(&key.2) else {
+                continue;
+            };
+
+            let Some(latest_base_open_time) = self.store.max_open_time(&key.0, &key.1).await?
+            else {
+                continue;
+            };
+
+            let start_time = target_interval.bucket_start_ms(latest_base_open_time);
+            let rows = self
+                .store
+                .query_klines(&key.0, &key.1, Some(start_time), None, 10_000)
+                .await?;
+
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            for row in rows {
+                if row.candle.close_time < now_ms {
+                    let _ = agg.ingest_candle(row.candle);
+                }
+            }
+
+            if let Some(mut current) = agg.current() {
+                if chrono::Utc::now().timestamp_millis() <= current.close_time {
+                    current.is_closed = false;
+                }
+                self.latest.upsert(&key.0, &key.2, current).await;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn refresh_custom_latest_from_open(
+        &self,
+        symbol: &str,
+        source: &str,
+        open_candle: crate::domain::candle::Candle,
+    ) -> Result<(), sqlx::Error> {
+        let targets = self
+            .custom_aggregators
+            .keys()
+            .filter(|key| key.0 == symbol && key.1 == source)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for key in targets {
+            let Ok(target_interval) = Interval::parse(&key.2) else {
+                continue;
+            };
+            let start_time = target_interval.bucket_start_ms(open_candle.open_time);
+            let rows = self
+                .store
+                .query_klines(
+                    &key.0,
+                    &key.1,
+                    Some(start_time),
+                    Some(open_candle.open_time.saturating_sub(1)),
+                    10_000,
+                )
+                .await?;
+            let mut aggregator = Aggregator::new(target_interval);
+
+            for row in rows {
+                if row.candle.close_time < open_candle.open_time {
+                    let _ = aggregator.ingest_candle(row.candle);
+                }
+            }
+            let _ = aggregator.ingest_candle(open_candle.clone());
+
+            if let Some(mut current) = aggregator.current() {
+                current.is_closed = false;
+                self.latest.upsert(&key.0, &key.2, current).await;
+            }
+        }
+
+        Ok(())
     }
 }

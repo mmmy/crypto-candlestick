@@ -151,8 +151,8 @@ GET /api/klines?symbol=BTCUSDT&interval=1&limit=1000
     "symbol": "BTCUSDT",
     "interval": "1",
     "candle": {
-      "openTime": 1710000000000,
-      "closeTime": 1710000059999,
+      "openTime": "2024-03-10T00:00:00.000+08:00",
+      "closeTime": "2024-03-10T00:00:59.999+08:00",
       "open": 100.0,
       "high": 102.0,
       "low": 99.0,

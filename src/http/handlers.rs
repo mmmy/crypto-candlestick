@@ -184,10 +184,60 @@ pub struct KlineQuery {
     pub limit: Option<u32>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KlineResponse {
+    pub symbol: String,
+    pub interval: String,
+    pub candle: ApiCandle,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiCandle {
+    pub open_time: String,
+    pub close_time: String,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub volume: f64,
+    pub quote_volume: f64,
+    pub trade_count: u64,
+    pub is_closed: bool,
+}
+
+impl From<StoredKline> for KlineResponse {
+    fn from(row: StoredKline) -> Self {
+        Self {
+            symbol: row.symbol,
+            interval: row.interval,
+            candle: row.candle.into(),
+        }
+    }
+}
+
+impl From<Candle> for ApiCandle {
+    fn from(candle: Candle) -> Self {
+        Self {
+            open_time: format_timestamp_ms(candle.open_time),
+            close_time: format_timestamp_ms(candle.close_time),
+            open: candle.open,
+            high: candle.high,
+            low: candle.low,
+            close: candle.close,
+            volume: candle.volume,
+            quote_volume: candle.quote_volume,
+            trade_count: candle.trade_count,
+            is_closed: candle.is_closed,
+        }
+    }
+}
+
 pub async fn klines(
     State(state): State<AppState>,
     Query(query): Query<KlineQuery>,
-) -> Result<Json<Vec<StoredKline>>, (axum::http::StatusCode, String)> {
+) -> Result<Json<Vec<KlineResponse>>, (axum::http::StatusCode, String)> {
     let interval = Interval::parse(&query.interval)
         .map_err(|err| (axum::http::StatusCode::BAD_REQUEST, err.to_string()))?;
     let canonical_interval = interval.canonical();
@@ -259,5 +309,5 @@ pub async fn klines(
         }
     }
 
-    Ok(Json(rows))
+    Ok(Json(rows.into_iter().map(KlineResponse::from).collect()))
 }

@@ -138,7 +138,14 @@ async fn klines_endpoint_returns_persisted_rows() {
     assert_eq!(body.as_array().unwrap().len(), 1);
     assert_eq!(body[0]["symbol"], "BTCUSDT");
     assert_eq!(body[0]["interval"], "1");
-    assert_eq!(body[0]["candle"]["openTime"], 1000);
+    assert_eq!(
+        body[0]["candle"]["openTime"],
+        "1970-01-01T08:00:01.000+08:00"
+    );
+    assert_eq!(
+        body[0]["candle"]["closeTime"],
+        "1970-01-01T08:00:01.999+08:00"
+    );
 
     server.abort();
 }
@@ -209,7 +216,14 @@ async fn klines_endpoint_appends_latest_open_candle_from_memory() {
     assert_eq!(response.status(), StatusCode::OK);
     let body: serde_json::Value = response.json().await.unwrap();
     assert_eq!(body.as_array().unwrap().len(), 2);
-    assert_eq!(body[1]["candle"]["openTime"], 60_000);
+    assert_eq!(
+        body[1]["candle"]["openTime"],
+        "1970-01-01T08:01:00.000+08:00"
+    );
+    assert_eq!(
+        body[1]["candle"]["closeTime"],
+        "1970-01-01T08:01:59.999+08:00"
+    );
     assert_eq!(body[1]["candle"]["isClosed"], false);
 
     server.abort();

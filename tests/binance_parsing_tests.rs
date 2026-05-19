@@ -36,7 +36,7 @@ fn parses_closed_kline_event() {
             candle,
         } => {
             assert_eq!(symbol, "BTCUSDT");
-            assert_eq!(interval, "1m");
+            assert_eq!(interval, "1");
             assert_eq!(candle.open_time, 1710000000000);
             assert_eq!(candle.close, 101.0);
         }
@@ -80,7 +80,7 @@ fn parses_open_kline_event_without_marking_it_closed() {
             candle,
         } => {
             assert_eq!(symbol, "BTCUSDT");
-            assert_eq!(interval, "1m");
+            assert_eq!(interval, "1");
             assert_eq!(candle.open_time, 1710000000000);
             assert_eq!(candle.close, 100.5);
             assert!(!candle.is_closed);

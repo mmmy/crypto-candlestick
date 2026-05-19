@@ -1,0 +1,79 @@
+use crypto_candlestick::binance::rest::parse_rest_klines;
+use crypto_candlestick::binance::rest::rebuild_custom_klines;
+use crypto_candlestick::binance::worker::SubscriptionPlan;
+use crypto_candlestick::domain::candle::Candle;
+use crypto_candlestick::domain::interval::Interval;
+use crypto_candlestick::storage::sqlite::SqliteStore;
+
+#[test]
+fn parses_rest_kline_array() {
+    let payload = serde_json::json!([[
+        1710000000000i64,
+        "100.0",
+        "102.0",
+        "99.0",
+        "101.0",
+        "12.5",
+        1710000059999i64,
+        "1250.0",
+        42,
+        "4.5",
+        "450.0",
+        "0"
+    ]]);
+
+    let rows = parse_rest_klines(payload).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].open_time, 1710000000000);
+    assert_eq!(rows[0].close_time, 1710000059999);
+    assert_eq!(rows[0].open, 100.0);
+    assert_eq!(rows[0].close, 101.0);
+    assert_eq!(rows[0].trade_count, 42);
+    assert!(rows[0].is_closed);
+}
+
+#[tokio::test]
+async fn rebuilds_custom_interval_from_native_base_rows() {
+    let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    for index in 0..2 {
+        let open_time = index * 60_000;
+        store
+            .upsert_candle(
+                "BTCUSDT",
+                "1",
+                &Candle {
+                    open_time,
+                    close_time: open_time + 59_999,
+                    open: 100.0 + index as f64,
+                    high: 102.0 + index as f64,
+                    low: 99.0,
+                    close: 101.0 + index as f64,
+                    volume: 10.0,
+                    quote_volume: 1_000.0,
+                    trade_count: 10,
+                    is_closed: true,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    let plan = SubscriptionPlan::new(
+        vec!["BTCUSDT".to_string()],
+        vec![Interval::parse("2").unwrap()],
+    );
+    rebuild_custom_klines(&store, &plan, 100).await.unwrap();
+
+    let rows = store
+        .query_klines("BTCUSDT", "2", None, None, 10)
+        .await
+        .unwrap();
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].candle.open_time, 0);
+    assert_eq!(rows[0].candle.close_time, 119_999);
+    assert_eq!(rows[0].candle.open, 100.0);
+    assert_eq!(rows[0].candle.high, 103.0);
+    assert_eq!(rows[0].candle.close, 102.0);
+    assert_eq!(rows[0].candle.volume, 20.0);
+}

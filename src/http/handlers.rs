@@ -34,6 +34,7 @@ pub struct SeriesHealth {
     pub symbol: String,
     pub interval: String,
     pub latest_open_time: Option<String>,
+    pub latest_lag_intervals: Option<u32>,
     pub consecutive_bars_from_latest: u32,
     pub checked_bars: usize,
     pub source: &'static str,
@@ -92,12 +93,16 @@ pub async fn deep_health(
         let latest_open_time = candles_desc
             .first()
             .map(|candle| format_timestamp_ms(candle.open_time));
+        let latest_lag_intervals = candles_desc
+            .first()
+            .map(|candle| latest_lag_intervals(&interval, candle.open_time));
         let consecutive_bars_from_latest = consecutive_bars_from_latest(&candles_desc, interval_ms);
 
         series.push(SeriesHealth {
             symbol: target.symbol.to_uppercase(),
             interval: canonical_interval,
             latest_open_time,
+            latest_lag_intervals,
             consecutive_bars_from_latest,
             checked_bars: candles_desc.len(),
             source,
@@ -135,6 +140,38 @@ fn format_timestamp_ms(timestamp_ms: i64) -> String {
         .single()
         .map(|timestamp| timestamp.to_rfc3339_opts(SecondsFormat::Millis, true))
         .unwrap_or_else(|| timestamp_ms.to_string())
+}
+
+fn latest_lag_intervals(interval: &Interval, latest_open_time: i64) -> u32 {
+    let now_ms = Local::now().timestamp_millis();
+    latest_lag_intervals_at(interval, latest_open_time, now_ms)
+}
+
+fn latest_lag_intervals_at(interval: &Interval, latest_open_time: i64, now_ms: i64) -> u32 {
+    let interval_ms = interval.as_millis() as i64;
+    let current_bucket_start = interval.bucket_start_ms(now_ms);
+    if current_bucket_start <= latest_open_time {
+        return 0;
+    }
+
+    ((current_bucket_start - latest_open_time) / interval_ms) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn calculates_latest_lag_from_current_bucket_start() {
+        let interval = Interval::parse("1").unwrap();
+        let now_ms = 1779105961000; // 2026-05-19 20:06:01 +08:00
+        let latest_open_time = 1779105720000; // 2026-05-19 20:02:00 +08:00
+
+        assert_eq!(
+            latest_lag_intervals_at(&interval, latest_open_time, now_ms),
+            4
+        );
+    }
 }
 
 #[derive(Debug, Deserialize)]

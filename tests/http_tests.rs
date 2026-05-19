@@ -91,6 +91,7 @@ async fn deep_health_reports_consecutive_closed_klines_from_latest() {
         body["series"][0]["latestOpenTime"],
         expected_latest_open_time
     );
+    assert!(body["series"][0]["latestLagIntervals"].as_u64().unwrap() > 0);
     assert_eq!(body["series"][0]["consecutiveBarsFromLatest"], 2);
 
     server.abort();

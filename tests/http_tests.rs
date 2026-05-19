@@ -81,7 +81,10 @@ async fn deep_health_reports_consecutive_closed_klines_from_latest() {
     assert_eq!(body["ok"], true);
     assert_eq!(body["series"][0]["symbol"], "BTCUSDT");
     assert_eq!(body["series"][0]["interval"], "1");
-    assert_eq!(body["series"][0]["latestOpenTime"], 240_000);
+    assert_eq!(
+        body["series"][0]["latestOpenTime"],
+        "1970-01-01T00:04:00.000Z"
+    );
     assert_eq!(body["series"][0]["consecutiveBarsFromLatest"], 2);
 
     server.abort();

@@ -7,6 +7,7 @@ use axum::{
     extract::{Query, State},
     Json,
 };
+use chrono::{SecondsFormat, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize)]
@@ -32,7 +33,7 @@ pub struct DeepHealthResponse {
 pub struct SeriesHealth {
     pub symbol: String,
     pub interval: String,
-    pub latest_open_time: Option<i64>,
+    pub latest_open_time: Option<String>,
     pub consecutive_bars_from_latest: u32,
     pub checked_bars: usize,
     pub source: &'static str,
@@ -88,7 +89,9 @@ pub async fn deep_health(
             )
         };
 
-        let latest_open_time = candles_desc.first().map(|candle| candle.open_time);
+        let latest_open_time = candles_desc
+            .first()
+            .map(|candle| format_timestamp_ms(candle.open_time));
         let consecutive_bars_from_latest = consecutive_bars_from_latest(&candles_desc, interval_ms);
 
         series.push(SeriesHealth {
@@ -124,6 +127,13 @@ fn consecutive_bars_from_latest(candles_desc: &[Candle], interval_ms: i64) -> u3
     }
 
     count
+}
+
+fn format_timestamp_ms(timestamp_ms: i64) -> String {
+    Utc.timestamp_millis_opt(timestamp_ms)
+        .single()
+        .map(|timestamp| timestamp.to_rfc3339_opts(SecondsFormat::Millis, true))
+        .unwrap_or_else(|| timestamp_ms.to_string())
 }
 
 #[derive(Debug, Deserialize)]

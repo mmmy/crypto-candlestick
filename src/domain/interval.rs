@@ -43,20 +43,19 @@ impl Interval {
         if last.is_ascii_alphabetic() {
             let number = &trimmed[..trimmed.len() - last.len_utf8()];
             let value = parse_positive_u32(number, input)?;
-            return match last {
-                's' | 'S' => Ok(Self::Seconds(value)),
-                'm' | 'M' => Ok(Self::Minutes(value)),
-                'd' | 'D' => Ok(Self::Days(value)),
-                'h' | 'H' => Ok(Self::Minutes(value.saturating_mul(60))),
-                'w' | 'W' => Ok(Self::Weeks(value)),
+            let interval = match last {
+                's' | 'S' => Self::Seconds(value),
+                'd' | 'D' => Self::Days(value),
+                'w' | 'W' => Self::Weeks(value),
                 _ => Err(IntervalParseError {
                     input: input.to_owned(),
-                }),
+                })?,
             };
+            return validate_supported(interval, input);
         }
 
         let value = parse_positive_u32(trimmed, input)?;
-        Ok(Self::Minutes(value))
+        validate_supported(Self::Minutes(value), input)
     }
 
     pub fn as_millis(&self) -> u64 {
@@ -136,11 +135,45 @@ impl Interval {
         }
 
         match self {
-            Self::Minutes(_) => Some(Self::Minutes(1)),
+            Self::Minutes(minutes) => native_minute_bases()
+                .iter()
+                .rev()
+                .copied()
+                .find(|base| *base < *minutes && minutes % base == 0)
+                .map(Self::Minutes),
             Self::Days(_) => Some(Self::Days(1)),
             _ => None,
         }
     }
+}
+
+fn validate_supported(interval: Interval, input: &str) -> Result<Interval, IntervalParseError> {
+    if is_supported(interval) {
+        Ok(interval)
+    } else {
+        Err(IntervalParseError {
+            input: input.to_owned(),
+        })
+    }
+}
+
+fn is_supported(interval: Interval) -> bool {
+    match interval {
+        Interval::Seconds(value) => [15, 30, 45].contains(&value),
+        Interval::Minutes(value) => supported_minutes().contains(&value),
+        Interval::Days(value) => [1, 2, 3, 4, 10].contains(&value),
+        Interval::Weeks(value) => value == 1,
+    }
+}
+
+fn supported_minutes() -> &'static [u32] {
+    &[
+        1, 2, 3, 4, 5, 8, 10, 15, 20, 30, 45, 60, 90, 120, 180, 240, 360, 480, 720,
+    ]
+}
+
+fn native_minute_bases() -> &'static [u32] {
+    &[1, 3, 5, 15, 30, 60, 120, 240, 360, 480, 720]
 }
 
 fn parse_positive_u32(raw: &str, input: &str) -> Result<u32, IntervalParseError> {

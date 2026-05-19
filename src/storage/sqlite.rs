@@ -167,6 +167,44 @@ impl SqliteStore {
         Ok(items)
     }
 
+    pub async fn query_latest_klines_desc(
+        &self,
+        symbol: &str,
+        interval: &str,
+        limit: u32,
+    ) -> Result<Vec<StoredKline>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT symbol, interval, open_time, close_time, open, high, low, close, volume, quote_volume, trade_count, is_closed \
+             FROM klines WHERE symbol = ? AND interval = ? ORDER BY open_time DESC LIMIT ?",
+        )
+        .bind(symbol)
+        .bind(interval)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut items = Vec::with_capacity(rows.len());
+        for row in rows {
+            items.push(StoredKline {
+                symbol: row.try_get::<String, _>("symbol")?,
+                interval: row.try_get::<String, _>("interval")?,
+                candle: Candle {
+                    open_time: row.try_get::<i64, _>("open_time")?,
+                    close_time: row.try_get::<i64, _>("close_time")?,
+                    open: row.try_get::<f64, _>("open")?,
+                    high: row.try_get::<f64, _>("high")?,
+                    low: row.try_get::<f64, _>("low")?,
+                    close: row.try_get::<f64, _>("close")?,
+                    volume: row.try_get::<f64, _>("volume")?,
+                    quote_volume: row.try_get::<f64, _>("quote_volume")?,
+                    trade_count: row.try_get::<i64, _>("trade_count")? as u64,
+                    is_closed: row.try_get::<i64, _>("is_closed")? != 0,
+                },
+            });
+        }
+        Ok(items)
+    }
+
     pub async fn max_open_time(
         &self,
         symbol: &str,

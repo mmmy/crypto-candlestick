@@ -181,3 +181,4 @@ git add src/http/routes.rs src/http/handlers.rs src/binance/ws.rs src/main.rs te
 git commit -m "feat: add http api and binance ingestion"
 ```
 
+ '10D', 'W','4D', '3D','2D', 'D','720', '480','360','240', '180', '120', '90', '60', '45', '30', '20', '15', '10', '8', '5', '4', '3', '2', '1', '45S', '30S', '15S

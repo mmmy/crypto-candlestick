@@ -7,7 +7,7 @@ use axum::{
     extract::{Query, State},
     Json,
 };
-use chrono::{SecondsFormat, TimeZone, Utc};
+use chrono::{Local, SecondsFormat, TimeZone};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize)]
@@ -130,7 +130,8 @@ fn consecutive_bars_from_latest(candles_desc: &[Candle], interval_ms: i64) -> u3
 }
 
 fn format_timestamp_ms(timestamp_ms: i64) -> String {
-    Utc.timestamp_millis_opt(timestamp_ms)
+    Local
+        .timestamp_millis_opt(timestamp_ms)
         .single()
         .map(|timestamp| timestamp.to_rfc3339_opts(SecondsFormat::Millis, true))
         .unwrap_or_else(|| timestamp_ms.to_string())

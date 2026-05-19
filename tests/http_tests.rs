@@ -1,4 +1,5 @@
 use axum::http::StatusCode;
+use chrono::{Local, SecondsFormat, TimeZone};
 use crypto_candlestick::domain::candle::Candle;
 use crypto_candlestick::http::{router, AppState, HealthTarget};
 use crypto_candlestick::memory::{LatestCache, MemorySeriesStore};
@@ -81,9 +82,14 @@ async fn deep_health_reports_consecutive_closed_klines_from_latest() {
     assert_eq!(body["ok"], true);
     assert_eq!(body["series"][0]["symbol"], "BTCUSDT");
     assert_eq!(body["series"][0]["interval"], "1");
+    let expected_latest_open_time = Local
+        .timestamp_millis_opt(240_000)
+        .single()
+        .unwrap()
+        .to_rfc3339_opts(SecondsFormat::Millis, true);
     assert_eq!(
         body["series"][0]["latestOpenTime"],
-        "1970-01-01T00:04:00.000Z"
+        expected_latest_open_time
     );
     assert_eq!(body["series"][0]["consecutiveBarsFromLatest"], 2);
 

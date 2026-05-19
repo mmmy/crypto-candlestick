@@ -47,12 +47,36 @@ fn maps_custom_intervals_to_base_interval() {
         "1"
     );
     assert_eq!(
+        Interval::parse("10")
+            .unwrap()
+            .aggregation_base()
+            .unwrap()
+            .canonical(),
+        "5"
+    );
+    assert_eq!(
+        Interval::parse("20")
+            .unwrap()
+            .aggregation_base()
+            .unwrap()
+            .canonical(),
+        "5"
+    );
+    assert_eq!(
         Interval::parse("45")
             .unwrap()
             .aggregation_base()
             .unwrap()
             .canonical(),
-        "1"
+        "15"
+    );
+    assert_eq!(
+        Interval::parse("90")
+            .unwrap()
+            .aggregation_base()
+            .unwrap()
+            .canonical(),
+        "30"
     );
     assert_eq!(
         Interval::parse("180")
@@ -60,7 +84,7 @@ fn maps_custom_intervals_to_base_interval() {
             .aggregation_base()
             .unwrap()
             .canonical(),
-        "1"
+        "60"
     );
     assert_eq!(
         Interval::parse("2D")
@@ -80,4 +104,11 @@ fn maps_custom_intervals_to_base_interval() {
     );
     assert!(Interval::parse("60").unwrap().aggregation_base().is_none());
     assert!(Interval::parse("15S").unwrap().aggregation_base().is_none());
+}
+
+#[test]
+fn rejects_unsupported_intervals() {
+    for raw in ["7", "11", "6D", "2W", "60S", "1H"] {
+        assert!(Interval::parse(raw).is_err(), "{raw} should be unsupported");
+    }
 }

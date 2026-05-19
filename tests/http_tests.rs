@@ -1,6 +1,6 @@
 use axum::http::StatusCode;
 use crypto_candlestick::domain::candle::Candle;
-use crypto_candlestick::http::{router, AppState};
+use crypto_candlestick::http::{router, AppState, HealthTarget};
 use crypto_candlestick::memory::{LatestCache, MemorySeriesStore};
 use crypto_candlestick::storage::sqlite::SqliteStore;
 
@@ -11,6 +11,7 @@ async fn health_endpoint_returns_ok() {
         store,
         latest: LatestCache::default(),
         memory_series: MemorySeriesStore::default(),
+        health_targets: Vec::new(),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -26,6 +27,62 @@ async fn health_endpoint_returns_ok() {
     assert_eq!(response.status(), StatusCode::OK);
     let body: serde_json::Value = response.json().await.unwrap();
     assert_eq!(body["ok"], true);
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn deep_health_reports_consecutive_closed_klines_from_latest() {
+    let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    for open_time in [0, 60_000, 180_000, 240_000] {
+        store
+            .upsert_candle(
+                "BTCUSDT",
+                "1",
+                &Candle {
+                    open_time,
+                    close_time: open_time + 59_999,
+                    open: 100.0,
+                    high: 101.0,
+                    low: 99.0,
+                    close: 100.5,
+                    volume: 12.5,
+                    quote_volume: 1_250.0,
+                    trade_count: 3,
+                    is_closed: true,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    let app = router(AppState {
+        store,
+        latest: LatestCache::default(),
+        memory_series: MemorySeriesStore::default(),
+        health_targets: vec![HealthTarget {
+            symbol: "BTCUSDT".to_string(),
+            interval: "1".to_string(),
+        }],
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let response = reqwest::get(format!("http://{addr}/api/health/deep"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["series"][0]["symbol"], "BTCUSDT");
+    assert_eq!(body["series"][0]["interval"], "1");
+    assert_eq!(body["series"][0]["latestOpenTime"], 240_000);
+    assert_eq!(body["series"][0]["consecutiveBarsFromLatest"], 2);
 
     server.abort();
 }
@@ -51,6 +108,7 @@ async fn klines_endpoint_returns_persisted_rows() {
         store,
         latest: LatestCache::default(),
         memory_series: MemorySeriesStore::default(),
+        health_targets: Vec::new(),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -123,6 +181,7 @@ async fn klines_endpoint_appends_latest_open_candle_from_memory() {
         store,
         latest,
         memory_series: MemorySeriesStore::default(),
+        health_targets: Vec::new(),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -194,6 +253,7 @@ async fn second_interval_query_reads_closed_rows_from_memory_not_sqlite() {
         store,
         latest,
         memory_series,
+        health_targets: Vec::new(),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

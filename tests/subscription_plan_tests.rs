@@ -20,6 +20,7 @@ fn subscribes_native_klines_directly_and_only_aggregates_custom_intervals() {
 
     assert!(streams.contains(&"btcusdt@aggTrade".to_string()));
     assert!(streams.contains(&"btcusdt@kline_1m".to_string()));
+    assert!(streams.contains(&"btcusdt@kline_30m".to_string()));
     assert!(streams.contains(&"btcusdt@kline_1h".to_string()));
     assert!(streams.contains(&"btcusdt@kline_1d".to_string()));
     assert!(streams.contains(&"btcusdt@kline_3d".to_string()));
@@ -35,7 +36,7 @@ fn subscribes_native_klines_directly_and_only_aggregates_custom_intervals() {
     )));
     assert!(aggregation_targets.contains(&(
         "BTCUSDT".to_string(),
-        "1".to_string(),
+        "30".to_string(),
         "90".to_string()
     )));
     assert!(aggregation_targets.contains(&(
@@ -54,7 +55,9 @@ fn subscribes_native_klines_directly_and_only_aggregates_custom_intervals() {
 fn exposes_native_kline_sources_for_rest_sync() {
     let intervals = vec![
         Interval::parse("2").unwrap(),
+        Interval::parse("20").unwrap(),
         Interval::parse("60").unwrap(),
+        Interval::parse("90").unwrap(),
         Interval::parse("2D").unwrap(),
         Interval::parse("3D").unwrap(),
     ];
@@ -73,6 +76,8 @@ fn exposes_native_kline_sources_for_rest_sync() {
         .collect::<Vec<_>>();
 
     assert!(sources.contains(&("BTCUSDT".to_string(), "1".to_string(), "1m".to_string())));
+    assert!(sources.contains(&("BTCUSDT".to_string(), "5".to_string(), "5m".to_string())));
+    assert!(sources.contains(&("BTCUSDT".to_string(), "30".to_string(), "30m".to_string())));
     assert!(sources.contains(&("BTCUSDT".to_string(), "60".to_string(), "1h".to_string())));
     assert!(sources.contains(&("BTCUSDT".to_string(), "D".to_string(), "1d".to_string())));
     assert!(sources.contains(&("BTCUSDT".to_string(), "3D".to_string(), "3d".to_string())));

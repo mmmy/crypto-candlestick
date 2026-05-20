@@ -3,6 +3,7 @@ pub mod config;
 pub mod domain;
 pub mod engine;
 pub mod http;
+pub mod logging;
 pub mod memory;
 pub mod runtime_health;
 pub mod storage;

@@ -1,18 +1,16 @@
 use crypto_candlestick::binance::{rest::sync_native_klines, worker::BinanceWorker};
 use crypto_candlestick::config::AppConfig;
 use crypto_candlestick::http::{router, AppState, HealthTarget};
+use crypto_candlestick::logging;
 use crypto_candlestick::memory::{LatestCache, MemorySeriesStore};
 use crypto_candlestick::runtime_health::RuntimeHealth;
 use crypto_candlestick::storage::sqlite::SqliteStore;
-use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
-
     let config = AppConfig::load();
+    let _log_guard = logging::init(&config.log_dir)?;
+    tracing::info!(log_dir = %config.log_dir, "logging initialized");
 
     let store =
         SqliteStore::connect_with_retention(&config.database_url, config.retention_bars).await?;

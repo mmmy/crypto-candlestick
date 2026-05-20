@@ -85,6 +85,7 @@ cargo run
 | `RETENTION_BARS` | `5000` | 每个交易对/周期最多保留的已存储 K 线数量，设为 `0` 表示不裁剪 |
 | `SYNC_ON_START` | `true` | 启动时是否同步历史 K 线 |
 | `SYNC_LOOKBACK_BARS` | `1500` | 没有本地历史时，启动同步回看的 K 线数量 |
+| `LOG_DIR` | `logs` | 按天滚动日志文件目录，同时保留控制台日志输出 |
 
 示例：
 
@@ -96,7 +97,29 @@ BINANCE_INTERVALS=15S,30S,1,5,15,60,D,W
 RETENTION_BARS=5000
 SYNC_ON_START=true
 SYNC_LOOKBACK_BARS=1500
+LOG_DIR=logs
 ```
+
+## 日志
+
+服务默认同时输出控制台日志和按天滚动的文件日志。文件日志写入 `LOG_DIR` 指定目录，默认目录为 `logs/`，文件名形如 `crypto-candlestick.log.YYYY-MM-DD`。
+
+通过 `RUST_LOG` 控制日志级别：
+
+Windows PowerShell:
+
+```powershell
+$env:RUST_LOG="info"
+cargo run
+```
+
+Linux/macOS:
+
+```bash
+RUST_LOG=info cargo run
+```
+
+排查 WebSocket 实时性问题时，建议使用 `RUST_LOG=info`；需要更详细的依赖库日志时可以临时提高到 `debug`。
 
 ## HTTP 接口
 

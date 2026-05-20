@@ -10,6 +10,7 @@ pub struct AppConfig {
     pub retention_bars: u32,
     pub sync_on_start: bool,
     pub sync_lookback_bars: u32,
+    pub log_dir: String,
 }
 
 impl AppConfig {
@@ -45,6 +46,7 @@ impl AppConfig {
             sync_lookback_bars: lookup("SYNC_LOOKBACK_BARS")
                 .and_then(|value| value.parse::<u32>().ok())
                 .unwrap_or(1500),
+            log_dir: lookup("LOG_DIR").unwrap_or_else(|| "logs".to_string()),
         }
     }
 }

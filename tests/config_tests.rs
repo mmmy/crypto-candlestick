@@ -10,6 +10,7 @@ fn builds_config_from_environment_values() {
         ("RETENTION_BARS", "1234"),
         ("SYNC_ON_START", "false"),
         ("SYNC_LOOKBACK_BARS", "777"),
+        ("LOG_DIR", "custom-logs"),
     ]);
 
     assert_eq!(config.database_url, "sqlite://custom.db");
@@ -19,4 +20,5 @@ fn builds_config_from_environment_values() {
     assert_eq!(config.retention_bars, 1234);
     assert!(!config.sync_on_start);
     assert_eq!(config.sync_lookback_bars, 777);
+    assert_eq!(config.log_dir, "custom-logs");
 }

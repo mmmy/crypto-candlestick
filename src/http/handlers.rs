@@ -330,5 +330,18 @@ pub async fn klines(
         }
     }
 
+    truncate_at_first_gap(&mut rows, interval.as_millis() as i64);
+
     Ok(Json(rows.into_iter().map(KlineResponse::from).collect()))
+}
+
+fn truncate_at_first_gap(rows: &mut Vec<StoredKline>, interval_ms: i64) {
+    let Some(gap_index) = rows
+        .windows(2)
+        .position(|pair| pair[1].candle.open_time - pair[0].candle.open_time != interval_ms)
+    else {
+        return;
+    };
+
+    rows.truncate(gap_index + 1);
 }

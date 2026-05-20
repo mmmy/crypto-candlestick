@@ -374,6 +374,87 @@ async fn klines_endpoint_appends_latest_open_candle_from_memory() {
 }
 
 #[tokio::test]
+async fn klines_endpoint_truncates_at_first_gap_before_returning() {
+    let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let latest = LatestCache::default();
+
+    for open_time in [0, 60_000] {
+        store
+            .upsert_candle(
+                "BTCUSDT",
+                "1",
+                &Candle {
+                    open_time,
+                    close_time: open_time + 59_999,
+                    open: 100.0,
+                    high: 101.0,
+                    low: 99.0,
+                    close: 100.5,
+                    volume: 12.5,
+                    quote_volume: 1_250.0,
+                    trade_count: 3,
+                    is_closed: true,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    latest
+        .upsert(
+            "BTCUSDT",
+            "1",
+            Candle {
+                open_time: 180_000,
+                close_time: 239_999,
+                open: 101.0,
+                high: 102.0,
+                low: 100.0,
+                close: 101.5,
+                volume: 8.0,
+                quote_volume: 812.0,
+                trade_count: 4,
+                is_closed: false,
+            },
+        )
+        .await;
+
+    let app = router(AppState {
+        store,
+        latest,
+        memory_series: MemorySeriesStore::default(),
+        health_targets: Vec::new(),
+        runtime_health: RuntimeHealth::default(),
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let response = reqwest::get(format!(
+        "http://{addr}/api/klines?symbol=BTCUSDT&interval=1&limit=10"
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body.as_array().unwrap().len(), 2);
+    assert_eq!(
+        body[0]["candle"]["openTime"],
+        "1970-01-01T08:00:00.000+08:00"
+    );
+    assert_eq!(
+        body[1]["candle"]["openTime"],
+        "1970-01-01T08:01:00.000+08:00"
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
 async fn second_interval_query_reads_closed_rows_from_memory_not_sqlite() {
     let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
     let latest = LatestCache::default();

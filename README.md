@@ -9,7 +9,8 @@
 - 分钟级、日线、周线 K 线写入 SQLite；秒级 K 线保存在内存中。
 - 查询结果会合并当前未收盘 K 线，便于前端展示实时蜡烛图。
 - 启动时可按配置同步历史 K 线，并重建自定义聚合周期。
-- 提供基础健康检查和逐交易对/周期的深度健康检查。
+- WebSocket 断开后自动退避重连，长时间无消息会主动重连。
+- 提供基础健康检查、WebSocket 状态和逐交易对/周期的深度健康检查。
 
 ## 支持的周期
 
@@ -60,6 +61,18 @@ cargo run
 ```
 
 默认监听地址为 `127.0.0.1:3000`。首次启动时，如果 `SYNC_ON_START=true`，服务会先从 Binance REST 拉取一段历史 K 线，再连接 WebSocket 进入实时更新。
+
+## 实时性与故障处理
+
+服务通过 Binance combined WebSocket stream 接收实时数据。连接成功后会记录 WebSocket 状态；收到行情文本消息、Ping 或 Pong 时会刷新最近消息时间。
+
+断线或读取失败时，后台 worker 会写入 warn 日志，更新 `/api/health/deep` 中的 WebSocket 状态，并按 `1s, 2s, 4s ... 30s` 的退避节奏重连。重连成功后会使用同一个 stream URL 重新订阅。
+
+如果连接没有显式断开，但 60 秒没有收到任何 WebSocket 消息，worker 会判定为空闲超时，主动断开当前读取循环并重连。此时深度健康检查中的 `websocket.ok` 会变为 `false`，`reason` 为 `websocket message stream is stale`。
+
+深度健康检查还会检查每个交易对/周期的最新 K 线是否落后：分钟级及以上周期允许最多落后 2 根，秒级周期允许最多落后 4 根。超过阈值时，对应序列的 `ok=false`，`reason` 为 `latest candle is stale`，整体 `ok` 也会变为 `false`。
+
+> 注意：当前 REST 补历史只在启动时执行。WebSocket 断线期间的分钟级及以上 K 线，如果需要在重连后立即补齐，可在后续增加重连后的 REST catch-up 任务。
 
 ## 配置项
 
@@ -114,18 +127,44 @@ GET /api/health/deep
 ```json
 {
   "ok": true,
+  "websocket": {
+    "connected": true,
+    "lastMessageAt": "2026-05-19T20:00:30.123+08:00",
+    "lastMessageAgoMs": 1200,
+    "reconnectCount": 0,
+    "lastError": null,
+    "ok": true,
+    "reason": null
+  },
   "series": [
     {
       "symbol": "BTCUSDT",
       "interval": "1",
       "latestOpenTime": "2026-05-19T20:00:00.000+08:00",
+      "latestLagIntervals": 0,
       "consecutiveBarsFromLatest": 42,
       "checkedBars": 5000,
-      "source": "sqlite"
+      "source": "sqlite",
+      "ok": true,
+      "reason": null
     }
   ]
 }
 ```
+
+适合用于监控告警的字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `ok` | WebSocket 和所有配置序列均健康时为 `true` |
+| `websocket.connected` | 当前 WebSocket 是否处于连接状态 |
+| `websocket.lastMessageAgoMs` | 距离最近一次 WebSocket 消息的毫秒数 |
+| `websocket.reconnectCount` | 本进程启动后的重连次数 |
+| `websocket.lastError` | 最近一次连接、读取或超时错误 |
+| `series[].latestLagIntervals` | 最新 K 线距离当前时间桶落后的周期数 |
+| `series[].consecutiveBarsFromLatest` | 从最新 K 线向前连续存在的 K 线数量 |
+| `series[].ok` | 该交易对/周期是否健康 |
+| `series[].reason` | 不健康时的原因 |
 
 ### 查询 K 线
 

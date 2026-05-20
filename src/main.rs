@@ -2,6 +2,7 @@ use crypto_candlestick::binance::{rest::sync_native_klines, worker::BinanceWorke
 use crypto_candlestick::config::AppConfig;
 use crypto_candlestick::http::{router, AppState, HealthTarget};
 use crypto_candlestick::memory::{LatestCache, MemorySeriesStore};
+use crypto_candlestick::runtime_health::RuntimeHealth;
 use crypto_candlestick::storage::sqlite::SqliteStore;
 use tracing_subscriber::EnvFilter;
 
@@ -17,6 +18,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         SqliteStore::connect_with_retention(&config.database_url, config.retention_bars).await?;
     let latest = LatestCache::default();
     let memory_series = MemorySeriesStore::new(config.retention_bars as usize);
+    let runtime_health = RuntimeHealth::default();
     let health_targets = config
         .symbols
         .iter()
@@ -47,6 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             store.clone(),
             latest.clone(),
             memory_series.clone(),
+            runtime_health.clone(),
             config.symbols,
             config.intervals,
         );
@@ -60,6 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         latest,
         memory_series,
         health_targets,
+        runtime_health,
     });
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;

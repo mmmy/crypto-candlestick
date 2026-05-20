@@ -1,5 +1,6 @@
 use crate::{
     memory::{LatestCache, MemorySeriesStore},
+    runtime_health::RuntimeHealth,
     storage::sqlite::SqliteStore,
 };
 use axum::{routing::get, Router};
@@ -12,6 +13,7 @@ pub struct AppState {
     pub latest: LatestCache,
     pub memory_series: MemorySeriesStore,
     pub health_targets: Vec<HealthTarget>,
+    pub runtime_health: RuntimeHealth,
 }
 
 #[derive(Debug, Clone)]

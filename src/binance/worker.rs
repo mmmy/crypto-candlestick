@@ -3,6 +3,7 @@ use crate::{
     domain::interval::Interval,
     engine::aggregator::{Aggregator, TradeTick},
     memory::{LatestCache, MemorySeriesStore},
+    runtime_health::{RuntimeHealth, WS_IDLE_TIMEOUT},
     storage::sqlite::SqliteStore,
 };
 use futures_util::StreamExt;
@@ -11,6 +12,7 @@ use std::{
     time::Duration,
 };
 use tokio::time::sleep;
+use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 const BINANCE_USDM_MARKET_WS_BASE: &str = "wss://fstream.binance.com/market/stream";
@@ -133,6 +135,7 @@ pub struct BinanceWorker {
     store: SqliteStore,
     latest: LatestCache,
     memory_series: MemorySeriesStore,
+    runtime_health: RuntimeHealth,
     plan: SubscriptionPlan,
     custom_aggregators: HashMap<(String, String, String), Aggregator>,
     second_aggregators: HashMap<(String, String), Aggregator>,
@@ -143,6 +146,7 @@ impl BinanceWorker {
         store: SqliteStore,
         latest: LatestCache,
         memory_series: MemorySeriesStore,
+        runtime_health: RuntimeHealth,
         symbols: Vec<String>,
         intervals: Vec<Interval>,
     ) -> Self {
@@ -166,6 +170,7 @@ impl BinanceWorker {
             store,
             latest,
             memory_series,
+            runtime_health,
             plan,
             custom_aggregators,
             second_aggregators,
@@ -188,11 +193,34 @@ impl BinanceWorker {
         loop {
             match connect_async(&url).await {
                 Ok((ws, _)) => {
+                    tracing::info!("connected to Binance websocket");
+                    self.runtime_health.mark_connected().await;
                     backoff_secs = 1;
                     let (_, mut read) = ws.split();
-                    while let Some(message) = read.next().await {
+                    loop {
+                        let message = match timeout(WS_IDLE_TIMEOUT, read.next()).await {
+                            Ok(Some(message)) => message,
+                            Ok(None) => {
+                                tracing::warn!("binance websocket stream ended");
+                                self.runtime_health
+                                    .mark_reconnecting("websocket stream ended")
+                                    .await;
+                                break;
+                            }
+                            Err(_) => {
+                                tracing::warn!(
+                                    idle_timeout_ms = WS_IDLE_TIMEOUT.as_millis(),
+                                    "binance websocket idle timeout"
+                                );
+                                self.runtime_health
+                                    .mark_reconnecting("websocket idle timeout")
+                                    .await;
+                                break;
+                            }
+                        };
                         match message {
                             Ok(Message::Text(text)) => {
+                                self.runtime_health.mark_message_now().await;
                                 if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text)
                                 {
                                     if let Ok(event) = parse_combined_stream_message(value) {
@@ -200,15 +228,32 @@ impl BinanceWorker {
                                     }
                                 }
                             }
-                            Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {}
-                            Ok(Message::Close(_)) => break,
+                            Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {
+                                self.runtime_health.mark_message_now().await;
+                            }
+                            Ok(Message::Close(_)) => {
+                                tracing::warn!("binance websocket closed");
+                                self.runtime_health
+                                    .mark_reconnecting("websocket closed")
+                                    .await;
+                                break;
+                            }
                             Ok(_) => {}
-                            Err(_) => break,
+                            Err(err) => {
+                                tracing::warn!("binance websocket read failed: {}", err);
+                                self.runtime_health
+                                    .mark_reconnecting(format!("websocket read failed: {err}"))
+                                    .await;
+                                break;
+                            }
                         }
                     }
                 }
                 Err(err) => {
                     tracing::warn!("binance connect failed: {}", err);
+                    self.runtime_health
+                        .mark_reconnecting(format!("connect failed: {err}"))
+                        .await;
                 }
             }
 

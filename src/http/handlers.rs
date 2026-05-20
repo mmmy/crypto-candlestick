@@ -1,13 +1,15 @@
 use crate::{
     domain::{candle::Candle, interval::Interval},
     http::routes::AppState,
+    runtime_health::WebSocketHealth,
     storage::sqlite::StoredKline,
+    time_format::format_timestamp_ms,
 };
 use axum::{
     extract::{Query, State},
     Json,
 };
-use chrono::{Local, SecondsFormat, TimeZone};
+use chrono::Local;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize)]
@@ -25,6 +27,7 @@ const DEEP_HEALTH_SCAN_LIMIT: u32 = 5_000;
 #[serde(rename_all = "camelCase")]
 pub struct DeepHealthResponse {
     pub ok: bool,
+    pub websocket: WebSocketHealth,
     pub series: Vec<SeriesHealth>,
 }
 
@@ -38,6 +41,8 @@ pub struct SeriesHealth {
     pub consecutive_bars_from_latest: u32,
     pub checked_bars: usize,
     pub source: &'static str,
+    pub ok: bool,
+    pub reason: Option<&'static str>,
 }
 
 pub async fn deep_health(
@@ -97,6 +102,17 @@ pub async fn deep_health(
             .first()
             .map(|candle| latest_lag_intervals(&interval, candle.open_time));
         let consecutive_bars_from_latest = consecutive_bars_from_latest(&candles_desc, interval_ms);
+        let is_stale = latest_lag_intervals
+            .map(|lag| lag > max_allowed_lag_intervals(&interval))
+            .unwrap_or(true);
+        let ok = consecutive_bars_from_latest > 0 && !is_stale;
+        let reason = if consecutive_bars_from_latest == 0 {
+            Some("no closed candles")
+        } else if is_stale {
+            Some("latest candle is stale")
+        } else {
+            None
+        };
 
         series.push(SeriesHealth {
             symbol: target.symbol.to_uppercase(),
@@ -106,13 +122,18 @@ pub async fn deep_health(
             consecutive_bars_from_latest,
             checked_bars: candles_desc.len(),
             source,
+            ok,
+            reason,
         });
     }
 
-    let ok = series
-        .iter()
-        .all(|item| item.consecutive_bars_from_latest > 0);
-    Ok(Json(DeepHealthResponse { ok, series }))
+    let websocket = state.runtime_health.websocket_snapshot().await;
+    let ok = websocket.ok && series.iter().all(|item| item.ok);
+    Ok(Json(DeepHealthResponse {
+        ok,
+        websocket,
+        series,
+    }))
 }
 
 fn consecutive_bars_from_latest(candles_desc: &[Candle], interval_ms: i64) -> u32 {
@@ -134,17 +155,17 @@ fn consecutive_bars_from_latest(candles_desc: &[Candle], interval_ms: i64) -> u3
     count
 }
 
-fn format_timestamp_ms(timestamp_ms: i64) -> String {
-    Local
-        .timestamp_millis_opt(timestamp_ms)
-        .single()
-        .map(|timestamp| timestamp.to_rfc3339_opts(SecondsFormat::Millis, true))
-        .unwrap_or_else(|| timestamp_ms.to_string())
-}
-
 fn latest_lag_intervals(interval: &Interval, latest_open_time: i64) -> u32 {
     let now_ms = Local::now().timestamp_millis();
     latest_lag_intervals_at(interval, latest_open_time, now_ms)
+}
+
+fn max_allowed_lag_intervals(interval: &Interval) -> u32 {
+    if interval.as_millis() < 60_000 {
+        4
+    } else {
+        2
+    }
 }
 
 fn latest_lag_intervals_at(interval: &Interval, latest_open_time: i64, now_ms: i64) -> u32 {

@@ -1,5 +1,6 @@
 use super::types::{parse_combined_stream_message, MarketEvent};
 use crate::{
+    binance::rest::sync_native_klines,
     domain::interval::Interval,
     engine::aggregator::{Aggregator, TradeTick},
     memory::{LatestCache, MemorySeriesStore},
@@ -137,6 +138,7 @@ pub struct BinanceWorker {
     memory_series: MemorySeriesStore,
     runtime_health: RuntimeHealth,
     plan: SubscriptionPlan,
+    sync_lookback_bars: u32,
     custom_aggregators: HashMap<(String, String, String), Aggregator>,
     second_aggregators: HashMap<(String, String), Aggregator>,
 }
@@ -149,6 +151,7 @@ impl BinanceWorker {
         runtime_health: RuntimeHealth,
         symbols: Vec<String>,
         intervals: Vec<Interval>,
+        sync_lookback_bars: u32,
     ) -> Self {
         let plan = SubscriptionPlan::new(symbols, intervals);
         let mut custom_aggregators = HashMap::new();
@@ -172,6 +175,7 @@ impl BinanceWorker {
             memory_series,
             runtime_health,
             plan,
+            sync_lookback_bars,
             custom_aggregators,
             second_aggregators,
         }
@@ -196,6 +200,16 @@ impl BinanceWorker {
                     tracing::info!("connected to Binance websocket");
                     self.runtime_health.mark_connected().await;
                     backoff_secs = 1;
+                    if let Err(err) = sync_native_klines(
+                        &self.store,
+                        self.plan.symbols.clone(),
+                        self.plan.intervals.clone(),
+                        self.sync_lookback_bars,
+                    )
+                    .await
+                    {
+                        tracing::warn!("websocket reconnect kline catch-up failed: {}", err);
+                    }
                     let (_, mut read) = ws.split();
                     loop {
                         let message = match timeout(WS_IDLE_TIMEOUT, read.next()).await {

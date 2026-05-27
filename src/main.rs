@@ -50,6 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             runtime_health.clone(),
             config.symbols,
             config.intervals,
+            config.sync_lookback_bars,
         );
         tokio::spawn(async move {
             worker.run().await;

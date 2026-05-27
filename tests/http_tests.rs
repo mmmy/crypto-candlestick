@@ -271,7 +271,7 @@ async fn klines_endpoint_returns_persisted_rows() {
     });
 
     let response = reqwest::get(format!(
-        "http://{addr}/api/klines?symbol=BTCUSDT&interval=1&limit=10"
+        "http://{addr}/api/klines?symbol=BTCUSDT&intervals=1&limit=10"
     ))
     .await
     .unwrap();
@@ -279,21 +279,29 @@ async fn klines_endpoint_returns_persisted_rows() {
     assert_eq!(response.status(), StatusCode::OK);
     let body: serde_json::Value = response.json().await.unwrap();
     assert_eq!(body["symbol"], "BTCUSDT");
-    assert_eq!(body["interval"], "1");
+    assert_eq!(body["intervals"], serde_json::json!(["1"]));
     assert_eq!(body["limit"], 10);
     assert_eq!(body["closedOnly"], false);
     assert_eq!(body["timezone"], "Asia/Shanghai");
     assert!(body["serverTime"].as_i64().unwrap() > 0);
-    assert_eq!(body["startTime"], "1970-01-01T08:00:01.000+08:00");
-    assert_eq!(body["endTime"], "1970-01-01T08:00:01.000+08:00");
-    assert_eq!(body["count"], 1);
-    assert_eq!(body["data"].as_array().unwrap().len(), 1);
+    assert_eq!(body["series"].as_array().unwrap().len(), 1);
+    assert_eq!(body["series"][0]["interval"], "1");
     assert_eq!(
-        body["data"][0]["candle"]["openTime"],
+        body["series"][0]["startTime"],
         "1970-01-01T08:00:01.000+08:00"
     );
     assert_eq!(
-        body["data"][0]["candle"]["closeTime"],
+        body["series"][0]["endTime"],
+        "1970-01-01T08:00:01.000+08:00"
+    );
+    assert_eq!(body["series"][0]["count"], 1);
+    assert_eq!(body["series"][0]["data"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        body["series"][0]["data"][0]["candle"]["openTime"],
+        "1970-01-01T08:00:01.000+08:00"
+    );
+    assert_eq!(
+        body["series"][0]["data"][0]["candle"]["closeTime"],
         "1970-01-01T08:00:01.999+08:00"
     );
 
@@ -318,7 +326,7 @@ async fn klines_endpoint_defaults_limit_to_200() {
     });
 
     let response = reqwest::get(format!(
-        "http://{addr}/api/klines?symbol=BTCUSDT&interval=1"
+        "http://{addr}/api/klines?symbol=BTCUSDT&intervals=1"
     ))
     .await
     .unwrap();
@@ -389,23 +397,23 @@ async fn klines_endpoint_appends_latest_open_candle_from_memory() {
     });
 
     let response = reqwest::get(format!(
-        "http://{addr}/api/klines?symbol=BTCUSDT&interval=1&limit=10"
+        "http://{addr}/api/klines?symbol=BTCUSDT&intervals=1&limit=10"
     ))
     .await
     .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
     let body: serde_json::Value = response.json().await.unwrap();
-    assert_eq!(body["data"].as_array().unwrap().len(), 2);
+    assert_eq!(body["series"][0]["data"].as_array().unwrap().len(), 2);
     assert_eq!(
-        body["data"][1]["candle"]["openTime"],
+        body["series"][0]["data"][1]["candle"]["openTime"],
         "1970-01-01T08:01:00.000+08:00"
     );
     assert_eq!(
-        body["data"][1]["candle"]["closeTime"],
+        body["series"][0]["data"][1]["candle"]["closeTime"],
         "1970-01-01T08:01:59.999+08:00"
     );
-    assert_eq!(body["data"][1]["candle"]["isClosed"], false);
+    assert_eq!(body["series"][0]["data"][1]["candle"]["isClosed"], false);
 
     server.abort();
 }
@@ -469,7 +477,7 @@ async fn klines_endpoint_can_return_closed_rows_only() {
     });
 
     let response = reqwest::get(format!(
-        "http://{addr}/api/klines?symbol=BTCUSDT&interval=1&limit=10&closedOnly=true"
+        "http://{addr}/api/klines?symbol=BTCUSDT&intervals=1&limit=10&closedOnly=true"
     ))
     .await
     .unwrap();
@@ -477,11 +485,11 @@ async fn klines_endpoint_can_return_closed_rows_only() {
     assert_eq!(response.status(), StatusCode::OK);
     let body: serde_json::Value = response.json().await.unwrap();
     assert_eq!(body["closedOnly"], true);
-    assert_eq!(body["count"], 1);
-    assert_eq!(body["data"].as_array().unwrap().len(), 1);
-    assert_eq!(body["data"][0]["candle"]["isClosed"], true);
+    assert_eq!(body["series"][0]["count"], 1);
+    assert_eq!(body["series"][0]["data"].as_array().unwrap().len(), 1);
+    assert_eq!(body["series"][0]["data"][0]["candle"]["isClosed"], true);
     assert_eq!(
-        body["data"][0]["candle"]["openTime"],
+        body["series"][0]["data"][0]["candle"]["openTime"],
         "1970-01-01T08:00:00.000+08:00"
     );
 
@@ -549,20 +557,20 @@ async fn klines_endpoint_keeps_latest_contiguous_rows_after_a_gap() {
     });
 
     let response = reqwest::get(format!(
-        "http://{addr}/api/klines?symbol=BTCUSDT&interval=1&limit=10"
+        "http://{addr}/api/klines?symbol=BTCUSDT&intervals=1&limit=10"
     ))
     .await
     .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
     let body: serde_json::Value = response.json().await.unwrap();
-    assert_eq!(body["data"].as_array().unwrap().len(), 2);
+    assert_eq!(body["series"][0]["data"].as_array().unwrap().len(), 2);
     assert_eq!(
-        body["data"][0]["candle"]["openTime"],
+        body["series"][0]["data"][0]["candle"]["openTime"],
         "1970-01-01T08:03:00.000+08:00"
     );
     assert_eq!(
-        body["data"][1]["candle"]["openTime"],
+        body["series"][0]["data"][1]["candle"]["openTime"],
         "1970-01-01T08:04:00.000+08:00"
     );
 
@@ -628,16 +636,151 @@ async fn second_interval_query_reads_closed_rows_from_memory_not_sqlite() {
     });
 
     let response = reqwest::get(format!(
-        "http://{addr}/api/klines?symbol=BTCUSDT&interval=15S&limit=10"
+        "http://{addr}/api/klines?symbol=BTCUSDT&intervals=15S&limit=10"
     ))
     .await
     .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
     let body: serde_json::Value = response.json().await.unwrap();
-    assert_eq!(body["data"].as_array().unwrap().len(), 2);
-    assert_eq!(body["data"][0]["candle"]["isClosed"], true);
-    assert_eq!(body["data"][1]["candle"]["isClosed"], false);
+    assert_eq!(body["series"][0]["data"].as_array().unwrap().len(), 2);
+    assert_eq!(body["series"][0]["data"][0]["candle"]["isClosed"], true);
+    assert_eq!(body["series"][0]["data"][1]["candle"]["isClosed"], false);
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn klines_endpoint_returns_multiple_intervals_in_request_order() {
+    let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let latest = LatestCache::default();
+    let memory_series = MemorySeriesStore::default();
+
+    store
+        .upsert_candle(
+            "BTCUSDT",
+            "1",
+            &Candle {
+                open_time: 60_000,
+                close_time: 119_999,
+                open: 100.0,
+                high: 101.0,
+                low: 99.0,
+                close: 100.5,
+                volume: 12.5,
+                quote_volume: 1_250.0,
+                trade_count: 3,
+                is_closed: true,
+            },
+        )
+        .await
+        .unwrap();
+
+    memory_series
+        .push_closed(
+            "BTCUSDT",
+            "15S",
+            Candle {
+                open_time: 15_000,
+                close_time: 29_999,
+                open: 99.0,
+                high: 100.0,
+                low: 98.0,
+                close: 99.5,
+                volume: 5.0,
+                quote_volume: 497.5,
+                trade_count: 2,
+                is_closed: true,
+            },
+        )
+        .await;
+
+    let app = router(AppState {
+        store,
+        latest,
+        memory_series,
+        health_targets: Vec::new(),
+        runtime_health: RuntimeHealth::default(),
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let response = reqwest::get(format!(
+        "http://{addr}/api/klines?symbol=BTCUSDT&intervals=15S,1&limit=10"
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["intervals"], serde_json::json!(["15S", "1"]));
+    assert_eq!(body["series"].as_array().unwrap().len(), 2);
+    assert_eq!(body["series"][0]["interval"], "15S");
+    assert_eq!(body["series"][0]["data"][0]["interval"], "15S");
+    assert_eq!(body["series"][1]["interval"], "1");
+    assert_eq!(body["series"][1]["data"][0]["interval"], "1");
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn klines_endpoint_rejects_missing_intervals() {
+    let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let app = router(AppState {
+        store,
+        latest: LatestCache::default(),
+        memory_series: MemorySeriesStore::default(),
+        health_targets: Vec::new(),
+        runtime_health: RuntimeHealth::default(),
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let response = reqwest::get(format!(
+        "http://{addr}/api/klines?symbol=BTCUSDT&interval=1"
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(response.text().await.unwrap().contains("missing intervals"));
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn klines_endpoint_rejects_empty_interval_item() {
+    let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let app = router(AppState {
+        store,
+        latest: LatestCache::default(),
+        memory_series: MemorySeriesStore::default(),
+        health_targets: Vec::new(),
+        runtime_health: RuntimeHealth::default(),
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let response = reqwest::get(format!(
+        "http://{addr}/api/klines?symbol=BTCUSDT&intervals=1,,5"
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(response.text().await.unwrap().contains("empty interval"));
 
     server.abort();
 }

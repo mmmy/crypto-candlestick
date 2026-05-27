@@ -199,7 +199,7 @@ mod tests {
 #[serde(rename_all = "camelCase")]
 pub struct KlineQuery {
     pub symbol: String,
-    pub interval: String,
+    pub intervals: Option<String>,
     pub start_time: Option<i64>,
     pub end_time: Option<i64>,
     pub limit: Option<u32>,
@@ -218,11 +218,18 @@ pub struct KlineResponse {
 #[serde(rename_all = "camelCase")]
 pub struct KlineEnvelope {
     pub symbol: String,
-    pub interval: String,
+    pub intervals: Vec<String>,
     pub limit: u32,
     pub closed_only: bool,
     pub timezone: &'static str,
     pub server_time: i64,
+    pub series: Vec<KlineSeries>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KlineSeries {
+    pub interval: String,
     pub start_time: Option<String>,
     pub end_time: Option<String>,
     pub count: usize,
@@ -271,15 +278,82 @@ impl From<Candle> for ApiCandle {
     }
 }
 
+fn parse_intervals(input: Option<&str>) -> Result<Vec<Interval>, (axum::http::StatusCode, String)> {
+    let input = input
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                "missing intervals".to_string(),
+            )
+        })?;
+
+    input
+        .split(',')
+        .map(|item| {
+            let item = item.trim();
+            if item.is_empty() {
+                return Err((
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "empty interval in intervals".to_string(),
+                ));
+            }
+
+            Interval::parse(item)
+                .map_err(|err| (axum::http::StatusCode::BAD_REQUEST, err.to_string()))
+        })
+        .collect()
+}
+
 pub async fn klines(
     State(state): State<AppState>,
     Query(query): Query<KlineQuery>,
 ) -> Result<Json<KlineEnvelope>, (axum::http::StatusCode, String)> {
-    let interval = Interval::parse(&query.interval)
-        .map_err(|err| (axum::http::StatusCode::BAD_REQUEST, err.to_string()))?;
-    let canonical_interval = interval.canonical();
+    let intervals = parse_intervals(query.intervals.as_deref())?;
+    let canonical_intervals = intervals
+        .iter()
+        .map(Interval::canonical)
+        .collect::<Vec<_>>();
     let limit = query.limit.unwrap_or(200);
     let closed_only = query.closed_only.unwrap_or(false);
+    let mut series = Vec::with_capacity(intervals.len());
+
+    for interval in intervals {
+        series.push(
+            query_kline_series(
+                &state,
+                &query.symbol,
+                interval,
+                query.start_time,
+                query.end_time,
+                limit,
+                closed_only,
+            )
+            .await?,
+        );
+    }
+
+    Ok(Json(KlineEnvelope {
+        symbol: query.symbol.to_uppercase(),
+        intervals: canonical_intervals,
+        limit,
+        closed_only,
+        timezone: "Asia/Shanghai",
+        server_time: Local::now().timestamp_millis(),
+        series,
+    }))
+}
+
+async fn query_kline_series(
+    state: &AppState,
+    symbol: &str,
+    interval: Interval,
+    start_time: Option<i64>,
+    end_time: Option<i64>,
+    limit: u32,
+    closed_only: bool,
+) -> Result<KlineSeries, (axum::http::StatusCode, String)> {
+    let canonical_interval = interval.canonical();
     let query_limit = if closed_only {
         limit.saturating_add(1)
     } else {
@@ -289,10 +363,10 @@ pub async fn klines(
         state
             .memory_series
             .query(
-                &query.symbol,
+                symbol,
                 &canonical_interval,
-                query.start_time,
-                query.end_time,
+                start_time,
+                end_time,
                 query_limit,
             )
             .await
@@ -300,10 +374,10 @@ pub async fn klines(
         state
             .store
             .query_klines(
-                &query.symbol,
+                symbol,
                 &canonical_interval,
-                query.start_time,
-                query.end_time,
+                start_time,
+                end_time,
                 query_limit,
             )
             .await
@@ -318,21 +392,17 @@ pub async fn klines(
     if !closed_only {
         if let Some(latest) = state
             .latest
-            .get(&query.symbol, &canonical_interval)
+            .get(symbol, &canonical_interval)
             .await
             .filter(|candle| {
-                query
-                    .start_time
+                start_time
                     .map(|start| candle.open_time >= start)
                     .unwrap_or(true)
-                    && query
-                        .end_time
-                        .map(|end| candle.open_time <= end)
-                        .unwrap_or(true)
+                    && end_time.map(|end| candle.open_time <= end).unwrap_or(true)
             })
         {
             let latest_row = StoredKline {
-                symbol: query.symbol.to_uppercase(),
+                symbol: symbol.to_uppercase(),
                 interval: canonical_interval.clone(),
                 candle: latest,
             };
@@ -367,18 +437,13 @@ pub async fn klines(
         .map(|row| format_timestamp_ms(row.candle.open_time));
     let data: Vec<KlineResponse> = rows.into_iter().map(KlineResponse::from).collect();
 
-    Ok(Json(KlineEnvelope {
-        symbol: query.symbol.to_uppercase(),
+    Ok(KlineSeries {
         interval: canonical_interval,
-        limit,
-        closed_only,
-        timezone: "Asia/Shanghai",
-        server_time: Local::now().timestamp_millis(),
         start_time,
         end_time,
         count: data.len(),
         data,
-    }))
+    })
 }
 
 fn keep_latest_contiguous_rows(rows: &mut Vec<StoredKline>, interval_ms: i64) {

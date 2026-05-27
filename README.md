@@ -208,24 +208,34 @@ GET /api/klines?symbol=BTCUSDT&interval=1&limit=1000
 响应示例：
 
 ```json
-[
-  {
-    "symbol": "BTCUSDT",
-    "interval": "1",
-    "candle": {
-      "openTime": "2024-03-10T00:00:00.000+08:00",
-      "closeTime": "2024-03-10T00:00:59.999+08:00",
-      "open": 100.0,
-      "high": 102.0,
-      "low": 99.0,
-      "close": 101.0,
-      "volume": 12.5,
-      "quoteVolume": 1250.0,
-      "tradeCount": 42,
-      "isClosed": true
+{
+  "symbol": "BTCUSDT",
+  "interval": "1",
+  "limit": 1000,
+  "timezone": "Asia/Shanghai",
+  "serverTime": 1780000000000,
+  "startTime": "2024-03-10T00:00:00.000+08:00",
+  "endTime": "2024-03-10T00:00:00.000+08:00",
+  "count": 1,
+  "data": [
+    {
+      "symbol": "BTCUSDT",
+      "interval": "1",
+      "candle": {
+        "openTime": "2024-03-10T00:00:00.000+08:00",
+        "closeTime": "2024-03-10T00:00:59.999+08:00",
+        "open": 100.0,
+        "high": 102.0,
+        "low": 99.0,
+        "close": 101.0,
+        "volume": 12.5,
+        "quoteVolume": 1250.0,
+        "tradeCount": 42,
+        "isClosed": true
+      }
     }
-  }
-]
+  ]
+}
 ```
 
 命令行示例：

@@ -215,6 +215,20 @@ pub struct KlineResponse {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct KlineEnvelope {
+    pub symbol: String,
+    pub interval: String,
+    pub limit: u32,
+    pub timezone: &'static str,
+    pub server_time: i64,
+    pub start_time: Option<String>,
+    pub end_time: Option<String>,
+    pub count: usize,
+    pub data: Vec<KlineResponse>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ApiCandle {
     pub open_time: String,
     pub close_time: String,
@@ -258,10 +272,11 @@ impl From<Candle> for ApiCandle {
 pub async fn klines(
     State(state): State<AppState>,
     Query(query): Query<KlineQuery>,
-) -> Result<Json<Vec<KlineResponse>>, (axum::http::StatusCode, String)> {
+) -> Result<Json<KlineEnvelope>, (axum::http::StatusCode, String)> {
     let interval = Interval::parse(&query.interval)
         .map_err(|err| (axum::http::StatusCode::BAD_REQUEST, err.to_string()))?;
     let canonical_interval = interval.canonical();
+    let limit = query.limit.unwrap_or(1000);
     let mut rows = if interval.as_millis() < 60_000 {
         state
             .memory_series
@@ -270,7 +285,7 @@ pub async fn klines(
                 &canonical_interval,
                 query.start_time,
                 query.end_time,
-                query.limit.unwrap_or(1000),
+                limit,
             )
             .await
     } else {
@@ -281,7 +296,7 @@ pub async fn klines(
                 &canonical_interval,
                 query.start_time,
                 query.end_time,
-                query.limit.unwrap_or(1000),
+                limit,
             )
             .await
             .map_err(|err| {
@@ -309,7 +324,7 @@ pub async fn klines(
     {
         let latest_row = StoredKline {
             symbol: query.symbol.to_uppercase(),
-            interval: canonical_interval,
+            interval: canonical_interval.clone(),
             candle: latest,
         };
         if let Some(last) = rows.last_mut() {
@@ -332,7 +347,25 @@ pub async fn klines(
 
     keep_latest_contiguous_rows(&mut rows, interval.as_millis() as i64);
 
-    Ok(Json(rows.into_iter().map(KlineResponse::from).collect()))
+    let start_time = rows
+        .first()
+        .map(|row| format_timestamp_ms(row.candle.open_time));
+    let end_time = rows
+        .last()
+        .map(|row| format_timestamp_ms(row.candle.open_time));
+    let data: Vec<KlineResponse> = rows.into_iter().map(KlineResponse::from).collect();
+
+    Ok(Json(KlineEnvelope {
+        symbol: query.symbol.to_uppercase(),
+        interval: canonical_interval,
+        limit,
+        timezone: "Asia/Shanghai",
+        server_time: Local::now().timestamp_millis(),
+        start_time,
+        end_time,
+        count: data.len(),
+        data,
+    }))
 }
 
 fn keep_latest_contiguous_rows(rows: &mut Vec<StoredKline>, interval_ms: i64) {

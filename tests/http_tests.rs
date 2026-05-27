@@ -278,15 +278,21 @@ async fn klines_endpoint_returns_persisted_rows() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let body: serde_json::Value = response.json().await.unwrap();
-    assert_eq!(body.as_array().unwrap().len(), 1);
-    assert_eq!(body[0]["symbol"], "BTCUSDT");
-    assert_eq!(body[0]["interval"], "1");
+    assert_eq!(body["symbol"], "BTCUSDT");
+    assert_eq!(body["interval"], "1");
+    assert_eq!(body["limit"], 10);
+    assert_eq!(body["timezone"], "Asia/Shanghai");
+    assert!(body["serverTime"].as_i64().unwrap() > 0);
+    assert_eq!(body["startTime"], "1970-01-01T08:00:01.000+08:00");
+    assert_eq!(body["endTime"], "1970-01-01T08:00:01.000+08:00");
+    assert_eq!(body["count"], 1);
+    assert_eq!(body["data"].as_array().unwrap().len(), 1);
     assert_eq!(
-        body[0]["candle"]["openTime"],
+        body["data"][0]["candle"]["openTime"],
         "1970-01-01T08:00:01.000+08:00"
     );
     assert_eq!(
-        body[0]["candle"]["closeTime"],
+        body["data"][0]["candle"]["closeTime"],
         "1970-01-01T08:00:01.999+08:00"
     );
 
@@ -359,16 +365,16 @@ async fn klines_endpoint_appends_latest_open_candle_from_memory() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let body: serde_json::Value = response.json().await.unwrap();
-    assert_eq!(body.as_array().unwrap().len(), 2);
+    assert_eq!(body["data"].as_array().unwrap().len(), 2);
     assert_eq!(
-        body[1]["candle"]["openTime"],
+        body["data"][1]["candle"]["openTime"],
         "1970-01-01T08:01:00.000+08:00"
     );
     assert_eq!(
-        body[1]["candle"]["closeTime"],
+        body["data"][1]["candle"]["closeTime"],
         "1970-01-01T08:01:59.999+08:00"
     );
-    assert_eq!(body[1]["candle"]["isClosed"], false);
+    assert_eq!(body["data"][1]["candle"]["isClosed"], false);
 
     server.abort();
 }
@@ -441,13 +447,13 @@ async fn klines_endpoint_keeps_latest_contiguous_rows_after_a_gap() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let body: serde_json::Value = response.json().await.unwrap();
-    assert_eq!(body.as_array().unwrap().len(), 2);
+    assert_eq!(body["data"].as_array().unwrap().len(), 2);
     assert_eq!(
-        body[0]["candle"]["openTime"],
+        body["data"][0]["candle"]["openTime"],
         "1970-01-01T08:03:00.000+08:00"
     );
     assert_eq!(
-        body[1]["candle"]["openTime"],
+        body["data"][1]["candle"]["openTime"],
         "1970-01-01T08:04:00.000+08:00"
     );
 
@@ -520,9 +526,9 @@ async fn second_interval_query_reads_closed_rows_from_memory_not_sqlite() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let body: serde_json::Value = response.json().await.unwrap();
-    assert_eq!(body.as_array().unwrap().len(), 2);
-    assert_eq!(body[0]["candle"]["isClosed"], true);
-    assert_eq!(body[1]["candle"]["isClosed"], false);
+    assert_eq!(body["data"].as_array().unwrap().len(), 2);
+    assert_eq!(body["data"][0]["candle"]["isClosed"], true);
+    assert_eq!(body["data"][1]["candle"]["isClosed"], false);
 
     server.abort();
 }

@@ -192,7 +192,7 @@ GET /api/health/deep
 ### 查询 K 线
 
 ```http
-GET /api/klines?symbol=BTCUSDT&interval=1&limit=1000
+GET /api/klines?symbol=BTCUSDT&intervals=1,5,15&limit=1000
 ```
 
 查询参数：
@@ -200,7 +200,7 @@ GET /api/klines?symbol=BTCUSDT&interval=1&limit=1000
 | 参数 | 必填 | 说明 |
 | --- | --- | --- |
 | `symbol` | 是 | 交易对，例如 `BTCUSDT` |
-| `interval` | 是 | 周期，可选值：`15S`, `30S`, `45S`, `1`, `2`, `3`, `4`, `5`, `8`, `10`, `15`, `20`, `30`, `45`, `60`, `90`, `120`, `180`, `240`, `360`, `480`, `720`, `D`, `2D`, `3D`, `4D`, `10D`, `W` |
+| `intervals` | 是 | 逗号分隔的周期列表，例如 `1,5,15`；可选值：`15S`, `30S`, `45S`, `1`, `2`, `3`, `4`, `5`, `8`, `10`, `15`, `20`, `30`, `45`, `60`, `90`, `120`, `180`, `240`, `360`, `480`, `720`, `D`, `2D`, `3D`, `4D`, `10D`, `W` |
 | `startTime` | 否 | 起始 open time，毫秒时间戳 |
 | `endTime` | 否 | 结束 open time，毫秒时间戳 |
 | `limit` | 否 | 返回数量，默认 `200` |
@@ -211,30 +211,35 @@ GET /api/klines?symbol=BTCUSDT&interval=1&limit=1000
 ```json
 {
   "symbol": "BTCUSDT",
-  "interval": "1",
+  "intervals": ["1", "5", "15"],
   "limit": 1000,
   "closedOnly": false,
   "timezone": "Asia/Shanghai",
   "serverTime": 1780000000000,
-  "startTime": "2024-03-10T00:00:00.000+08:00",
-  "endTime": "2024-03-10T00:00:00.000+08:00",
-  "count": 1,
-  "data": [
+  "series": [
     {
-      "symbol": "BTCUSDT",
       "interval": "1",
-      "candle": {
-        "openTime": "2024-03-10T00:00:00.000+08:00",
-        "closeTime": "2024-03-10T00:00:59.999+08:00",
-        "open": 100.0,
-        "high": 102.0,
-        "low": 99.0,
-        "close": 101.0,
-        "volume": 12.5,
-        "quoteVolume": 1250.0,
-        "tradeCount": 42,
-        "isClosed": true
-      }
+      "startTime": "2024-03-10T00:00:00.000+08:00",
+      "endTime": "2024-03-10T00:00:00.000+08:00",
+      "count": 1,
+      "data": [
+        {
+          "symbol": "BTCUSDT",
+          "interval": "1",
+          "candle": {
+            "openTime": "2024-03-10T00:00:00.000+08:00",
+            "closeTime": "2024-03-10T00:00:59.999+08:00",
+            "open": 100.0,
+            "high": 102.0,
+            "low": 99.0,
+            "close": 101.0,
+            "volume": 12.5,
+            "quoteVolume": 1250.0,
+            "tradeCount": 42,
+            "isClosed": true
+          }
+        }
+      ]
     }
   ]
 }
@@ -245,13 +250,13 @@ GET /api/klines?symbol=BTCUSDT&interval=1&limit=1000
 Windows PowerShell:
 
 ```powershell
-Invoke-RestMethod "http://127.0.0.1:3000/api/klines?symbol=BTCUSDT&interval=1&limit=10"
+Invoke-RestMethod "http://127.0.0.1:3000/api/klines?symbol=BTCUSDT&intervals=1,5,15&limit=10"
 ```
 
 Linux/macOS:
 
 ```bash
-curl "http://127.0.0.1:3000/api/klines?symbol=BTCUSDT&interval=1&limit=10"
+curl "http://127.0.0.1:3000/api/klines?symbol=BTCUSDT&intervals=1,5,15&limit=10"
 ```
 
 ## 数据存储

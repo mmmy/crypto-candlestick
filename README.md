@@ -204,6 +204,7 @@ GET /api/klines?symbol=BTCUSDT&interval=1&limit=1000
 | `startTime` | 否 | 起始 open time，毫秒时间戳 |
 | `endTime` | 否 | 结束 open time，毫秒时间戳 |
 | `limit` | 否 | 返回数量，默认 `1000` |
+| `closedOnly` | 否 | 设为 `true` 时只返回已收线 K 线，默认 `false` |
 
 响应示例：
 
@@ -212,6 +213,7 @@ GET /api/klines?symbol=BTCUSDT&interval=1&limit=1000
   "symbol": "BTCUSDT",
   "interval": "1",
   "limit": 1000,
+  "closedOnly": false,
   "timezone": "Asia/Shanghai",
   "serverTime": 1780000000000,
   "startTime": "2024-03-10T00:00:00.000+08:00",

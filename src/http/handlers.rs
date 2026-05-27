@@ -203,6 +203,7 @@ pub struct KlineQuery {
     pub start_time: Option<i64>,
     pub end_time: Option<i64>,
     pub limit: Option<u32>,
+    pub closed_only: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -219,6 +220,7 @@ pub struct KlineEnvelope {
     pub symbol: String,
     pub interval: String,
     pub limit: u32,
+    pub closed_only: bool,
     pub timezone: &'static str,
     pub server_time: i64,
     pub start_time: Option<String>,
@@ -277,6 +279,12 @@ pub async fn klines(
         .map_err(|err| (axum::http::StatusCode::BAD_REQUEST, err.to_string()))?;
     let canonical_interval = interval.canonical();
     let limit = query.limit.unwrap_or(1000);
+    let closed_only = query.closed_only.unwrap_or(false);
+    let query_limit = if closed_only {
+        limit.saturating_add(1)
+    } else {
+        limit
+    };
     let mut rows = if interval.as_millis() < 60_000 {
         state
             .memory_series
@@ -285,7 +293,7 @@ pub async fn klines(
                 &canonical_interval,
                 query.start_time,
                 query.end_time,
-                limit,
+                query_limit,
             )
             .await
     } else {
@@ -296,7 +304,7 @@ pub async fn klines(
                 &canonical_interval,
                 query.start_time,
                 query.end_time,
-                limit,
+                query_limit,
             )
             .await
             .map_err(|err| {
@@ -307,42 +315,46 @@ pub async fn klines(
             })?
     };
 
-    if let Some(latest) = state
-        .latest
-        .get(&query.symbol, &canonical_interval)
-        .await
-        .filter(|candle| {
-            query
-                .start_time
-                .map(|start| candle.open_time >= start)
-                .unwrap_or(true)
-                && query
-                    .end_time
-                    .map(|end| candle.open_time <= end)
+    if !closed_only {
+        if let Some(latest) = state
+            .latest
+            .get(&query.symbol, &canonical_interval)
+            .await
+            .filter(|candle| {
+                query
+                    .start_time
+                    .map(|start| candle.open_time >= start)
                     .unwrap_or(true)
-        })
-    {
-        let latest_row = StoredKline {
-            symbol: query.symbol.to_uppercase(),
-            interval: canonical_interval.clone(),
-            candle: latest,
-        };
-        if let Some(last) = rows.last_mut() {
-            if last.candle.open_time == latest_row.candle.open_time {
-                *last = latest_row;
-            } else if last.candle.open_time < latest_row.candle.open_time {
+                    && query
+                        .end_time
+                        .map(|end| candle.open_time <= end)
+                        .unwrap_or(true)
+            })
+        {
+            let latest_row = StoredKline {
+                symbol: query.symbol.to_uppercase(),
+                interval: canonical_interval.clone(),
+                candle: latest,
+            };
+            if let Some(last) = rows.last_mut() {
+                if last.candle.open_time == latest_row.candle.open_time {
+                    *last = latest_row;
+                } else if last.candle.open_time < latest_row.candle.open_time {
+                    rows.push(latest_row);
+                }
+            } else {
                 rows.push(latest_row);
             }
-        } else {
-            rows.push(latest_row);
         }
     }
 
-    if let Some(limit) = query.limit {
-        if rows.len() > limit as usize {
-            let start = rows.len() - limit as usize;
-            rows = rows.split_off(start);
-        }
+    if closed_only {
+        rows.retain(|row| row.candle.is_closed);
+    }
+
+    if rows.len() > limit as usize {
+        let start = rows.len() - limit as usize;
+        rows = rows.split_off(start);
     }
 
     keep_latest_contiguous_rows(&mut rows, interval.as_millis() as i64);
@@ -359,6 +371,7 @@ pub async fn klines(
         symbol: query.symbol.to_uppercase(),
         interval: canonical_interval,
         limit,
+        closed_only,
         timezone: "Asia/Shanghai",
         server_time: Local::now().timestamp_millis(),
         start_time,

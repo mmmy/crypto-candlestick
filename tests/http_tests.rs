@@ -281,6 +281,7 @@ async fn klines_endpoint_returns_persisted_rows() {
     assert_eq!(body["symbol"], "BTCUSDT");
     assert_eq!(body["interval"], "1");
     assert_eq!(body["limit"], 10);
+    assert_eq!(body["closedOnly"], false);
     assert_eq!(body["timezone"], "Asia/Shanghai");
     assert!(body["serverTime"].as_i64().unwrap() > 0);
     assert_eq!(body["startTime"], "1970-01-01T08:00:01.000+08:00");
@@ -375,6 +376,84 @@ async fn klines_endpoint_appends_latest_open_candle_from_memory() {
         "1970-01-01T08:01:59.999+08:00"
     );
     assert_eq!(body["data"][1]["candle"]["isClosed"], false);
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn klines_endpoint_can_return_closed_rows_only() {
+    let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let latest = LatestCache::default();
+
+    store
+        .upsert_candle(
+            "BTCUSDT",
+            "1",
+            &Candle {
+                open_time: 0,
+                close_time: 59_999,
+                open: 99.0,
+                high: 100.0,
+                low: 98.0,
+                close: 99.5,
+                volume: 10.0,
+                quote_volume: 995.0,
+                trade_count: 10,
+                is_closed: true,
+            },
+        )
+        .await
+        .unwrap();
+
+    latest
+        .upsert(
+            "BTCUSDT",
+            "1",
+            Candle {
+                open_time: 60_000,
+                close_time: 119_999,
+                open: 100.0,
+                high: 101.0,
+                low: 99.0,
+                close: 100.5,
+                volume: 12.5,
+                quote_volume: 1_250.0,
+                trade_count: 3,
+                is_closed: false,
+            },
+        )
+        .await;
+
+    let app = router(AppState {
+        store,
+        latest,
+        memory_series: MemorySeriesStore::default(),
+        health_targets: Vec::new(),
+        runtime_health: RuntimeHealth::default(),
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let response = reqwest::get(format!(
+        "http://{addr}/api/klines?symbol=BTCUSDT&interval=1&limit=10&closedOnly=true"
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["closedOnly"], true);
+    assert_eq!(body["count"], 1);
+    assert_eq!(body["data"].as_array().unwrap().len(), 1);
+    assert_eq!(body["data"][0]["candle"]["isClosed"], true);
+    assert_eq!(
+        body["data"][0]["candle"]["openTime"],
+        "1970-01-01T08:00:00.000+08:00"
+    );
 
     server.abort();
 }

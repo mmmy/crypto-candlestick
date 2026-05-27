@@ -301,6 +301,36 @@ async fn klines_endpoint_returns_persisted_rows() {
 }
 
 #[tokio::test]
+async fn klines_endpoint_defaults_limit_to_200() {
+    let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let app = router(AppState {
+        store,
+        latest: LatestCache::default(),
+        memory_series: MemorySeriesStore::default(),
+        health_targets: Vec::new(),
+        runtime_health: RuntimeHealth::default(),
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let response = reqwest::get(format!(
+        "http://{addr}/api/klines?symbol=BTCUSDT&interval=1"
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["limit"], 200);
+
+    server.abort();
+}
+
+#[tokio::test]
 async fn klines_endpoint_appends_latest_open_candle_from_memory() {
     let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
     let latest = LatestCache::default();

@@ -278,7 +278,7 @@ pub async fn klines(
     let interval = Interval::parse(&query.interval)
         .map_err(|err| (axum::http::StatusCode::BAD_REQUEST, err.to_string()))?;
     let canonical_interval = interval.canonical();
-    let limit = query.limit.unwrap_or(1000);
+    let limit = query.limit.unwrap_or(200);
     let closed_only = query.closed_only.unwrap_or(false);
     let query_limit = if closed_only {
         limit.saturating_add(1)

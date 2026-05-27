@@ -374,11 +374,11 @@ async fn klines_endpoint_appends_latest_open_candle_from_memory() {
 }
 
 #[tokio::test]
-async fn klines_endpoint_truncates_at_first_gap_before_returning() {
+async fn klines_endpoint_keeps_latest_contiguous_rows_after_a_gap() {
     let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
     let latest = LatestCache::default();
 
-    for open_time in [0, 60_000] {
+    for open_time in [0, 60_000, 180_000] {
         store
             .upsert_candle(
                 "BTCUSDT",
@@ -405,8 +405,8 @@ async fn klines_endpoint_truncates_at_first_gap_before_returning() {
             "BTCUSDT",
             "1",
             Candle {
-                open_time: 180_000,
-                close_time: 239_999,
+                open_time: 240_000,
+                close_time: 299_999,
                 open: 101.0,
                 high: 102.0,
                 low: 100.0,
@@ -444,11 +444,11 @@ async fn klines_endpoint_truncates_at_first_gap_before_returning() {
     assert_eq!(body.as_array().unwrap().len(), 2);
     assert_eq!(
         body[0]["candle"]["openTime"],
-        "1970-01-01T08:00:00.000+08:00"
+        "1970-01-01T08:03:00.000+08:00"
     );
     assert_eq!(
         body[1]["candle"]["openTime"],
-        "1970-01-01T08:01:00.000+08:00"
+        "1970-01-01T08:04:00.000+08:00"
     );
 
     server.abort();

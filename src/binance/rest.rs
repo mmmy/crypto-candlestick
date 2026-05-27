@@ -76,6 +76,33 @@ pub fn closed_lookback_window(interval: &Interval, lookback_bars: u32, now_ms: i
     (start_open_time, latest_closed_open_time)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestKlinePage {
+    pub start_time: i64,
+    pub end_time: i64,
+    pub limit: u32,
+}
+
+pub fn plan_rest_kline_pages(range: &MissingKlineRange) -> Vec<RestKlinePage> {
+    let mut pages = Vec::new();
+    let mut next_start = range.start_open_time;
+    let mut remaining = range.missing_count();
+
+    while remaining > 0 {
+        let limit = remaining.min(MAX_KLINE_LIMIT);
+        let page_end_open_time = next_start + (i64::from(limit) - 1) * range.interval_ms;
+        pages.push(RestKlinePage {
+            start_time: next_start,
+            end_time: page_end_open_time + range.interval_ms - 1,
+            limit,
+        });
+        next_start = page_end_open_time + range.interval_ms;
+        remaining -= limit;
+    }
+
+    pages
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RestError {
     #[error("http error: {0}")]

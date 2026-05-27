@@ -1,6 +1,7 @@
 use crypto_candlestick::binance::rest::parse_rest_klines;
 use crypto_candlestick::binance::rest::rebuild_custom_klines;
 use crypto_candlestick::binance::rest::closed_lookback_window;
+use crypto_candlestick::binance::rest::{plan_rest_kline_pages, RestKlinePage};
 use crypto_candlestick::binance::rest::{detect_missing_kline_ranges, MissingKlineRange};
 use crypto_candlestick::binance::worker::SubscriptionPlan;
 use crypto_candlestick::domain::candle::Candle;
@@ -168,4 +169,49 @@ fn closed_lookback_window_uses_one_bar_minimum() {
 
     assert_eq!(start, end);
     assert_eq!(end, 1779868260000); // 15:51 +08:00
+}
+
+#[test]
+fn plans_single_rest_page_for_small_gap() {
+    let pages = plan_rest_kline_pages(&MissingKlineRange {
+        start_open_time: 1779867600000,
+        end_open_time: 1779867600000,
+        interval_ms: 300_000,
+    });
+
+    assert_eq!(
+        pages,
+        vec![RestKlinePage {
+            start_time: 1779867600000,
+            end_time: 1779867899999,
+            limit: 1,
+        }]
+    );
+}
+
+#[test]
+fn splits_large_gap_without_requesting_outside_range() {
+    let pages = plan_rest_kline_pages(&MissingKlineRange {
+        start_open_time: 0,
+        end_open_time: 1500 * 60_000,
+        interval_ms: 60_000,
+    });
+
+    assert_eq!(pages.len(), 2);
+    assert_eq!(
+        pages[0],
+        RestKlinePage {
+            start_time: 0,
+            end_time: 1499 * 60_000 + 59_999,
+            limit: 1500,
+        }
+    );
+    assert_eq!(
+        pages[1],
+        RestKlinePage {
+            start_time: 1500 * 60_000,
+            end_time: 1500 * 60_000 + 59_999,
+            limit: 1,
+        }
+    );
 }

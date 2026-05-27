@@ -1,9 +1,10 @@
 use crypto_candlestick::binance::rest::parse_rest_klines;
 use crypto_candlestick::binance::rest::rebuild_custom_klines;
 use crypto_candlestick::binance::rest::closed_lookback_window;
+use crypto_candlestick::binance::rest::missing_ranges_for_source;
 use crypto_candlestick::binance::rest::{plan_rest_kline_pages, RestKlinePage};
 use crypto_candlestick::binance::rest::{detect_missing_kline_ranges, MissingKlineRange};
-use crypto_candlestick::binance::worker::SubscriptionPlan;
+use crypto_candlestick::binance::worker::{KlineSource, SubscriptionPlan};
 use crypto_candlestick::domain::candle::Candle;
 use crypto_candlestick::domain::interval::Interval;
 use crypto_candlestick::storage::sqlite::SqliteStore;
@@ -213,5 +214,51 @@ fn splits_large_gap_without_requesting_outside_range() {
             end_time: 1500 * 60_000 + 59_999,
             limit: 1,
         }
+    );
+}
+
+#[tokio::test]
+async fn finds_only_missing_ranges_from_sqlite_window() {
+    let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let source = KlineSource {
+        symbol: "BTCUSDT".to_string(),
+        canonical_interval: "5".to_string(),
+        binance_interval: "5m",
+        interval: Interval::parse("5").unwrap(),
+    };
+
+    for open_time in [0, 300_000, 900_000, 1_200_000] {
+        store
+            .upsert_candle(
+                "BTCUSDT",
+                "5",
+                &Candle {
+                    open_time,
+                    close_time: open_time + 299_999,
+                    open: 100.0,
+                    high: 101.0,
+                    low: 99.0,
+                    close: 100.5,
+                    volume: 1.0,
+                    quote_volume: 100.0,
+                    trade_count: 1,
+                    is_closed: true,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    let ranges = missing_ranges_for_source(&store, &source, 0, 1_200_000)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        ranges,
+        vec![MissingKlineRange {
+            start_open_time: 600_000,
+            end_open_time: 600_000,
+            interval_ms: 300_000,
+        }]
     );
 }

@@ -1,5 +1,5 @@
 use crate::{
-    binance::worker::SubscriptionPlan,
+    binance::worker::{KlineSource, SubscriptionPlan},
     domain::{candle::Candle, interval::Interval},
     storage::sqlite::SqliteStore,
 };
@@ -103,6 +103,37 @@ pub fn plan_rest_kline_pages(range: &MissingKlineRange) -> Vec<RestKlinePage> {
     pages
 }
 
+pub async fn missing_ranges_for_source(
+    store: &SqliteStore,
+    source: &KlineSource,
+    window_start_open_time: i64,
+    window_end_open_time: i64,
+) -> Result<Vec<MissingKlineRange>, RestError> {
+    let interval_ms = source.interval.as_millis() as i64;
+    let expected_bars =
+        ((window_end_open_time - window_start_open_time) / interval_ms + 1) as u32;
+    let rows = store
+        .query_klines(
+            &source.symbol,
+            &source.canonical_interval,
+            Some(window_start_open_time),
+            Some(window_end_open_time),
+            expected_bars,
+        )
+        .await?;
+    let existing_open_times = rows
+        .into_iter()
+        .map(|row| row.candle.open_time)
+        .collect::<Vec<_>>();
+
+    Ok(detect_missing_kline_ranges(
+        window_start_open_time,
+        window_end_open_time,
+        interval_ms,
+        &existing_open_times,
+    ))
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RestError {
     #[error("http error: {0}")]
@@ -132,45 +163,31 @@ pub async fn sync_native_klines(
     let client = reqwest::Client::new();
 
     for source in plan.kline_sources() {
-        let last_open_time = store
-            .max_open_time(&source.symbol, &source.canonical_interval)
-            .await?;
-        let mut start_time = match last_open_time {
-            Some(value) => value + source.interval.as_millis() as i64,
-            None => {
-                chrono::Utc::now().timestamp_millis()
-                    - source.interval.as_millis() as i64 * i64::from(lookback_bars.max(1))
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let (window_start, window_end) =
+            closed_lookback_window(&source.interval, lookback_bars, now_ms);
+        let ranges = missing_ranges_for_source(store, &source, window_start, window_end).await?;
+
+        for range in ranges {
+            for page in plan_rest_kline_pages(&range) {
+                let candles = fetch_klines_page(
+                    &client,
+                    &source.symbol,
+                    source.binance_interval,
+                    page.start_time,
+                    page.end_time,
+                    page.limit,
+                )
+                .await?;
+
+                for candle in &candles {
+                    store
+                        .upsert_candle(&source.symbol, &source.canonical_interval, candle)
+                        .await?;
+                }
+
+                sleep(Duration::from_millis(120)).await;
             }
-        };
-
-        loop {
-            let candles = fetch_klines_page(
-                &client,
-                &source.symbol,
-                source.binance_interval,
-                start_time,
-                MAX_KLINE_LIMIT,
-            )
-            .await?;
-
-            if candles.is_empty() {
-                break;
-            }
-
-            let mut newest_open_time = start_time;
-            for candle in &candles {
-                newest_open_time = newest_open_time.max(candle.open_time);
-                store
-                    .upsert_candle(&source.symbol, &source.canonical_interval, candle)
-                    .await?;
-            }
-
-            if candles.len() < MAX_KLINE_LIMIT as usize {
-                break;
-            }
-
-            start_time = newest_open_time + source.interval.as_millis() as i64;
-            sleep(Duration::from_millis(120)).await;
         }
     }
 
@@ -213,6 +230,7 @@ async fn fetch_klines_page(
     symbol: &str,
     interval: &str,
     start_time: i64,
+    end_time: i64,
     limit: u32,
 ) -> Result<Vec<Candle>, RestError> {
     let payload = client
@@ -221,6 +239,7 @@ async fn fetch_klines_page(
             ("symbol", symbol.to_string()),
             ("interval", interval.to_string()),
             ("startTime", start_time.to_string()),
+            ("endTime", end_time.to_string()),
             ("limit", limit.min(MAX_KLINE_LIMIT).to_string()),
         ])
         .send()

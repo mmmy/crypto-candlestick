@@ -66,6 +66,16 @@ pub fn detect_missing_kline_ranges(
     ranges
 }
 
+pub fn closed_lookback_window(interval: &Interval, lookback_bars: u32, now_ms: i64) -> (i64, i64) {
+    let interval_ms = interval.as_millis() as i64;
+    let current_bucket_start = interval.bucket_start_ms(now_ms);
+    let latest_closed_open_time = current_bucket_start - interval_ms;
+    let bar_count = i64::from(lookback_bars.max(1));
+    let start_open_time = latest_closed_open_time - (bar_count - 1) * interval_ms;
+
+    (start_open_time, latest_closed_open_time)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RestError {
     #[error("http error: {0}")]

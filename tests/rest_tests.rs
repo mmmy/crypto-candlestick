@@ -1,5 +1,6 @@
 use crypto_candlestick::binance::rest::parse_rest_klines;
 use crypto_candlestick::binance::rest::rebuild_custom_klines;
+use crypto_candlestick::binance::rest::closed_lookback_window;
 use crypto_candlestick::binance::rest::{detect_missing_kline_ranges, MissingKlineRange};
 use crypto_candlestick::binance::worker::SubscriptionPlan;
 use crypto_candlestick::domain::candle::Candle;
@@ -145,4 +146,26 @@ fn complete_window_has_no_missing_ranges() {
     let ranges = detect_missing_kline_ranges(0, 2 * 60_000, 60_000, &[0, 60_000, 120_000]);
 
     assert!(ranges.is_empty());
+}
+
+#[test]
+fn closed_lookback_window_ends_at_latest_closed_bucket() {
+    let interval = Interval::parse("5").unwrap();
+    let now_ms = 1779868323456; // 2026-05-27 15:52:03.456 +08:00
+
+    let (start, end) = closed_lookback_window(&interval, 3, now_ms);
+
+    assert_eq!(start, 1779867300000); // 15:35 +08:00
+    assert_eq!(end, 1779867900000); // 15:45 +08:00
+}
+
+#[test]
+fn closed_lookback_window_uses_one_bar_minimum() {
+    let interval = Interval::parse("1").unwrap();
+    let now_ms = 1779868323456;
+
+    let (start, end) = closed_lookback_window(&interval, 0, now_ms);
+
+    assert_eq!(start, end);
+    assert_eq!(end, 1779868260000); // 15:51 +08:00
 }

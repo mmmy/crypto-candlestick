@@ -31,10 +31,7 @@ pub fn detect_missing_kline_ranges(
     interval_ms: i64,
     existing_open_times: &[i64],
 ) -> Vec<MissingKlineRange> {
-    let existing = existing_open_times
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
+    let existing = existing_open_times.iter().copied().collect::<BTreeSet<_>>();
     let mut ranges = Vec::new();
     let mut current_start = None;
     let mut expected = window_start_open_time;
@@ -110,8 +107,7 @@ pub async fn missing_ranges_for_source(
     window_end_open_time: i64,
 ) -> Result<Vec<MissingKlineRange>, RestError> {
     let interval_ms = source.interval.as_millis() as i64;
-    let expected_bars =
-        ((window_end_open_time - window_start_open_time) / interval_ms + 1) as u32;
+    let expected_bars = ((window_end_open_time - window_start_open_time) / interval_ms + 1) as u32;
     let rows = store
         .query_klines(
             &source.symbol,

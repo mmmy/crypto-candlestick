@@ -1,9 +1,9 @@
-use crypto_candlestick::binance::rest::parse_rest_klines;
-use crypto_candlestick::binance::rest::rebuild_custom_klines;
 use crypto_candlestick::binance::rest::closed_lookback_window;
 use crypto_candlestick::binance::rest::missing_ranges_for_source;
-use crypto_candlestick::binance::rest::{plan_rest_kline_pages, RestKlinePage};
+use crypto_candlestick::binance::rest::parse_rest_klines;
+use crypto_candlestick::binance::rest::rebuild_custom_klines;
 use crypto_candlestick::binance::rest::{detect_missing_kline_ranges, MissingKlineRange};
+use crypto_candlestick::binance::rest::{plan_rest_kline_pages, RestKlinePage};
 use crypto_candlestick::binance::worker::{KlineSource, SubscriptionPlan};
 use crypto_candlestick::domain::candle::Candle;
 use crypto_candlestick::domain::interval::Interval;
@@ -84,12 +84,7 @@ async fn rebuilds_custom_interval_from_native_base_rows() {
 
 #[test]
 fn detects_single_missing_kline_range() {
-    let ranges = detect_missing_kline_ranges(
-        0,
-        4 * 60_000,
-        60_000,
-        &[0, 60_000, 180_000, 240_000],
-    );
+    let ranges = detect_missing_kline_ranges(0, 4 * 60_000, 60_000, &[0, 60_000, 180_000, 240_000]);
 
     assert_eq!(
         ranges,

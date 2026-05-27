@@ -1,5 +1,6 @@
 use crypto_candlestick::binance::rest::parse_rest_klines;
 use crypto_candlestick::binance::rest::rebuild_custom_klines;
+use crypto_candlestick::binance::rest::{detect_missing_kline_ranges, MissingKlineRange};
 use crypto_candlestick::binance::worker::SubscriptionPlan;
 use crypto_candlestick::domain::candle::Candle;
 use crypto_candlestick::domain::interval::Interval;
@@ -76,4 +77,72 @@ async fn rebuilds_custom_interval_from_native_base_rows() {
     assert_eq!(rows[0].candle.high, 103.0);
     assert_eq!(rows[0].candle.close, 102.0);
     assert_eq!(rows[0].candle.volume, 20.0);
+}
+
+#[test]
+fn detects_single_missing_kline_range() {
+    let ranges = detect_missing_kline_ranges(
+        0,
+        4 * 60_000,
+        60_000,
+        &[0, 60_000, 180_000, 240_000],
+    );
+
+    assert_eq!(
+        ranges,
+        vec![MissingKlineRange {
+            start_open_time: 120_000,
+            end_open_time: 120_000,
+            interval_ms: 60_000,
+        }]
+    );
+}
+
+#[test]
+fn merges_consecutive_missing_klines_into_one_range() {
+    let ranges = detect_missing_kline_ranges(0, 5 * 60_000, 60_000, &[0, 60_000, 300_000]);
+
+    assert_eq!(
+        ranges,
+        vec![MissingKlineRange {
+            start_open_time: 120_000,
+            end_open_time: 240_000,
+            interval_ms: 60_000,
+        }]
+    );
+}
+
+#[test]
+fn detects_tail_lag_as_missing_range() {
+    let ranges = detect_missing_kline_ranges(0, 4 * 60_000, 60_000, &[0, 60_000, 120_000]);
+
+    assert_eq!(
+        ranges,
+        vec![MissingKlineRange {
+            start_open_time: 180_000,
+            end_open_time: 240_000,
+            interval_ms: 60_000,
+        }]
+    );
+}
+
+#[test]
+fn empty_window_fetches_whole_closed_lookback_range() {
+    let ranges = detect_missing_kline_ranges(0, 2 * 60_000, 60_000, &[]);
+
+    assert_eq!(
+        ranges,
+        vec![MissingKlineRange {
+            start_open_time: 0,
+            end_open_time: 120_000,
+            interval_ms: 60_000,
+        }]
+    );
+}
+
+#[test]
+fn complete_window_has_no_missing_ranges() {
+    let ranges = detect_missing_kline_ranges(0, 2 * 60_000, 60_000, &[0, 60_000, 120_000]);
+
+    assert!(ranges.is_empty());
 }

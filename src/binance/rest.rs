@@ -4,12 +4,67 @@ use crate::{
     storage::sqlite::SqliteStore,
 };
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::time::Duration;
 use tokio::time::sleep;
 
 const BINANCE_FAPI_BASE: &str = "https://fapi.binance.com";
 const MAX_KLINE_LIMIT: u32 = 1500;
 const DEFAULT_REBUILD_LIMIT: u32 = 1_000_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingKlineRange {
+    pub start_open_time: i64,
+    pub end_open_time: i64,
+    pub interval_ms: i64,
+}
+
+impl MissingKlineRange {
+    fn missing_count(&self) -> u32 {
+        ((self.end_open_time - self.start_open_time) / self.interval_ms + 1) as u32
+    }
+}
+
+pub fn detect_missing_kline_ranges(
+    window_start_open_time: i64,
+    window_end_open_time: i64,
+    interval_ms: i64,
+    existing_open_times: &[i64],
+) -> Vec<MissingKlineRange> {
+    let existing = existing_open_times
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut ranges = Vec::new();
+    let mut current_start = None;
+    let mut expected = window_start_open_time;
+
+    while expected <= window_end_open_time {
+        if existing.contains(&expected) {
+            if let Some(start) = current_start.take() {
+                ranges.push(MissingKlineRange {
+                    start_open_time: start,
+                    end_open_time: expected - interval_ms,
+                    interval_ms,
+                });
+            }
+        } else if current_start.is_none() {
+            current_start = Some(expected);
+        }
+
+        expected += interval_ms;
+    }
+
+    if let Some(start) = current_start {
+        ranges.push(MissingKlineRange {
+            start_open_time: start,
+            end_open_time: window_end_open_time,
+            interval_ms,
+        });
+    }
+
+    ranges
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum RestError {

@@ -199,26 +199,83 @@ pub async fn rebuild_custom_klines(
 ) -> Result<(), RestError> {
     for (symbol, base, target) in plan.aggregation_targets() {
         let target_interval = Interval::parse(&target).map_err(|_| RestError::InvalidPayload)?;
-        let start_time = store
-            .max_open_time(&symbol, &target)
-            .await?
-            .map(|open_time| open_time.saturating_sub(target_interval.as_millis() as i64));
+        let base_interval = Interval::parse(&base).map_err(|_| RestError::InvalidPayload)?;
         let source_rows = store
-            .query_klines(&symbol, &base, start_time, None, base_limit)
+            .query_klines(&symbol, &base, None, None, base_limit)
             .await?;
-        let mut aggregator = crate::engine::aggregator::Aggregator::new(target_interval);
 
-        for row in source_rows {
-            if let Ok(Some(closed)) = aggregator.ingest_candle(row.candle) {
-                store.upsert_candle(&symbol, &target, &closed).await?;
-            }
-            if let Some(current) = aggregator.current() {
-                store.upsert_candle(&symbol, &target, &current).await?;
-            }
+        for candle in aggregate_complete_custom_klines(source_rows, base_interval, target_interval)
+        {
+            store.upsert_candle(&symbol, &target, &candle).await?;
         }
     }
 
     Ok(())
+}
+
+fn aggregate_complete_custom_klines(
+    source_rows: Vec<crate::storage::sqlite::StoredKline>,
+    base_interval: Interval,
+    target_interval: Interval,
+) -> Vec<Candle> {
+    let base_ms = base_interval.as_millis() as i64;
+    let target_ms = target_interval.as_millis() as i64;
+    if target_ms % base_ms != 0 {
+        return Vec::new();
+    }
+
+    let mut output = Vec::new();
+    let mut bucket_rows = Vec::new();
+    let mut current_bucket_start = None;
+
+    for row in source_rows {
+        let bucket_start = target_interval.bucket_start_ms(row.candle.open_time);
+        if current_bucket_start.is_some_and(|current| current != bucket_start) {
+            if let Some(candle) = aggregate_complete_bucket(&bucket_rows, base_ms, target_interval)
+            {
+                output.push(candle);
+            }
+            bucket_rows.clear();
+        }
+
+        current_bucket_start = Some(bucket_start);
+        bucket_rows.push(row.candle);
+    }
+
+    if let Some(candle) = aggregate_complete_bucket(&bucket_rows, base_ms, target_interval) {
+        output.push(candle);
+    }
+
+    output
+}
+
+fn aggregate_complete_bucket(
+    bucket_rows: &[Candle],
+    base_ms: i64,
+    target_interval: Interval,
+) -> Option<Candle> {
+    let first = bucket_rows.first()?;
+    let bucket_start = target_interval.bucket_start_ms(first.open_time);
+    let expected_count = (target_interval.as_millis() as i64 / base_ms) as usize;
+
+    if bucket_rows.len() != expected_count || first.open_time != bucket_start {
+        return None;
+    }
+
+    for pair in bucket_rows.windows(2) {
+        if pair[1].open_time - pair[0].open_time != base_ms {
+            return None;
+        }
+    }
+
+    let mut aggregator = crate::engine::aggregator::Aggregator::new(target_interval);
+    for candle in bucket_rows {
+        if aggregator.ingest_candle(candle.clone()).is_err() {
+            return None;
+        }
+    }
+
+    aggregator.flush()
 }
 
 async fn fetch_klines_page(

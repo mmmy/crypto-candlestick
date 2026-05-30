@@ -82,6 +82,77 @@ async fn rebuilds_custom_interval_from_native_base_rows() {
     assert_eq!(rows[0].candle.volume, 20.0);
 }
 
+#[tokio::test]
+async fn rebuilds_missing_custom_interval_inside_existing_history() {
+    let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    for index in 0..8 {
+        let open_time = index * 300_000;
+        store
+            .upsert_candle(
+                "BTCUSDT",
+                "5",
+                &Candle {
+                    open_time,
+                    close_time: open_time + 299_999,
+                    open: 100.0 + index as f64,
+                    high: 101.0 + index as f64,
+                    low: 99.0 + index as f64,
+                    close: 100.5 + index as f64,
+                    volume: 10.0,
+                    quote_volume: 1_000.0,
+                    trade_count: 10,
+                    is_closed: true,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    for open_time in [0, 1_800_000] {
+        store
+            .upsert_candle(
+                "BTCUSDT",
+                "10",
+                &Candle {
+                    open_time,
+                    close_time: open_time + 599_999,
+                    open: 1.0,
+                    high: 1.0,
+                    low: 1.0,
+                    close: 1.0,
+                    volume: 1.0,
+                    quote_volume: 1.0,
+                    trade_count: 1,
+                    is_closed: true,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    let plan = SubscriptionPlan::new(
+        vec!["BTCUSDT".to_string()],
+        vec![Interval::parse("10").unwrap()],
+    );
+    rebuild_custom_klines(&store, &plan, 100).await.unwrap();
+
+    let rows = store
+        .query_klines("BTCUSDT", "10", None, None, 10)
+        .await
+        .unwrap();
+    let open_times = rows
+        .iter()
+        .map(|row| row.candle.open_time)
+        .collect::<Vec<_>>();
+
+    assert_eq!(open_times, vec![0, 600_000, 1_200_000, 1_800_000]);
+    assert_eq!(rows[1].candle.open, 102.0);
+    assert_eq!(rows[1].candle.high, 104.0);
+    assert_eq!(rows[1].candle.low, 101.0);
+    assert_eq!(rows[1].candle.close, 103.5);
+    assert_eq!(rows[1].candle.volume, 20.0);
+}
+
 #[test]
 fn detects_single_missing_kline_range() {
     let ranges = detect_missing_kline_ranges(0, 4 * 60_000, 60_000, &[0, 60_000, 180_000, 240_000]);

@@ -17,6 +17,42 @@ pub struct StoredKline {
     pub candle: Candle,
 }
 
+const UPSERT_CANDLE_SQL: &str = r#"
+    INSERT INTO klines (
+        symbol, interval, open_time, close_time, open, high, low, close,
+        volume, quote_volume, trade_count, is_closed, updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(symbol, interval, open_time) DO UPDATE SET
+        close_time = excluded.close_time,
+        open = excluded.open,
+        high = excluded.high,
+        low = excluded.low,
+        close = excluded.close,
+        volume = excluded.volume,
+        quote_volume = excluded.quote_volume,
+        trade_count = excluded.trade_count,
+        is_closed = excluded.is_closed,
+        updated_at = excluded.updated_at
+    "#;
+
+const PRUNE_SERIES_SQL: &str = r#"
+    DELETE FROM klines
+    WHERE symbol = ?
+      AND interval = ?
+      AND open_time < (
+        SELECT COALESCE(MIN(open_time), 9223372036854775807)
+        FROM (
+            SELECT open_time
+            FROM klines
+            WHERE symbol = ?
+              AND interval = ?
+            ORDER BY open_time DESC
+            LIMIT ?
+        )
+      )
+    "#;
+
 impl SqliteStore {
     pub async fn connect(database_url: &str) -> Result<Self, sqlx::Error> {
         Self::connect_with_retention(database_url, DEFAULT_RETENTION_BARS).await
@@ -76,42 +112,60 @@ impl SqliteStore {
         interval: &str,
         candle: &Candle,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            r#"
-            INSERT INTO klines (
-                symbol, interval, open_time, close_time, open, high, low, close,
-                volume, quote_volume, trade_count, is_closed, updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(symbol, interval, open_time) DO UPDATE SET
-                close_time = excluded.close_time,
-                open = excluded.open,
-                high = excluded.high,
-                low = excluded.low,
-                close = excluded.close,
-                volume = excluded.volume,
-                quote_volume = excluded.quote_volume,
-                trade_count = excluded.trade_count,
-                is_closed = excluded.is_closed,
-                updated_at = excluded.updated_at
-            "#,
-        )
-        .bind(symbol)
-        .bind(interval)
-        .bind(candle.open_time)
-        .bind(candle.close_time)
-        .bind(candle.open)
-        .bind(candle.high)
-        .bind(candle.low)
-        .bind(candle.close)
-        .bind(candle.volume)
-        .bind(candle.quote_volume)
-        .bind(candle.trade_count as i64)
-        .bind(i64::from(candle.is_closed))
-        .bind(chrono::Utc::now().timestamp_millis())
-        .execute(&self.pool)
-        .await?;
+        sqlx::query(UPSERT_CANDLE_SQL)
+            .bind(symbol)
+            .bind(interval)
+            .bind(candle.open_time)
+            .bind(candle.close_time)
+            .bind(candle.open)
+            .bind(candle.high)
+            .bind(candle.low)
+            .bind(candle.close)
+            .bind(candle.volume)
+            .bind(candle.quote_volume)
+            .bind(candle.trade_count as i64)
+            .bind(i64::from(candle.is_closed))
+            .bind(chrono::Utc::now().timestamp_millis())
+            .execute(&self.pool)
+            .await?;
         self.prune_series(symbol, interval).await?;
+        Ok(())
+    }
+
+    pub async fn upsert_candles(
+        &self,
+        symbol: &str,
+        interval: &str,
+        candles: &[Candle],
+    ) -> Result<(), sqlx::Error> {
+        if candles.is_empty() {
+            return Ok(());
+        }
+
+        let updated_at = chrono::Utc::now().timestamp_millis();
+        let mut tx = self.pool.begin().await?;
+        for candle in candles {
+            sqlx::query(UPSERT_CANDLE_SQL)
+                .bind(symbol)
+                .bind(interval)
+                .bind(candle.open_time)
+                .bind(candle.close_time)
+                .bind(candle.open)
+                .bind(candle.high)
+                .bind(candle.low)
+                .bind(candle.close)
+                .bind(candle.volume)
+                .bind(candle.quote_volume)
+                .bind(candle.trade_count as i64)
+                .bind(i64::from(candle.is_closed))
+                .bind(updated_at)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        self.prune_series_in_transaction(&mut tx, symbol, interval)
+            .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -238,31 +292,35 @@ impl SqliteStore {
             return Ok(());
         }
 
-        sqlx::query(
-            r#"
-            DELETE FROM klines
-            WHERE symbol = ?
-              AND interval = ?
-              AND open_time < (
-                SELECT COALESCE(MIN(open_time), 9223372036854775807)
-                FROM (
-                    SELECT open_time
-                    FROM klines
-                    WHERE symbol = ?
-                      AND interval = ?
-                    ORDER BY open_time DESC
-                    LIMIT ?
-                )
-              )
-            "#,
-        )
-        .bind(symbol)
-        .bind(interval)
-        .bind(symbol)
-        .bind(interval)
-        .bind(i64::from(self.retention_bars))
-        .execute(&self.pool)
-        .await?;
+        sqlx::query(PRUNE_SERIES_SQL)
+            .bind(symbol)
+            .bind(interval)
+            .bind(symbol)
+            .bind(interval)
+            .bind(i64::from(self.retention_bars))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn prune_series_in_transaction(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        symbol: &str,
+        interval: &str,
+    ) -> Result<(), sqlx::Error> {
+        if self.retention_bars == 0 {
+            return Ok(());
+        }
+
+        sqlx::query(PRUNE_SERIES_SQL)
+            .bind(symbol)
+            .bind(interval)
+            .bind(symbol)
+            .bind(interval)
+            .bind(i64::from(self.retention_bars))
+            .execute(&mut **tx)
+            .await?;
         Ok(())
     }
 }

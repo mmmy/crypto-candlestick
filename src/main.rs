@@ -29,6 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect::<Vec<_>>();
 
     if !config.symbols.is_empty() && !config.intervals.is_empty() {
+        let mut initial_sync_completed = false;
         if config.sync_on_start {
             tracing::info!("syncing native Binance klines before websocket startup");
             if let Err(err) = sync_native_klines(
@@ -40,6 +41,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
             {
                 tracing::warn!("startup sync failed: {}", err);
+            } else {
+                initial_sync_completed = true;
             }
         }
 
@@ -51,6 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             config.symbols,
             config.intervals,
             config.sync_lookback_bars,
+            !initial_sync_completed,
         );
         tokio::spawn(async move {
             worker.run().await;

@@ -106,6 +106,44 @@ async fn prunes_old_rows_over_retention_limit() {
 }
 
 #[tokio::test]
+async fn batch_upsert_prunes_once_after_inserted_rows() {
+    let store = SqliteStore::connect_with_retention("sqlite::memory:", 3)
+        .await
+        .unwrap();
+    let candles = (0..5)
+        .map(|index| {
+            let open_time = index * 60_000;
+            Candle {
+                open_time,
+                close_time: open_time + 59_999,
+                open: 100.0,
+                high: 101.0,
+                low: 99.0,
+                close: 100.5,
+                volume: 12.5,
+                quote_volume: 1_250.0,
+                trade_count: 3,
+                is_closed: true,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    store
+        .upsert_candles("BTCUSDT", "1", &candles)
+        .await
+        .unwrap();
+
+    let rows = store
+        .query_klines("BTCUSDT", "1", None, None, 10)
+        .await
+        .unwrap();
+
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].candle.open_time, 120_000);
+    assert_eq!(rows[2].candle.open_time, 240_000);
+}
+
+#[tokio::test]
 async fn query_without_time_bounds_returns_latest_rows_in_ascending_order() {
     let store = SqliteStore::connect_with_retention("sqlite::memory:", 0)
         .await

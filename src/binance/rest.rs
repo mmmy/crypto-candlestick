@@ -4,7 +4,7 @@ use crate::{
     storage::sqlite::SqliteStore,
 };
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -176,11 +176,9 @@ pub async fn sync_native_klines(
                 )
                 .await?;
 
-                for candle in &candles {
-                    store
-                        .upsert_candle(&source.symbol, &source.canonical_interval, candle)
-                        .await?;
-                }
+                store
+                    .upsert_candles(&source.symbol, &source.canonical_interval, &candles)
+                    .await?;
 
                 sleep(Duration::from_millis(120)).await;
             }
@@ -204,10 +202,38 @@ pub async fn rebuild_custom_klines(
             .query_klines(&symbol, &base, None, None, base_limit)
             .await?;
 
-        for candle in aggregate_complete_custom_klines(source_rows, base_interval, target_interval)
-        {
-            store.upsert_candle(&symbol, &target, &candle).await?;
+        let candles = aggregate_complete_custom_klines(source_rows, base_interval, target_interval);
+        if candles.is_empty() {
+            continue;
         }
+
+        let start_time = candles.first().map(|candle| candle.open_time);
+        let end_time = candles.last().map(|candle| candle.open_time);
+        let Some((start_time, end_time)) = start_time.zip(end_time) else {
+            continue;
+        };
+
+        let existing_rows = store
+            .query_klines(
+                &symbol,
+                &target,
+                Some(start_time),
+                Some(end_time),
+                candles.len() as u32,
+            )
+            .await?;
+        let existing_open_times = existing_rows
+            .into_iter()
+            .map(|row| row.candle.open_time)
+            .collect::<HashSet<_>>();
+        let missing_candles = candles
+            .into_iter()
+            .filter(|candle| !existing_open_times.contains(&candle.open_time))
+            .collect::<Vec<_>>();
+
+        store
+            .upsert_candles(&symbol, &target, &missing_candles)
+            .await?;
     }
 
     Ok(())

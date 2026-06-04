@@ -146,11 +146,13 @@ async fn rebuilds_missing_custom_interval_inside_existing_history() {
         .collect::<Vec<_>>();
 
     assert_eq!(open_times, vec![0, 600_000, 1_200_000, 1_800_000]);
+    assert_eq!(rows[0].candle.open, 1.0);
     assert_eq!(rows[1].candle.open, 102.0);
     assert_eq!(rows[1].candle.high, 104.0);
     assert_eq!(rows[1].candle.low, 101.0);
     assert_eq!(rows[1].candle.close, 103.5);
     assert_eq!(rows[1].candle.volume, 20.0);
+    assert_eq!(rows[3].candle.open, 1.0);
 }
 
 #[test]

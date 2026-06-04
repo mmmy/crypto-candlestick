@@ -139,6 +139,7 @@ pub struct BinanceWorker {
     runtime_health: RuntimeHealth,
     plan: SubscriptionPlan,
     sync_lookback_bars: u32,
+    catch_up_on_first_connect: bool,
     custom_aggregators: HashMap<(String, String, String), Aggregator>,
     second_aggregators: HashMap<(String, String), Aggregator>,
 }
@@ -152,6 +153,7 @@ impl BinanceWorker {
         symbols: Vec<String>,
         intervals: Vec<Interval>,
         sync_lookback_bars: u32,
+        catch_up_on_first_connect: bool,
     ) -> Self {
         let plan = SubscriptionPlan::new(symbols, intervals);
         let mut custom_aggregators = HashMap::new();
@@ -176,6 +178,7 @@ impl BinanceWorker {
             runtime_health,
             plan,
             sync_lookback_bars,
+            catch_up_on_first_connect,
             custom_aggregators,
             second_aggregators,
         }
@@ -194,21 +197,26 @@ impl BinanceWorker {
         let url = self.plan.stream_url();
 
         let mut backoff_secs = 1u64;
+        let mut should_catch_up_on_connect = self.catch_up_on_first_connect;
         loop {
             match connect_async(&url).await {
                 Ok((ws, _)) => {
                     tracing::info!("connected to Binance websocket");
                     self.runtime_health.mark_connected().await;
                     backoff_secs = 1;
-                    if let Err(err) = sync_native_klines(
-                        &self.store,
-                        self.plan.symbols.clone(),
-                        self.plan.intervals.clone(),
-                        self.sync_lookback_bars,
-                    )
-                    .await
-                    {
-                        tracing::warn!("websocket reconnect kline catch-up failed: {}", err);
+                    if should_catch_up_on_connect {
+                        if let Err(err) = sync_native_klines(
+                            &self.store,
+                            self.plan.symbols.clone(),
+                            self.plan.intervals.clone(),
+                            self.sync_lookback_bars,
+                        )
+                        .await
+                        {
+                            tracing::warn!("websocket reconnect kline catch-up failed: {}", err);
+                        }
+                    } else {
+                        should_catch_up_on_connect = true;
                     }
                     let (_, mut read) = ws.split();
                     loop {

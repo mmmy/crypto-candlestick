@@ -11,6 +11,7 @@ use axum::{
 };
 use chrono::Local;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
@@ -89,10 +90,24 @@ pub async fn deep_health(
                         err.to_string(),
                     )
                 })?;
-            (
-                "sqlite",
-                rows.into_iter().map(|row| row.candle).collect::<Vec<_>>(),
-            )
+            let buffered_rows = state
+                .closed_buffer
+                .query(
+                    &target.symbol,
+                    &canonical_interval,
+                    None,
+                    None,
+                    DEEP_HEALTH_SCAN_LIMIT,
+                )
+                .await;
+            let rows = merge_kline_rows(rows.into_iter().rev().collect(), buffered_rows);
+            let candles_desc = rows
+                .into_iter()
+                .rev()
+                .take(DEEP_HEALTH_SCAN_LIMIT as usize)
+                .map(|row| row.candle)
+                .collect::<Vec<_>>();
+            ("sqlite+buffer", candles_desc)
         };
 
         let latest_open_time = candles_desc
@@ -371,7 +386,7 @@ async fn query_kline_series(
             )
             .await
     } else {
-        state
+        let rows = state
             .store
             .query_klines(
                 symbol,
@@ -386,7 +401,18 @@ async fn query_kline_series(
                     axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                     err.to_string(),
                 )
-            })?
+            })?;
+        let buffered_rows = state
+            .closed_buffer
+            .query(
+                symbol,
+                &canonical_interval,
+                start_time,
+                end_time,
+                query_limit,
+            )
+            .await;
+        merge_kline_rows(rows, buffered_rows)
     };
 
     if !closed_only {
@@ -444,6 +470,21 @@ async fn query_kline_series(
         count: data.len(),
         data,
     })
+}
+
+fn merge_kline_rows(
+    persisted_rows: Vec<StoredKline>,
+    buffered_rows: Vec<StoredKline>,
+) -> Vec<StoredKline> {
+    let mut rows_by_open_time = BTreeMap::new();
+    for row in persisted_rows {
+        rows_by_open_time.insert(row.candle.open_time, row);
+    }
+    for row in buffered_rows {
+        rows_by_open_time.insert(row.candle.open_time, row);
+    }
+
+    rows_by_open_time.into_values().collect()
 }
 
 fn keep_latest_contiguous_rows(rows: &mut Vec<StoredKline>, interval_ms: i64) {

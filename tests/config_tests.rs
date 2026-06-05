@@ -10,6 +10,8 @@ fn builds_config_from_environment_values() {
         ("RETENTION_BARS", "1234"),
         ("SYNC_ON_START", "false"),
         ("SYNC_LOOKBACK_BARS", "777"),
+        ("REALTIME_FLUSH_INTERVAL_SECS", "60"),
+        ("REALTIME_FLUSH_MAX_ROWS", "250"),
         ("LOG_DIR", "custom-logs"),
     ]);
 
@@ -20,5 +22,7 @@ fn builds_config_from_environment_values() {
     assert_eq!(config.retention_bars, 1234);
     assert!(!config.sync_on_start);
     assert_eq!(config.sync_lookback_bars, 777);
+    assert_eq!(config.realtime_flush_interval_secs, 60);
+    assert_eq!(config.realtime_flush_max_rows, 250);
     assert_eq!(config.log_dir, "custom-logs");
 }

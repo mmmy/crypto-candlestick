@@ -2,7 +2,7 @@ use axum::http::StatusCode;
 use chrono::{Local, SecondsFormat, TimeZone};
 use crypto_candlestick::domain::candle::Candle;
 use crypto_candlestick::http::{router, AppState, HealthTarget};
-use crypto_candlestick::memory::{LatestCache, MemorySeriesStore};
+use crypto_candlestick::memory::{ClosedKlineBuffer, LatestCache, MemorySeriesStore};
 use crypto_candlestick::runtime_health::RuntimeHealth;
 use crypto_candlestick::storage::sqlite::SqliteStore;
 
@@ -13,6 +13,7 @@ async fn health_endpoint_returns_ok() {
         store,
         latest: LatestCache::default(),
         memory_series: MemorySeriesStore::default(),
+        closed_buffer: ClosedKlineBuffer::default(),
         health_targets: Vec::new(),
         runtime_health: RuntimeHealth::default(),
     });
@@ -70,6 +71,7 @@ async fn deep_health_reports_consecutive_closed_klines_from_latest() {
         store,
         latest: LatestCache::default(),
         memory_series: MemorySeriesStore::default(),
+        closed_buffer: ClosedKlineBuffer::default(),
         health_targets: vec![HealthTarget {
             symbol: "BTCUSDT".to_string(),
             interval: "1".to_string(),
@@ -135,6 +137,7 @@ async fn deep_health_reports_stale_series_as_unhealthy() {
         store,
         latest: LatestCache::default(),
         memory_series: MemorySeriesStore::default(),
+        closed_buffer: ClosedKlineBuffer::default(),
         health_targets: vec![HealthTarget {
             symbol: "BTCUSDT".to_string(),
             interval: "1".to_string(),
@@ -174,6 +177,7 @@ async fn deep_health_reports_stale_websocket_as_unhealthy() {
         store,
         latest: LatestCache::default(),
         memory_series: MemorySeriesStore::default(),
+        closed_buffer: ClosedKlineBuffer::default(),
         health_targets: Vec::new(),
         runtime_health,
     });
@@ -214,6 +218,7 @@ async fn deep_health_reports_disconnected_websocket_as_unhealthy() {
         store,
         latest: LatestCache::default(),
         memory_series: MemorySeriesStore::default(),
+        closed_buffer: ClosedKlineBuffer::default(),
         health_targets: Vec::new(),
         runtime_health,
     });
@@ -260,6 +265,7 @@ async fn klines_endpoint_returns_persisted_rows() {
         store,
         latest: LatestCache::default(),
         memory_series: MemorySeriesStore::default(),
+        closed_buffer: ClosedKlineBuffer::default(),
         health_targets: Vec::new(),
         runtime_health: RuntimeHealth::default(),
     });
@@ -309,12 +315,89 @@ async fn klines_endpoint_returns_persisted_rows() {
 }
 
 #[tokio::test]
+async fn klines_endpoint_returns_buffered_closed_rows() {
+    let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    store
+        .upsert_candle(
+            "BTCUSDT",
+            "1",
+            &Candle {
+                open_time: 60_000,
+                close_time: 119_999,
+                open: 100.0,
+                high: 101.0,
+                low: 99.0,
+                close: 100.5,
+                volume: 12.5,
+                quote_volume: 1_250.0,
+                trade_count: 3,
+                is_closed: true,
+            },
+        )
+        .await
+        .unwrap();
+
+    let closed_buffer = ClosedKlineBuffer::default();
+    closed_buffer
+        .upsert(
+            "BTCUSDT",
+            "1",
+            Candle {
+                open_time: 120_000,
+                close_time: 179_999,
+                open: 101.0,
+                high: 102.0,
+                low: 100.0,
+                close: 101.5,
+                volume: 10.0,
+                quote_volume: 1_000.0,
+                trade_count: 4,
+                is_closed: true,
+            },
+        )
+        .await;
+
+    let app = router(AppState {
+        store,
+        latest: LatestCache::default(),
+        memory_series: MemorySeriesStore::default(),
+        closed_buffer,
+        health_targets: Vec::new(),
+        runtime_health: RuntimeHealth::default(),
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let response = reqwest::get(format!(
+        "http://{addr}/api/klines?symbol=BTCUSDT&intervals=1&limit=10&closedOnly=true"
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["series"][0]["count"], 2);
+    assert_eq!(
+        body["series"][0]["endTime"],
+        "1970-01-01T08:02:00.000+08:00"
+    );
+    assert_eq!(body["series"][0]["data"][1]["candle"]["open"], 101.0);
+
+    server.abort();
+}
+
+#[tokio::test]
 async fn klines_endpoint_defaults_limit_to_200() {
     let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
     let app = router(AppState {
         store,
         latest: LatestCache::default(),
         memory_series: MemorySeriesStore::default(),
+        closed_buffer: ClosedKlineBuffer::default(),
         health_targets: Vec::new(),
         runtime_health: RuntimeHealth::default(),
     });
@@ -386,6 +469,7 @@ async fn klines_endpoint_appends_latest_open_candle_from_memory() {
         store,
         latest,
         memory_series: MemorySeriesStore::default(),
+        closed_buffer: ClosedKlineBuffer::default(),
         health_targets: Vec::new(),
         runtime_health: RuntimeHealth::default(),
     });
@@ -466,6 +550,7 @@ async fn klines_endpoint_can_return_closed_rows_only() {
         store,
         latest,
         memory_series: MemorySeriesStore::default(),
+        closed_buffer: ClosedKlineBuffer::default(),
         health_targets: Vec::new(),
         runtime_health: RuntimeHealth::default(),
     });
@@ -546,6 +631,7 @@ async fn klines_endpoint_keeps_latest_contiguous_rows_after_a_gap() {
         store,
         latest,
         memory_series: MemorySeriesStore::default(),
+        closed_buffer: ClosedKlineBuffer::default(),
         health_targets: Vec::new(),
         runtime_health: RuntimeHealth::default(),
     });
@@ -625,6 +711,7 @@ async fn second_interval_query_reads_closed_rows_from_memory_not_sqlite() {
         store,
         latest,
         memory_series,
+        closed_buffer: ClosedKlineBuffer::default(),
         health_targets: Vec::new(),
         runtime_health: RuntimeHealth::default(),
     });
@@ -699,6 +786,7 @@ async fn klines_endpoint_returns_multiple_intervals_in_request_order() {
         store,
         latest,
         memory_series,
+        closed_buffer: ClosedKlineBuffer::default(),
         health_targets: Vec::new(),
         runtime_health: RuntimeHealth::default(),
     });
@@ -734,6 +822,7 @@ async fn klines_endpoint_rejects_missing_intervals() {
         store,
         latest: LatestCache::default(),
         memory_series: MemorySeriesStore::default(),
+        closed_buffer: ClosedKlineBuffer::default(),
         health_targets: Vec::new(),
         runtime_health: RuntimeHealth::default(),
     });
@@ -763,6 +852,7 @@ async fn klines_endpoint_rejects_empty_interval_item() {
         store,
         latest: LatestCache::default(),
         memory_series: MemorySeriesStore::default(),
+        closed_buffer: ClosedKlineBuffer::default(),
         health_targets: Vec::new(),
         runtime_health: RuntimeHealth::default(),
     });

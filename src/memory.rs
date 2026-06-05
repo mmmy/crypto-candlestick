@@ -1,5 +1,8 @@
 use crate::{domain::candle::Candle, storage::sqlite::StoredKline};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 use tokio::sync::RwLock;
 
 pub const DEFAULT_MEMORY_SERIES_LIMIT: usize = 5_000;
@@ -7,6 +10,112 @@ pub const DEFAULT_MEMORY_SERIES_LIMIT: usize = 5_000;
 #[derive(Debug, Clone, Default)]
 pub struct LatestCache {
     inner: Arc<RwLock<HashMap<(String, String), Candle>>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ClosedKlineBuffer {
+    inner: Arc<RwLock<BTreeMap<(String, String, i64), Candle>>>,
+}
+
+impl ClosedKlineBuffer {
+    pub async fn upsert(&self, symbol: &str, interval: &str, mut candle: Candle) -> usize {
+        candle.is_closed = true;
+        let mut inner = self.inner.write().await;
+        inner.insert(
+            (
+                symbol.to_uppercase(),
+                interval.to_string(),
+                candle.open_time,
+            ),
+            candle,
+        );
+        inner.len()
+    }
+
+    pub async fn query(
+        &self,
+        symbol: &str,
+        interval: &str,
+        start_time: Option<i64>,
+        end_time: Option<i64>,
+        limit: u32,
+    ) -> Vec<StoredKline> {
+        let symbol = symbol.to_uppercase();
+        let interval = interval.to_string();
+        let inner = self.inner.read().await;
+        let mut result = inner
+            .iter()
+            .filter(|((row_symbol, row_interval, open_time), _)| {
+                row_symbol == &symbol
+                    && row_interval == &interval
+                    && start_time.map(|start| *open_time >= start).unwrap_or(true)
+                    && end_time.map(|end| *open_time <= end).unwrap_or(true)
+            })
+            .map(|((row_symbol, row_interval, _), candle)| StoredKline {
+                symbol: row_symbol.clone(),
+                interval: row_interval.clone(),
+                candle: candle.clone(),
+            })
+            .collect::<Vec<_>>();
+
+        if result.len() > limit as usize {
+            let start = result.len() - limit as usize;
+            result = result.split_off(start);
+        }
+
+        result
+    }
+
+    pub async fn drain_grouped(&self) -> HashMap<(String, String), Vec<Candle>> {
+        let mut inner = self.inner.write().await;
+        let rows = std::mem::take(&mut *inner);
+        let mut grouped = HashMap::<(String, String), Vec<Candle>>::new();
+
+        for ((symbol, interval, _), candle) in rows {
+            grouped.entry((symbol, interval)).or_default().push(candle);
+        }
+
+        grouped
+    }
+
+    pub async fn snapshot_grouped(&self) -> HashMap<(String, String), Vec<Candle>> {
+        let inner = self.inner.read().await;
+        let mut grouped = HashMap::<(String, String), Vec<Candle>>::new();
+
+        for ((symbol, interval, _), candle) in inner.iter() {
+            grouped
+                .entry((symbol.clone(), interval.clone()))
+                .or_default()
+                .push(candle.clone());
+        }
+
+        grouped
+    }
+
+    pub async fn remove_flushed(&self, grouped: &HashMap<(String, String), Vec<Candle>>) -> usize {
+        let mut inner = self.inner.write().await;
+
+        for ((symbol, interval), candles) in grouped {
+            for candle in candles {
+                let key = (symbol.clone(), interval.clone(), candle.open_time);
+                if inner.get(&key) == Some(candle) {
+                    inner.remove(&key);
+                }
+            }
+        }
+
+        inner.len()
+    }
+
+    pub async fn requeue_grouped(&self, grouped: HashMap<(String, String), Vec<Candle>>) -> usize {
+        let mut inner = self.inner.write().await;
+        for ((symbol, interval), candles) in grouped {
+            for candle in candles {
+                inner.insert((symbol.clone(), interval.clone(), candle.open_time), candle);
+            }
+        }
+        inner.len()
+    }
 }
 
 impl LatestCache {

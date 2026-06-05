@@ -1,5 +1,5 @@
 use crate::{
-    memory::{LatestCache, MemorySeriesStore},
+    memory::{ClosedKlineBuffer, LatestCache, MemorySeriesStore},
     runtime_health::RuntimeHealth,
     storage::sqlite::SqliteStore,
 };
@@ -12,6 +12,7 @@ pub struct AppState {
     pub store: SqliteStore,
     pub latest: LatestCache,
     pub memory_series: MemorySeriesStore,
+    pub closed_buffer: ClosedKlineBuffer,
     pub health_targets: Vec<HealthTarget>,
     pub runtime_health: RuntimeHealth,
 }

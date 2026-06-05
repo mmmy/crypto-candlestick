@@ -1,17 +1,19 @@
 use super::types::{parse_combined_stream_message, MarketEvent};
 use crate::{
     binance::rest::sync_native_klines,
-    domain::interval::Interval,
+    domain::{candle::Candle, interval::Interval},
     engine::aggregator::{Aggregator, TradeTick},
-    memory::{LatestCache, MemorySeriesStore},
+    memory::{ClosedKlineBuffer, LatestCache, MemorySeriesStore},
     runtime_health::{RuntimeHealth, WS_IDLE_TIMEOUT},
     storage::sqlite::SqliteStore,
 };
 use futures_util::StreamExt;
 use std::{
     collections::{BTreeSet, HashMap},
+    sync::Arc,
     time::Duration,
 };
+use tokio::sync::Mutex;
 use tokio::time::sleep;
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -136,24 +138,32 @@ pub struct BinanceWorker {
     store: SqliteStore,
     latest: LatestCache,
     memory_series: MemorySeriesStore,
+    closed_buffer: ClosedKlineBuffer,
     runtime_health: RuntimeHealth,
     plan: SubscriptionPlan,
     sync_lookback_bars: u32,
     catch_up_on_first_connect: bool,
+    flush_max_rows: usize,
+    flush_lock: FlushLock,
     custom_aggregators: HashMap<(String, String, String), Aggregator>,
     second_aggregators: HashMap<(String, String), Aggregator>,
 }
+
+pub type FlushLock = Arc<Mutex<()>>;
 
 impl BinanceWorker {
     pub fn new(
         store: SqliteStore,
         latest: LatestCache,
         memory_series: MemorySeriesStore,
+        closed_buffer: ClosedKlineBuffer,
         runtime_health: RuntimeHealth,
         symbols: Vec<String>,
         intervals: Vec<Interval>,
         sync_lookback_bars: u32,
         catch_up_on_first_connect: bool,
+        flush_max_rows: usize,
+        flush_lock: FlushLock,
     ) -> Self {
         let plan = SubscriptionPlan::new(symbols, intervals);
         let mut custom_aggregators = HashMap::new();
@@ -175,10 +185,13 @@ impl BinanceWorker {
             store,
             latest,
             memory_series,
+            closed_buffer,
             runtime_health,
             plan,
             sync_lookback_bars,
             catch_up_on_first_connect,
+            flush_max_rows,
+            flush_lock,
             custom_aggregators,
             second_aggregators,
         }
@@ -309,13 +322,22 @@ impl BinanceWorker {
             } => {
                 if let Ok(source_interval) = Interval::parse(&interval) {
                     let source = source_interval.canonical();
-                    let _ = self.store.upsert_candle(&symbol, &source, &candle).await;
+                    self.buffer_closed_candle(&symbol, &source, candle.clone())
+                        .await;
                     self.latest.remove(&symbol, &source).await;
 
                     for (key, agg) in self.custom_aggregators.iter_mut() {
                         if key.0 == symbol && key.1 == source {
                             if let Ok(Some(closed)) = agg.ingest_candle(candle.clone()) {
-                                let _ = self.store.upsert_candle(&symbol, &key.2, &closed).await;
+                                let rows = self.closed_buffer.upsert(&symbol, &key.2, closed).await;
+                                if rows >= self.flush_max_rows {
+                                    flush_closed_buffer(
+                                        &self.store,
+                                        &self.closed_buffer,
+                                        &self.flush_lock,
+                                    )
+                                    .await;
+                                }
                                 self.latest.remove(&symbol, &key.2).await;
                             }
                             if agg
@@ -324,8 +346,16 @@ impl BinanceWorker {
                                 .unwrap_or(false)
                             {
                                 if let Some(closed) = agg.flush() {
-                                    let _ =
-                                        self.store.upsert_candle(&symbol, &key.2, &closed).await;
+                                    let rows =
+                                        self.closed_buffer.upsert(&symbol, &key.2, closed).await;
+                                    if rows >= self.flush_max_rows {
+                                        flush_closed_buffer(
+                                            &self.store,
+                                            &self.closed_buffer,
+                                            &self.flush_lock,
+                                        )
+                                        .await;
+                                    }
                                     self.latest.remove(&symbol, &key.2).await;
                                 }
                             } else if let Some(mut current) = agg.current() {
@@ -358,6 +388,13 @@ impl BinanceWorker {
                 }
             }
             MarketEvent::Ignored => {}
+        }
+    }
+
+    async fn buffer_closed_candle(&self, symbol: &str, interval: &str, candle: Candle) {
+        let rows = self.closed_buffer.upsert(symbol, interval, candle).await;
+        if rows >= self.flush_max_rows {
+            flush_closed_buffer(&self.store, &self.closed_buffer, &self.flush_lock).await;
         }
     }
 
@@ -440,5 +477,36 @@ impl BinanceWorker {
         }
 
         Ok(())
+    }
+}
+
+pub async fn flush_closed_buffer(
+    store: &SqliteStore,
+    closed_buffer: &ClosedKlineBuffer,
+    flush_lock: &FlushLock,
+) {
+    let _guard = flush_lock.lock().await;
+    let grouped = closed_buffer.snapshot_grouped().await;
+    if grouped.is_empty() {
+        return;
+    }
+
+    let mut flushed = HashMap::new();
+    for ((symbol, interval), candles) in grouped {
+        if let Err(err) = store.upsert_candles(&symbol, &interval, &candles).await {
+            tracing::warn!(
+                symbol = %symbol,
+                interval = %interval,
+                rows = candles.len(),
+                "failed to flush closed kline buffer: {}",
+                err
+            );
+        } else {
+            flushed.insert((symbol, interval), candles);
+        }
+    }
+
+    if !flushed.is_empty() {
+        closed_buffer.remove_flushed(&flushed).await;
     }
 }

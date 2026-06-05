@@ -10,6 +10,8 @@ pub struct AppConfig {
     pub retention_bars: u32,
     pub sync_on_start: bool,
     pub sync_lookback_bars: u32,
+    pub realtime_flush_interval_secs: u64,
+    pub realtime_flush_max_rows: usize,
     pub log_dir: String,
 }
 
@@ -46,6 +48,12 @@ impl AppConfig {
             sync_lookback_bars: lookup("SYNC_LOOKBACK_BARS")
                 .and_then(|value| value.parse::<u32>().ok())
                 .unwrap_or(1500),
+            realtime_flush_interval_secs: lookup("REALTIME_FLUSH_INTERVAL_SECS")
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(300),
+            realtime_flush_max_rows: lookup("REALTIME_FLUSH_MAX_ROWS")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(1_000),
             log_dir: lookup("LOG_DIR").unwrap_or_else(|| "logs".to_string()),
         }
     }

@@ -85,6 +85,8 @@ cargo run
 | `RETENTION_BARS` | `5000` | 每个交易对/周期最多保留的已存储 K 线数量，设为 `0` 表示不裁剪 |
 | `SYNC_ON_START` | `true` | 启动时是否同步历史 K 线 |
 | `SYNC_LOOKBACK_BARS` | `1500` | 没有本地历史时，启动同步回看的 K 线数量 |
+| `REALTIME_FLUSH_INTERVAL_SECS` | `300` | 实时收盘 K 线最多缓存多久后批量写入 SQLite |
+| `REALTIME_FLUSH_MAX_ROWS` | `1000` | 实时收盘 K 线缓存达到多少条时提前批量写入 SQLite |
 | `LOG_DIR` | `logs` | 按天滚动日志文件目录，同时保留控制台日志输出 |
 
 示例：
@@ -97,6 +99,8 @@ BINANCE_INTERVALS=15S,30S,1,5,15,60,D,W
 RETENTION_BARS=5000
 SYNC_ON_START=true
 SYNC_LOOKBACK_BARS=1500
+REALTIME_FLUSH_INTERVAL_SECS=300
+REALTIME_FLUSH_MAX_ROWS=1000
 LOG_DIR=logs
 ```
 

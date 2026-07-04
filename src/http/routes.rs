@@ -5,7 +5,7 @@ use crate::{
 };
 use axum::{routing::get, Router};
 
-use super::handlers::{deep_health, health, klines};
+use super::handlers::{deep_health, health, health_summary, klines};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -25,7 +25,11 @@ pub struct HealthTarget {
 
 pub fn router(state: AppState) -> Router {
     Router::new()
+        .route("/health", get(health))
+        .route("/health/summary", get(health_summary))
+        .route("/health/deep", get(deep_health))
         .route("/api/health", get(health))
+        .route("/api/health/summary", get(health_summary))
         .route("/api/health/deep", get(deep_health))
         .route("/api/klines", get(klines))
         .with_state(state)

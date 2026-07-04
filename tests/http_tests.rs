@@ -36,6 +36,184 @@ async fn health_endpoint_returns_ok() {
 }
 
 #[tokio::test]
+async fn root_health_endpoint_returns_ok_and_api_health_stays_compatible() {
+    let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let app = router(AppState {
+        store,
+        latest: LatestCache::default(),
+        memory_series: MemorySeriesStore::default(),
+        closed_buffer: ClosedKlineBuffer::default(),
+        health_targets: Vec::new(),
+        runtime_health: RuntimeHealth::default(),
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    for path in ["/health", "/api/health"] {
+        let response = reqwest::get(format!("http://{addr}{path}")).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["ok"], true);
+    }
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn root_deep_health_endpoint_matches_api_deep_health() {
+    let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let current_bucket_start = chrono::Utc::now().timestamp_millis().div_euclid(60_000) * 60_000;
+    store
+        .upsert_candle(
+            "BTCUSDT",
+            "1",
+            &Candle {
+                open_time: current_bucket_start,
+                close_time: current_bucket_start + 59_999,
+                open: 100.0,
+                high: 101.0,
+                low: 99.0,
+                close: 100.5,
+                volume: 12.5,
+                quote_volume: 1_250.0,
+                trade_count: 3,
+                is_closed: true,
+            },
+        )
+        .await
+        .unwrap();
+
+    let app = router(AppState {
+        store,
+        latest: LatestCache::default(),
+        memory_series: MemorySeriesStore::default(),
+        closed_buffer: ClosedKlineBuffer::default(),
+        health_targets: vec![HealthTarget {
+            symbol: "BTCUSDT".to_string(),
+            interval: "1".to_string(),
+        }],
+        runtime_health: RuntimeHealth::default(),
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    for path in ["/health/deep", "/api/health/deep"] {
+        let response = reqwest::get(format!("http://{addr}{path}")).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["series"][0]["symbol"], "BTCUSDT");
+        assert_eq!(body["series"][0]["interval"], "1");
+    }
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn health_summary_returns_aggregate_counts_without_series_details() {
+    let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let current_bucket_start = chrono::Utc::now().timestamp_millis().div_euclid(60_000) * 60_000;
+    store
+        .upsert_candle(
+            "BTCUSDT",
+            "1",
+            &Candle {
+                open_time: current_bucket_start,
+                close_time: current_bucket_start + 59_999,
+                open: 100.0,
+                high: 101.0,
+                low: 99.0,
+                close: 100.5,
+                volume: 12.5,
+                quote_volume: 1_250.0,
+                trade_count: 3,
+                is_closed: true,
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .upsert_candle(
+            "ETHUSDT",
+            "1",
+            &Candle {
+                open_time: 0,
+                close_time: 59_999,
+                open: 100.0,
+                high: 101.0,
+                low: 99.0,
+                close: 100.5,
+                volume: 12.5,
+                quote_volume: 1_250.0,
+                trade_count: 3,
+                is_closed: true,
+            },
+        )
+        .await
+        .unwrap();
+
+    let app = router(AppState {
+        store,
+        latest: LatestCache::default(),
+        memory_series: MemorySeriesStore::default(),
+        closed_buffer: ClosedKlineBuffer::default(),
+        health_targets: vec![
+            HealthTarget {
+                symbol: "BTCUSDT".to_string(),
+                interval: "1".to_string(),
+            },
+            HealthTarget {
+                symbol: "ETHUSDT".to_string(),
+                interval: "1".to_string(),
+            },
+        ],
+        runtime_health: RuntimeHealth::default(),
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let response = reqwest::get(format!("http://{addr}/health/summary"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["websocketOk"], true);
+    assert_eq!(body["totalSeries"], 2);
+    assert_eq!(body["okSeries"], 1);
+    assert_eq!(body["badSeries"], 1);
+    assert!(body.get("serverTime").is_some());
+    assert!(body.get("series").is_none());
+    assert_eq!(body["symbols"][0]["symbol"], "BTCUSDT");
+    assert_eq!(body["symbols"][0]["total"], 1);
+    assert_eq!(body["symbols"][0]["ok"], 1);
+    assert_eq!(body["symbols"][0]["bad"], 0);
+    assert_eq!(body["symbols"][1]["symbol"], "ETHUSDT");
+    assert_eq!(body["symbols"][1]["total"], 1);
+    assert_eq!(body["symbols"][1]["ok"], 0);
+    assert_eq!(body["symbols"][1]["bad"], 1);
+    assert_eq!(body["reasons"][0]["reason"], "latest candle is stale");
+    assert_eq!(body["reasons"][0]["count"], 1);
+
+    server.abort();
+}
+
+#[tokio::test]
 async fn deep_health_reports_consecutive_closed_klines_from_latest() {
     let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
     let current_bucket_start = chrono::Utc::now().timestamp_millis().div_euclid(60_000) * 60_000;

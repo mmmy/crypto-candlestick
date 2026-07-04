@@ -34,6 +34,35 @@ pub struct DeepHealthResponse {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct HealthSummaryResponse {
+    pub ok: bool,
+    pub websocket_ok: bool,
+    pub total_series: usize,
+    pub ok_series: usize,
+    pub bad_series: usize,
+    pub symbols: Vec<SymbolHealthSummary>,
+    pub reasons: Vec<HealthReasonSummary>,
+    pub server_time: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SymbolHealthSummary {
+    pub symbol: String,
+    pub total: usize,
+    pub ok: usize,
+    pub bad: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HealthReasonSummary {
+    pub reason: &'static str,
+    pub count: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SeriesHealth {
     pub symbol: String,
     pub interval: String,
@@ -49,6 +78,57 @@ pub struct SeriesHealth {
 pub async fn deep_health(
     State(state): State<AppState>,
 ) -> Result<Json<DeepHealthResponse>, (axum::http::StatusCode, String)> {
+    Ok(Json(build_deep_health_response(&state).await?))
+}
+
+pub async fn health_summary(
+    State(state): State<AppState>,
+) -> Result<Json<HealthSummaryResponse>, (axum::http::StatusCode, String)> {
+    let deep = build_deep_health_response(&state).await?;
+    let mut symbols = BTreeMap::<String, SymbolHealthSummary>::new();
+    let mut reasons = BTreeMap::<&'static str, usize>::new();
+
+    for item in &deep.series {
+        let summary = symbols
+            .entry(item.symbol.clone())
+            .or_insert_with(|| SymbolHealthSummary {
+                symbol: item.symbol.clone(),
+                total: 0,
+                ok: 0,
+                bad: 0,
+            });
+        summary.total += 1;
+        if item.ok {
+            summary.ok += 1;
+        } else {
+            summary.bad += 1;
+            if let Some(reason) = item.reason {
+                *reasons.entry(reason).or_insert(0) += 1;
+            }
+        }
+    }
+
+    let ok_series = deep.series.iter().filter(|item| item.ok).count();
+    let total_series = deep.series.len();
+
+    Ok(Json(HealthSummaryResponse {
+        ok: deep.ok,
+        websocket_ok: deep.websocket.ok,
+        total_series,
+        ok_series,
+        bad_series: total_series - ok_series,
+        symbols: symbols.into_values().collect(),
+        reasons: reasons
+            .into_iter()
+            .map(|(reason, count)| HealthReasonSummary { reason, count })
+            .collect(),
+        server_time: format_timestamp_ms(chrono::Utc::now().timestamp_millis()),
+    }))
+}
+
+async fn build_deep_health_response(
+    state: &AppState,
+) -> Result<DeepHealthResponse, (axum::http::StatusCode, String)> {
     let mut series = Vec::with_capacity(state.health_targets.len());
 
     for target in &state.health_targets {
@@ -144,11 +224,11 @@ pub async fn deep_health(
 
     let websocket = state.runtime_health.websocket_snapshot().await;
     let ok = websocket.ok && series.iter().all(|item| item.ok);
-    Ok(Json(DeepHealthResponse {
+    Ok(DeepHealthResponse {
         ok,
         websocket,
         series,
-    }))
+    })
 }
 
 fn consecutive_bars_from_latest(candles_desc: &[Candle], interval_ms: i64) -> u32 {

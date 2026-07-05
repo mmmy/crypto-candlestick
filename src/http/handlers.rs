@@ -1,6 +1,7 @@
 use crate::{
     domain::{candle::Candle, interval::Interval},
     http::routes::AppState,
+    indicators::guaili::{compute_guaili, GuailiConfig, GuailiPoint, MaType},
     runtime_health::WebSocketHealth,
     storage::sqlite::StoredKline,
     time_format::format_timestamp_ms,
@@ -449,6 +450,44 @@ async fn query_kline_series(
     closed_only: bool,
 ) -> Result<KlineSeries, (axum::http::StatusCode, String)> {
     let canonical_interval = interval.canonical();
+    let rows = query_kline_rows(
+        state,
+        symbol,
+        interval,
+        start_time,
+        end_time,
+        limit,
+        closed_only,
+    )
+    .await?;
+
+    let start_time = rows
+        .first()
+        .map(|row| format_timestamp_ms(row.candle.open_time));
+    let end_time = rows
+        .last()
+        .map(|row| format_timestamp_ms(row.candle.open_time));
+    let data: Vec<KlineResponse> = rows.into_iter().map(KlineResponse::from).collect();
+
+    Ok(KlineSeries {
+        interval: canonical_interval,
+        start_time,
+        end_time,
+        count: data.len(),
+        data,
+    })
+}
+
+async fn query_kline_rows(
+    state: &AppState,
+    symbol: &str,
+    interval: Interval,
+    start_time: Option<i64>,
+    end_time: Option<i64>,
+    limit: u32,
+    closed_only: bool,
+) -> Result<Vec<StoredKline>, (axum::http::StatusCode, String)> {
+    let canonical_interval = interval.canonical();
     let query_limit = if closed_only {
         limit.saturating_add(1)
     } else {
@@ -535,21 +574,7 @@ async fn query_kline_series(
 
     keep_latest_contiguous_rows(&mut rows, interval.as_millis() as i64);
 
-    let start_time = rows
-        .first()
-        .map(|row| format_timestamp_ms(row.candle.open_time));
-    let end_time = rows
-        .last()
-        .map(|row| format_timestamp_ms(row.candle.open_time));
-    let data: Vec<KlineResponse> = rows.into_iter().map(KlineResponse::from).collect();
-
-    Ok(KlineSeries {
-        interval: canonical_interval,
-        start_time,
-        end_time,
-        count: data.len(),
-        data,
-    })
+    Ok(rows)
 }
 
 fn merge_kline_rows(
@@ -576,4 +601,281 @@ fn keep_latest_contiguous_rows(rows: &mut Vec<StoredKline>, interval_ms: i64) {
     };
 
     rows.drain(..=last_gap_index);
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuailiQuery {
+    pub symbols: Option<String>,
+    pub intervals: Option<String>,
+    pub start_time: Option<i64>,
+    pub end_time: Option<i64>,
+    pub limit: Option<u32>,
+    pub calc_limit: Option<u32>,
+    pub closed_only: Option<bool>,
+    pub ma_length: Option<usize>,
+    pub ma_type: Option<String>,
+    pub atr_len: Option<usize>,
+    pub atr_percent_len: Option<usize>,
+    pub max_atr_rank: Option<f64>,
+    pub slope_mul: Option<f64>,
+    pub use_slope: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuailiEnvelope {
+    pub symbols: Vec<String>,
+    pub intervals: Vec<String>,
+    pub limit: u32,
+    pub calc_limit: u32,
+    pub closed_only: bool,
+    pub config: ApiGuailiConfig,
+    pub timezone: &'static str,
+    pub server_time: i64,
+    pub results: Vec<GuailiSymbolResult>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiGuailiConfig {
+    pub ma_length: usize,
+    pub ma_type: &'static str,
+    pub atr_len: usize,
+    pub atr_percent_len: usize,
+    pub max_atr_rank: f64,
+    pub slope_mul: f64,
+    pub use_slope: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuailiSymbolResult {
+    pub symbol: String,
+    pub series: Vec<GuailiSeries>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuailiSeries {
+    pub interval: String,
+    pub start_time: Option<String>,
+    pub end_time: Option<String>,
+    pub count: usize,
+    pub latest: Option<ApiGuailiPoint>,
+    pub data: Vec<ApiGuailiPoint>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiGuailiPoint {
+    pub open_time: String,
+    pub close_time: String,
+    pub ma: f64,
+    pub atr14: f64,
+    pub atr_rank: Option<f64>,
+    pub rank_filter: bool,
+    pub guaili: f64,
+    pub value: i32,
+    pub long_trend: bool,
+    pub short_trend: bool,
+    pub is_closed: bool,
+}
+
+impl From<GuailiPoint> for ApiGuailiPoint {
+    fn from(point: GuailiPoint) -> Self {
+        Self {
+            open_time: format_timestamp_ms(point.open_time),
+            close_time: format_timestamp_ms(point.close_time),
+            ma: point.ma,
+            atr14: point.atr14,
+            atr_rank: point.atr_rank,
+            rank_filter: point.rank_filter,
+            guaili: point.guaili,
+            value: point.value,
+            long_trend: point.long_trend,
+            short_trend: point.short_trend,
+            is_closed: point.is_closed,
+        }
+    }
+}
+
+pub async fn guaili(
+    State(state): State<AppState>,
+    Query(query): Query<GuailiQuery>,
+) -> Result<Json<GuailiEnvelope>, (axum::http::StatusCode, String)> {
+    let symbols = parse_symbols(query.symbols.as_deref())?;
+    let intervals = parse_intervals(query.intervals.as_deref())?;
+    let canonical_intervals = intervals
+        .iter()
+        .map(Interval::canonical)
+        .collect::<Vec<_>>();
+    let limit = query.limit.unwrap_or(200);
+    let calc_limit = guaili_calc_limit(&query, limit);
+    let closed_only = query.closed_only.unwrap_or(false);
+    let config = guaili_config_from_query(&query)?;
+    let mut results = Vec::with_capacity(symbols.len());
+
+    for symbol in &symbols {
+        let mut series = Vec::with_capacity(intervals.len());
+        for interval in &intervals {
+            let canonical_interval = interval.canonical();
+            let rows = query_kline_rows(
+                &state,
+                symbol,
+                *interval,
+                query.start_time,
+                query.end_time,
+                calc_limit,
+                closed_only,
+            )
+            .await?;
+            let candles = rows
+                .iter()
+                .map(|row| row.candle.clone())
+                .collect::<Vec<_>>();
+            let response_points = compute_guaili(&candles, config)
+                .into_iter()
+                .rev()
+                .take(limit as usize)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>();
+            let start_time = response_points
+                .first()
+                .map(|point| format_timestamp_ms(point.open_time));
+            let end_time = response_points
+                .last()
+                .map(|point| format_timestamp_ms(point.open_time));
+            let data = response_points
+                .into_iter()
+                .map(ApiGuailiPoint::from)
+                .collect::<Vec<_>>();
+            let latest = data.last().cloned();
+
+            series.push(GuailiSeries {
+                interval: canonical_interval,
+                start_time,
+                end_time,
+                count: data.len(),
+                latest,
+                data,
+            });
+        }
+
+        results.push(GuailiSymbolResult {
+            symbol: symbol.clone(),
+            series,
+        });
+    }
+
+    Ok(Json(GuailiEnvelope {
+        symbols,
+        intervals: canonical_intervals,
+        limit,
+        calc_limit,
+        closed_only,
+        config: ApiGuailiConfig::from(config),
+        timezone: "Asia/Shanghai",
+        server_time: Local::now().timestamp_millis(),
+        results,
+    }))
+}
+
+fn parse_symbols(input: Option<&str>) -> Result<Vec<String>, (axum::http::StatusCode, String)> {
+    let input = input
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                "missing symbols".to_string(),
+            )
+        })?;
+
+    input
+        .split(',')
+        .map(|item| {
+            let item = item.trim();
+            if item.is_empty() {
+                return Err((
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "empty symbol in symbols".to_string(),
+                ));
+            }
+            Ok(item.to_uppercase())
+        })
+        .collect()
+}
+
+fn guaili_calc_limit(query: &GuailiQuery, response_limit: u32) -> u32 {
+    const DEFAULT_GUAILI_CALC_LIMIT: u32 = 500;
+    query
+        .calc_limit
+        .unwrap_or(DEFAULT_GUAILI_CALC_LIMIT)
+        .max(response_limit)
+        .max(query.ma_length.unwrap_or(GuailiConfig::default().ma_length) as u32)
+        .max(
+            query
+                .atr_percent_len
+                .unwrap_or(GuailiConfig::default().atr_percent_len) as u32,
+        )
+        .max(15)
+}
+
+impl From<GuailiConfig> for ApiGuailiConfig {
+    fn from(config: GuailiConfig) -> Self {
+        Self {
+            ma_length: config.ma_length,
+            ma_type: ma_type_name(config.ma_type),
+            atr_len: config.atr_len,
+            atr_percent_len: config.atr_percent_len,
+            max_atr_rank: config.max_atr_rank,
+            slope_mul: config.slope_mul,
+            use_slope: config.use_slope,
+        }
+    }
+}
+
+fn guaili_config_from_query(
+    query: &GuailiQuery,
+) -> Result<GuailiConfig, (axum::http::StatusCode, String)> {
+    let default = GuailiConfig::default();
+    Ok(GuailiConfig {
+        ma_length: query.ma_length.unwrap_or(default.ma_length).max(1),
+        ma_type: parse_ma_type(query.ma_type.as_deref())?,
+        atr_len: query.atr_len.unwrap_or(default.atr_len).max(1),
+        atr_percent_len: query
+            .atr_percent_len
+            .unwrap_or(default.atr_percent_len)
+            .max(2),
+        max_atr_rank: query.max_atr_rank.unwrap_or(default.max_atr_rank),
+        slope_mul: query.slope_mul.unwrap_or(default.slope_mul),
+        use_slope: query.use_slope.unwrap_or(default.use_slope),
+    })
+}
+
+fn parse_ma_type(input: Option<&str>) -> Result<MaType, (axum::http::StatusCode, String)> {
+    let value = input.unwrap_or("EMA").trim().to_ascii_uppercase();
+    match value.as_str() {
+        "SMA" => Ok(MaType::Sma),
+        "EMA" => Ok(MaType::Ema),
+        "SMMA" | "SMMA (RMA)" | "RMA" => Ok(MaType::Smma),
+        "WMA" => Ok(MaType::Wma),
+        "VWMA" => Ok(MaType::Vwma),
+        _ => Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("unsupported maType: {}", input.unwrap_or_default()),
+        )),
+    }
+}
+
+fn ma_type_name(ma_type: MaType) -> &'static str {
+    match ma_type {
+        MaType::Sma => "SMA",
+        MaType::Ema => "EMA",
+        MaType::Smma => "SMMA (RMA)",
+        MaType::Wma => "WMA",
+        MaType::Vwma => "VWMA",
+    }
 }

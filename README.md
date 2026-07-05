@@ -263,6 +263,85 @@ Linux/macOS:
 curl "http://127.0.0.1:3000/api/klines?symbol=BTCUSDT&intervals=1,5,15&limit=10"
 ```
 
+### 查询 guaili 指标
+
+```http
+GET /api/indicators/guaili?symbols=BTCUSDT,ETHUSDT&intervals=1,5,15&limit=200
+```
+
+该接口按请求实时计算 Pine 脚本中的 `guaili` 派生值，不落库。它复用 K 线查询的数据视图：分钟级及以上周期来自 SQLite + 实时已收线缓冲，秒级周期来自内存序列；`closedOnly=false` 时会合并当前未收线 K 线。
+
+查询参数：
+
+| 参数 | 必填 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `symbols` | 是 | - | 逗号分隔的交易对列表，例如 `BTCUSDT,ETHUSDT`；单品种也使用 `symbols=BTCUSDT` |
+| `intervals` | 是 | - | 逗号分隔的周期列表，例如 `1,5,15` |
+| `startTime` | 否 | - | 起始 open time，毫秒时间戳 |
+| `endTime` | 否 | - | 结束 open time，毫秒时间戳 |
+| `limit` | 否 | `200` | 每个周期最多返回的指标点数量 |
+| `calcLimit` | 否 | `500` | 每个周期最多用于计算的 K 线数量，会自动不小于 `limit`、`maLength`、`atrPercentLen` 和 `15` |
+| `closedOnly` | 否 | `false` | 设为 `true` 时只使用已收线 K 线 |
+| `maLength` | 否 | `20` | 均线长度 |
+| `maType` | 否 | `EMA` | 可选 `SMA`, `EMA`, `SMMA (RMA)`, `RMA`, `WMA`, `VWMA` |
+| `atrLen` | 否 | `1` | Pine 脚本中 ATR 小 K 过滤使用的 ATR 长度 |
+| `atrPercentLen` | 否 | `20` | ATR percent rank 窗口长度 |
+| `maxAtrRank` | 否 | `100` | `rankFilter` 阈值 |
+| `slopeMul` | 否 | `0.1` | 趋势斜率过滤倍数 |
+| `useSlope` | 否 | `true` | 是否启用斜率过滤 |
+
+响应中每个周期包含 `data` 和 `latest`。`value` 对应 Pine 脚本中的 `int(guaili * 10)`。如果只想看最新值，可以传 `limit=1`；接口仍会用 `calcLimit` 指定的历史 K 线计算 MA/ATR，再只返回最新 1 个指标点。
+
+响应示例：
+
+```json
+{
+  "symbols": ["BTCUSDT", "ETHUSDT"],
+  "intervals": ["1"],
+  "limit": 200,
+  "calcLimit": 500,
+  "closedOnly": false,
+  "config": {
+    "maLength": 20,
+    "maType": "EMA",
+    "atrLen": 1,
+    "atrPercentLen": 20,
+    "maxAtrRank": 100.0,
+    "slopeMul": 0.1,
+    "useSlope": true
+  },
+  "timezone": "Asia/Shanghai",
+  "serverTime": 1780000000000,
+  "results": [
+    {
+      "symbol": "BTCUSDT",
+      "series": [
+        {
+          "interval": "1",
+          "startTime": "2024-03-10T00:00:00.000+08:00",
+          "endTime": "2024-03-10T00:19:00.000+08:00",
+          "count": 20,
+          "latest": {
+            "openTime": "2024-03-10T00:19:00.000+08:00",
+            "closeTime": "2024-03-10T00:19:59.999+08:00",
+            "ma": 100.0,
+            "atr14": 10.0,
+            "atrRank": 50.0,
+            "rankFilter": true,
+            "guaili": 1.2,
+            "value": 12,
+            "longTrend": true,
+            "shortTrend": false,
+            "isClosed": false
+          },
+          "data": []
+        }
+      ]
+    }
+  ]
+}
+```
+
 ## 数据存储
 
 SQLite 表名为 `klines`，主键为 `(symbol, interval, open_time)`。服务会在启动时自动创建表，并启用 WAL。分钟级及以上周期会持久化到 SQLite；`15S`、`30S`、`45S` 等秒级周期来自 aggTrade 聚合，当前保存在内存中，适合实时展示但不会跨进程保留。

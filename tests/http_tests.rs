@@ -493,6 +493,224 @@ async fn klines_endpoint_returns_persisted_rows() {
 }
 
 #[tokio::test]
+async fn guaili_endpoint_returns_latest_indicator_values_for_each_symbol() {
+    let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    for symbol in ["BTCUSDT", "ETHUSDT"] {
+        for index in 0..20 {
+            let close = 100.0 + index as f64 * 10.0;
+            let open_time = index * 60_000;
+            store
+                .upsert_candle(
+                    symbol,
+                    "1",
+                    &Candle {
+                        open_time,
+                        close_time: open_time + 59_999,
+                        open: close,
+                        high: close + 1.0,
+                        low: close - 1.0,
+                        close,
+                        volume: 1.0,
+                        quote_volume: close,
+                        trade_count: 1,
+                        is_closed: true,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    let app = router(AppState {
+        store,
+        latest: LatestCache::default(),
+        memory_series: MemorySeriesStore::default(),
+        closed_buffer: ClosedKlineBuffer::default(),
+        health_targets: Vec::new(),
+        runtime_health: RuntimeHealth::default(),
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let response = reqwest::get(format!(
+        "http://{addr}/api/indicators/guaili?symbols=BTCUSDT,ETHUSDT&intervals=1&limit=20&maLength=3"
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert!(body.get("symbol").is_none());
+    assert_eq!(body["symbols"], serde_json::json!(["BTCUSDT", "ETHUSDT"]));
+    assert_eq!(body["intervals"], serde_json::json!(["1"]));
+    assert_eq!(body["limit"], 20);
+    assert_eq!(body["results"].as_array().unwrap().len(), 2);
+    for (index, symbol) in ["BTCUSDT", "ETHUSDT"].iter().enumerate() {
+        let result = &body["results"][index];
+        assert_eq!(result["symbol"], *symbol);
+        assert_eq!(result["series"][0]["interval"], "1");
+        assert_eq!(result["series"][0]["count"], 20);
+        assert_eq!(result["series"][0]["latest"]["value"], 10);
+        assert_eq!(result["series"][0]["latest"]["longTrend"], true);
+        assert_eq!(result["series"][0]["latest"]["shortTrend"], false);
+        assert!(
+            (result["series"][0]["latest"]["guaili"].as_f64().unwrap() - 1.042_983_536_760_88)
+                .abs()
+                < 0.000_001
+        );
+    }
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn guaili_endpoint_uses_history_even_when_response_limit_is_one() {
+    let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    for index in 0..20 {
+        let close = 100.0 + index as f64 * 10.0;
+        let open_time = index * 60_000;
+        store
+            .upsert_candle(
+                "BTCUSDT",
+                "1",
+                &Candle {
+                    open_time,
+                    close_time: open_time + 59_999,
+                    open: close,
+                    high: close + 1.0,
+                    low: close - 1.0,
+                    close,
+                    volume: 1.0,
+                    quote_volume: close,
+                    trade_count: 1,
+                    is_closed: true,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    let app = router(AppState {
+        store,
+        latest: LatestCache::default(),
+        memory_series: MemorySeriesStore::default(),
+        closed_buffer: ClosedKlineBuffer::default(),
+        health_targets: Vec::new(),
+        runtime_health: RuntimeHealth::default(),
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let response = reqwest::get(format!(
+        "http://{addr}/api/indicators/guaili?symbols=BTCUSDT&intervals=1&limit=1&maLength=3"
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["results"][0]["series"][0]["count"], 1);
+    assert_eq!(
+        body["results"][0]["series"][0]["data"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(body["results"][0]["series"][0]["latest"]["value"], 10);
+    assert!(
+        (body["results"][0]["series"][0]["latest"]["guaili"]
+            .as_f64()
+            .unwrap()
+            - 1.042_983_536_760_88)
+            .abs()
+            < 0.000_001
+    );
+    assert_eq!(
+        body["results"][0]["series"][0]["startTime"],
+        body["results"][0]["series"][0]["data"][0]["openTime"]
+    );
+    assert_eq!(
+        body["results"][0]["series"][0]["endTime"],
+        body["results"][0]["series"][0]["data"][0]["openTime"]
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn guaili_endpoint_rejects_unsupported_ma_type() {
+    let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let app = router(AppState {
+        store,
+        latest: LatestCache::default(),
+        memory_series: MemorySeriesStore::default(),
+        closed_buffer: ClosedKlineBuffer::default(),
+        health_targets: Vec::new(),
+        runtime_health: RuntimeHealth::default(),
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let response = reqwest::get(format!(
+        "http://{addr}/api/indicators/guaili?symbols=BTCUSDT&intervals=1&maType=BAD"
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(response
+        .text()
+        .await
+        .unwrap()
+        .contains("unsupported maType: BAD"));
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn guaili_endpoint_requires_symbols_parameter() {
+    let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let app = router(AppState {
+        store,
+        latest: LatestCache::default(),
+        memory_series: MemorySeriesStore::default(),
+        closed_buffer: ClosedKlineBuffer::default(),
+        health_targets: Vec::new(),
+        runtime_health: RuntimeHealth::default(),
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let response = reqwest::get(format!(
+        "http://{addr}/api/indicators/guaili?symbol=BTCUSDT&intervals=1"
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(response.text().await.unwrap().contains("missing symbols"));
+
+    server.abort();
+}
+
+#[tokio::test]
 async fn klines_endpoint_returns_buffered_closed_rows() {
     let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
     store

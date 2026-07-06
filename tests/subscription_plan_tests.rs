@@ -4,6 +4,7 @@ use crypto_candlestick::domain::interval::Interval;
 #[test]
 fn subscribes_native_klines_directly_and_only_aggregates_custom_intervals() {
     let intervals = vec![
+        Interval::parse("10S").unwrap(),
         Interval::parse("15S").unwrap(),
         Interval::parse("1").unwrap(),
         Interval::parse("2").unwrap(),

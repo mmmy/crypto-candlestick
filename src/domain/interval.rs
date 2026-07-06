@@ -179,7 +179,7 @@ fn validate_supported(interval: Interval, input: &str) -> Result<Interval, Inter
 
 fn is_supported(interval: Interval) -> bool {
     match interval {
-        Interval::Seconds(value) => [15, 30, 45].contains(&value),
+        Interval::Seconds(value) => [10, 15, 30, 45].contains(&value),
         Interval::Minutes(value) => supported_minutes().contains(&value),
         Interval::Days(value) => [1, 2, 3, 4, 10].contains(&value),
         Interval::Weeks(value) => value == 1,

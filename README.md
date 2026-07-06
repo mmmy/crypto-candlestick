@@ -18,7 +18,7 @@
 
 | 类型 | 格式 | 示例 |
 | --- | --- | --- |
-| 秒级 | `{N}S` | `15S`, `30S`, `45S` |
+| 秒级 | `{N}S` | `10S`, `15S`, `30S`, `45S` |
 | 分钟级 | 数字分钟 | `1`, `2`, `3`, `5`, `15`, `60`, `240` |
 | 日线 | `D` 或 `{N}D` | `D`, `2D`, `3D`, `4D`, `10D` |
 | 周线 | `W` | `W` |
@@ -81,7 +81,7 @@ cargo run
 | `DATABASE_URL` | `sqlite://candles.db` | SQLite 数据库地址 |
 | `BIND_ADDR` | `127.0.0.1:3000` | HTTP 服务监听地址 |
 | `BINANCE_SYMBOLS` | 空 | 逗号分隔的交易对，例如 `BTCUSDT,ETHUSDT` |
-| `BINANCE_INTERVALS` | 空 | 逗号分隔的周期列表，例如 `15S,1,5,D,W` |
+| `BINANCE_INTERVALS` | 空 | 逗号分隔的周期列表，例如 `10S,15S,1,5,D,W` |
 | `RETENTION_BARS` | `5000` | 每个交易对/周期最多保留的已存储 K 线数量，设为 `0` 表示不裁剪 |
 | `SYNC_ON_START` | `true` | 启动时是否同步历史 K 线 |
 | `SYNC_LOOKBACK_BARS` | `1500` | 没有本地历史时，启动同步回看的 K 线数量 |
@@ -95,7 +95,7 @@ cargo run
 DATABASE_URL=sqlite://candles.db
 BIND_ADDR=127.0.0.1:3000
 BINANCE_SYMBOLS=BTCUSDT,ETHUSDT
-BINANCE_INTERVALS=15S,30S,1,5,15,60,D,W
+BINANCE_INTERVALS=10S,15S,30S,1,5,15,60,D,W
 RETENTION_BARS=5000
 SYNC_ON_START=true
 SYNC_LOOKBACK_BARS=1500
@@ -204,7 +204,7 @@ GET /api/klines?symbol=BTCUSDT&intervals=1,5,15&limit=1000
 | 参数 | 必填 | 说明 |
 | --- | --- | --- |
 | `symbol` | 是 | 交易对，例如 `BTCUSDT` |
-| `intervals` | 是 | 逗号分隔的周期列表，例如 `1,5,15`；可选值：`15S`, `30S`, `45S`, `1`, `2`, `3`, `4`, `5`, `8`, `10`, `15`, `20`, `30`, `45`, `60`, `90`, `120`, `180`, `240`, `360`, `480`, `720`, `D`, `2D`, `3D`, `4D`, `10D`, `W` |
+| `intervals` | 是 | 逗号分隔的周期列表，例如 `1,5,15`；可选值：`10S`, `15S`, `30S`, `45S`, `1`, `2`, `3`, `4`, `5`, `8`, `10`, `15`, `20`, `30`, `45`, `60`, `90`, `120`, `180`, `240`, `360`, `480`, `720`, `D`, `2D`, `3D`, `4D`, `10D`, `W` |
 | `startTime` | 否 | 起始 open time，毫秒时间戳 |
 | `endTime` | 否 | 结束 open time，毫秒时间戳 |
 | `limit` | 否 | 返回数量，默认 `200` |
@@ -344,7 +344,7 @@ GET /api/indicators/guaili?symbols=BTCUSDT,ETHUSDT&intervals=1,5,15&limit=200
 
 ## 数据存储
 
-SQLite 表名为 `klines`，主键为 `(symbol, interval, open_time)`。服务会在启动时自动创建表，并启用 WAL。分钟级及以上周期会持久化到 SQLite；`15S`、`30S`、`45S` 等秒级周期来自 aggTrade 聚合，当前保存在内存中，适合实时展示但不会跨进程保留。
+SQLite 表名为 `klines`，主键为 `(symbol, interval, open_time)`。服务会在启动时自动创建表，并启用 WAL。分钟级及以上周期会持久化到 SQLite；`10S`、`15S`、`30S`、`45S` 等秒级周期来自 aggTrade 聚合，当前保存在内存中，适合实时展示但不会跨进程保留。
 
 数据库文件、WAL 文件和 `.env` 已在 `.gitignore` 中忽略。
 

@@ -2,6 +2,7 @@ use crypto_candlestick::domain::interval::Interval;
 
 #[test]
 fn parses_custom_and_native_intervals() {
+    assert_eq!(Interval::parse("10S").unwrap().as_millis(), 10_000);
     assert_eq!(Interval::parse("15S").unwrap().as_millis(), 15_000);
     assert_eq!(Interval::parse("45").unwrap().as_millis(), 2_700_000);
     assert_eq!(Interval::parse("4D").unwrap().as_millis(), 345_600_000);
@@ -33,6 +34,7 @@ fn maps_binance_native_intervals() {
 
     assert_eq!(Interval::parse("2").unwrap().binance_interval(), None);
     assert_eq!(Interval::parse("10D").unwrap().binance_interval(), None);
+    assert_eq!(Interval::parse("10S").unwrap().binance_interval(), None);
     assert_eq!(Interval::parse("15S").unwrap().binance_interval(), None);
 }
 
@@ -103,6 +105,7 @@ fn maps_custom_intervals_to_base_interval() {
         "D"
     );
     assert!(Interval::parse("60").unwrap().aggregation_base().is_none());
+    assert!(Interval::parse("10S").unwrap().aggregation_base().is_none());
     assert!(Interval::parse("15S").unwrap().aggregation_base().is_none());
 }
 

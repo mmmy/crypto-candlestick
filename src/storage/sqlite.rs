@@ -4,10 +4,12 @@ use sqlx::{sqlite::SqlitePoolOptions, QueryBuilder, Row, Sqlite, SqlitePool, Tra
 use std::collections::HashMap;
 
 pub const DEFAULT_RETENTION_BARS: u32 = 5_000;
+const DEFAULT_READ_CONNECTIONS: u32 = 4;
 
 #[derive(Debug, Clone)]
 pub struct SqliteStore {
-    pool: SqlitePool,
+    read_pool: SqlitePool,
+    write_pool: SqlitePool,
     retention_bars: u32,
 }
 
@@ -121,24 +123,52 @@ impl SqliteStore {
         database_url: &str,
         retention_bars: u32,
     ) -> Result<Self, sqlx::Error> {
-        let pool = SqlitePoolOptions::new()
+        let write_pool = SqlitePoolOptions::new()
             .max_connections(1)
+            .after_connect(|connection, _metadata| {
+                Box::pin(async move {
+                    sqlx::query("PRAGMA synchronous = NORMAL;")
+                        .execute(&mut *connection)
+                        .await?;
+                    sqlx::query("PRAGMA busy_timeout = 5000;")
+                        .execute(&mut *connection)
+                        .await?;
+                    Ok(())
+                })
+            })
             .connect(database_url)
             .await?;
-        let store = Self {
-            pool,
+        let mut store = Self {
+            read_pool: write_pool.clone(),
+            write_pool,
             retention_bars,
         };
         store.init().await?;
+
+        if !is_memory_database(database_url) {
+            store.read_pool = SqlitePoolOptions::new()
+                .max_connections(DEFAULT_READ_CONNECTIONS)
+                .after_connect(|connection, _metadata| {
+                    Box::pin(async move {
+                        sqlx::query("PRAGMA busy_timeout = 5000;")
+                            .execute(&mut *connection)
+                            .await?;
+                        sqlx::query("PRAGMA query_only = TRUE;")
+                            .execute(&mut *connection)
+                            .await?;
+                        Ok(())
+                    })
+                })
+                .connect(database_url)
+                .await?;
+        }
+
         Ok(store)
     }
 
     async fn init(&self) -> Result<(), sqlx::Error> {
         sqlx::query("PRAGMA journal_mode = WAL;")
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("PRAGMA synchronous = NORMAL;")
-            .execute(&self.pool)
+            .execute(&self.write_pool)
             .await?;
         sqlx::query(
             r#"
@@ -160,7 +190,7 @@ impl SqliteStore {
             );
             "#,
         )
-        .execute(&self.pool)
+        .execute(&self.write_pool)
         .await?;
         Ok(())
     }
@@ -185,7 +215,7 @@ impl SqliteStore {
             .bind(candle.trade_count as i64)
             .bind(i64::from(candle.is_closed))
             .bind(chrono::Utc::now().timestamp_millis())
-            .execute(&self.pool)
+            .execute(&self.write_pool)
             .await?;
         self.prune_series(symbol, interval).await?;
         Ok(())
@@ -202,7 +232,7 @@ impl SqliteStore {
         }
 
         let updated_at = chrono::Utc::now().timestamp_millis();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write_pool.begin().await?;
         let rows = candles
             .iter()
             .map(|candle| CandleUpsertRow {
@@ -228,7 +258,7 @@ impl SqliteStore {
         }
 
         let updated_at = chrono::Utc::now().timestamp_millis();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write_pool.begin().await?;
 
         let rows = grouped
             .iter()
@@ -292,7 +322,7 @@ impl SqliteStore {
         }
         query = query.bind(i64::from(limit));
 
-        let rows = query.fetch_all(&self.pool).await?;
+        let rows = query.fetch_all(&self.read_pool).await?;
         let mut items = Vec::with_capacity(rows.len());
         let now_ms = chrono::Utc::now().timestamp_millis();
         for row in rows {
@@ -330,7 +360,7 @@ impl SqliteStore {
         .bind(symbol)
         .bind(interval)
         .bind(i64::from(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(&self.read_pool)
         .await?;
 
         let mut items = Vec::with_capacity(rows.len());
@@ -367,7 +397,7 @@ impl SqliteStore {
         )
         .bind(symbol)
         .bind(interval)
-        .fetch_one(&self.pool)
+        .fetch_one(&self.read_pool)
         .await?;
 
         row.try_get::<Option<i64>, _>("max_open_time")
@@ -384,7 +414,7 @@ impl SqliteStore {
             .bind(symbol)
             .bind(interval)
             .bind(i64::from(self.retention_bars))
-            .execute(&self.pool)
+            .execute(&self.write_pool)
             .await?;
         Ok(())
     }
@@ -408,5 +438,129 @@ impl SqliteStore {
             .execute(&mut **tx)
             .await?;
         Ok(())
+    }
+}
+
+fn is_memory_database(database_url: &str) -> bool {
+    let database_url = database_url.to_ascii_lowercase();
+    database_url.contains(":memory:") || database_url.contains("mode=memory")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn file_database_reads_do_not_wait_for_the_writer_connection() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let database_path = std::env::temp_dir().join(format!(
+            "crypto-candlestick-read-pool-{}-{unique}.db",
+            std::process::id()
+        ));
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            database_path.to_string_lossy().replace('\\', "/")
+        );
+        let store = SqliteStore::connect_with_retention(&database_url, 0)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            write_connection_pragmas(&store.write_pool).await,
+            (1, 5_000)
+        );
+        store
+            .write_pool
+            .acquire()
+            .await
+            .unwrap()
+            .close()
+            .await
+            .unwrap();
+        assert_eq!(
+            write_connection_pragmas(&store.write_pool).await,
+            (1, 5_000)
+        );
+
+        assert!(store
+            .query_klines("BTCUSDT", "1", None, None, 10)
+            .await
+            .unwrap()
+            .is_empty());
+
+        let candle = Candle {
+            open_time: 60_000,
+            close_time: 119_999,
+            open: 100.0,
+            high: 101.0,
+            low: 99.0,
+            close: 100.5,
+            volume: 12.5,
+            quote_volume: 1_250.0,
+            trade_count: 3,
+            is_closed: true,
+        };
+        let mut tx = store.write_pool.begin().await.unwrap();
+        upsert_candle_rows(
+            &mut tx,
+            &[CandleUpsertRow {
+                symbol: "BTCUSDT",
+                interval: "1",
+                candle: &candle,
+            }],
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await
+        .unwrap();
+
+        let rows = timeout(
+            Duration::from_millis(500),
+            store.query_klines("BTCUSDT", "1", None, None, 10),
+        )
+        .await
+        .expect("read pool should not wait for the writer connection")
+        .unwrap();
+        assert!(rows.is_empty());
+
+        tx.commit().await.unwrap();
+        assert_eq!(
+            store
+                .query_klines("BTCUSDT", "1", None, None, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        store.read_pool.close().await;
+        store.write_pool.close().await;
+        for path in [
+            database_path.clone(),
+            database_path.with_extension("db-wal"),
+            database_path.with_extension("db-shm"),
+        ] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    async fn write_connection_pragmas(pool: &SqlitePool) -> (i64, i64) {
+        let synchronous = sqlx::query("PRAGMA synchronous;")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+            .try_get(0)
+            .unwrap();
+        let busy_timeout = sqlx::query("PRAGMA busy_timeout;")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+            .try_get(0)
+            .unwrap();
+        (synchronous, busy_timeout)
     }
 }

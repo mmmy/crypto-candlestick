@@ -1,5 +1,9 @@
+use crypto_candlestick::binance::worker::{flush_closed_buffer, FlushLock};
 use crypto_candlestick::domain::candle::Candle;
 use crypto_candlestick::memory::{ClosedKlineBuffer, LatestCache, MemorySeriesStore};
+use crypto_candlestick::storage::sqlite::SqliteStore;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 #[tokio::test]
 async fn stores_and_returns_latest_open_candle() {
@@ -121,4 +125,59 @@ async fn closed_kline_buffer_remove_flushed_keeps_newer_same_key_update() {
     let rows = buffer.query("BTCUSDT", "1", None, None, 10).await;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].candle.close, 102.0);
+}
+
+#[tokio::test]
+async fn flush_closed_buffer_persists_all_series_and_clears_snapshot() {
+    let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let buffer = ClosedKlineBuffer::default();
+    let flush_lock: FlushLock = Arc::new(Mutex::new(()));
+
+    for (symbol, interval, open_time) in [("BTCUSDT", "1", 60_000), ("ETHUSDT", "5", 300_000)] {
+        buffer
+            .upsert(
+                symbol,
+                interval,
+                Candle {
+                    open_time,
+                    close_time: open_time + 59_999,
+                    open: 100.0,
+                    high: 101.0,
+                    low: 99.0,
+                    close: 100.5,
+                    volume: 12.5,
+                    quote_volume: 1_250.0,
+                    trade_count: 3,
+                    is_closed: true,
+                },
+            )
+            .await;
+    }
+
+    flush_closed_buffer(&store, &buffer, &flush_lock).await;
+
+    assert!(buffer
+        .query("BTCUSDT", "1", None, None, 10)
+        .await
+        .is_empty());
+    assert!(buffer
+        .query("ETHUSDT", "5", None, None, 10)
+        .await
+        .is_empty());
+    assert_eq!(
+        store
+            .query_klines("BTCUSDT", "1", None, None, 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .query_klines("ETHUSDT", "5", None, None, 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
 }

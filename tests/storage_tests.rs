@@ -1,5 +1,6 @@
 use crypto_candlestick::domain::candle::Candle;
 use crypto_candlestick::storage::sqlite::SqliteStore;
+use std::collections::HashMap;
 
 #[tokio::test]
 async fn persists_and_queries_klines() {
@@ -141,6 +142,47 @@ async fn batch_upsert_prunes_once_after_inserted_rows() {
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[0].candle.open_time, 120_000);
     assert_eq!(rows[2].candle.open_time, 240_000);
+}
+
+#[tokio::test]
+async fn grouped_upsert_persists_and_prunes_multiple_series_in_one_batch() {
+    let store = SqliteStore::connect_with_retention("sqlite::memory:", 2)
+        .await
+        .unwrap();
+    let mut grouped = HashMap::new();
+
+    for (symbol, interval) in [("BTCUSDT", "1"), ("ETHUSDT", "5")] {
+        let candles = (0..3)
+            .map(|index| {
+                let open_time = index * 60_000;
+                Candle {
+                    open_time,
+                    close_time: open_time + 59_999,
+                    open: 100.0,
+                    high: 101.0,
+                    low: 99.0,
+                    close: 100.5,
+                    volume: 12.5,
+                    quote_volume: 1_250.0,
+                    trade_count: 3,
+                    is_closed: true,
+                }
+            })
+            .collect::<Vec<_>>();
+        grouped.insert((symbol.to_string(), interval.to_string()), candles);
+    }
+
+    store.upsert_candle_groups(&grouped).await.unwrap();
+
+    for (symbol, interval) in [("BTCUSDT", "1"), ("ETHUSDT", "5")] {
+        let rows = store
+            .query_klines(symbol, interval, None, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].candle.open_time, 60_000);
+        assert_eq!(rows[1].candle.open_time, 120_000);
+    }
 }
 
 #[tokio::test]

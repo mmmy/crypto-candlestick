@@ -491,22 +491,11 @@ pub async fn flush_closed_buffer(
         return;
     }
 
-    let mut flushed = HashMap::new();
-    for ((symbol, interval), candles) in grouped {
-        if let Err(err) = store.upsert_candles(&symbol, &interval, &candles).await {
-            tracing::warn!(
-                symbol = %symbol,
-                interval = %interval,
-                rows = candles.len(),
-                "failed to flush closed kline buffer: {}",
-                err
-            );
-        } else {
-            flushed.insert((symbol, interval), candles);
-        }
-    }
-
-    if !flushed.is_empty() {
-        closed_buffer.remove_flushed(&flushed).await;
+    let series = grouped.len();
+    let rows = grouped.values().map(Vec::len).sum::<usize>();
+    if let Err(err) = store.upsert_candle_groups(&grouped).await {
+        tracing::warn!(series, rows, "failed to flush closed kline buffer: {}", err);
+    } else {
+        closed_buffer.remove_flushed(&grouped).await;
     }
 }

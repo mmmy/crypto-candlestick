@@ -1,6 +1,7 @@
 use crate::domain::candle::Candle;
 use serde::{Deserialize, Serialize};
 use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
+use std::collections::HashMap;
 
 pub const DEFAULT_RETENTION_BARS: u32 = 5_000;
 
@@ -165,6 +166,49 @@ impl SqliteStore {
 
         self.prune_series_in_transaction(&mut tx, symbol, interval)
             .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn upsert_candle_groups(
+        &self,
+        grouped: &HashMap<(String, String), Vec<Candle>>,
+    ) -> Result<(), sqlx::Error> {
+        if grouped.values().all(Vec::is_empty) {
+            return Ok(());
+        }
+
+        let updated_at = chrono::Utc::now().timestamp_millis();
+        let mut tx = self.pool.begin().await?;
+
+        for ((symbol, interval), candles) in grouped {
+            if candles.is_empty() {
+                continue;
+            }
+
+            for candle in candles {
+                sqlx::query(UPSERT_CANDLE_SQL)
+                    .bind(symbol)
+                    .bind(interval)
+                    .bind(candle.open_time)
+                    .bind(candle.close_time)
+                    .bind(candle.open)
+                    .bind(candle.high)
+                    .bind(candle.low)
+                    .bind(candle.close)
+                    .bind(candle.volume)
+                    .bind(candle.quote_volume)
+                    .bind(candle.trade_count as i64)
+                    .bind(i64::from(candle.is_closed))
+                    .bind(updated_at)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+
+            self.prune_series_in_transaction(&mut tx, symbol, interval)
+                .await?;
+        }
+
         tx.commit().await?;
         Ok(())
     }

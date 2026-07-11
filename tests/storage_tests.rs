@@ -145,6 +145,61 @@ async fn batch_upsert_prunes_once_after_inserted_rows() {
 }
 
 #[tokio::test]
+async fn defers_large_retention_pruning_until_the_series_reaches_its_write_threshold() {
+    let store = SqliteStore::connect_with_retention("sqlite::memory:", 200)
+        .await
+        .unwrap();
+    let candles = (0..300)
+        .map(|index| {
+            let open_time = index * 60_000;
+            Candle {
+                open_time,
+                close_time: open_time + 59_999,
+                open: 100.0,
+                high: 101.0,
+                low: 99.0,
+                close: 100.5,
+                volume: 12.5,
+                quote_volume: 1_250.0,
+                trade_count: 3,
+                is_closed: true,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    store
+        .upsert_candles("BTCUSDT", "1", &candles[..200])
+        .await
+        .unwrap();
+    store
+        .upsert_candles("BTCUSDT", "1", &candles[200..299])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .query_klines("BTCUSDT", "1", None, None, 500)
+            .await
+            .unwrap()
+            .len(),
+        299
+    );
+
+    store
+        .upsert_candles("BTCUSDT", "1", &candles[299..])
+        .await
+        .unwrap();
+    let rows = store
+        .query_klines("BTCUSDT", "1", None, None, 500)
+        .await
+        .unwrap();
+
+    assert_eq!(rows.len(), 200);
+    assert_eq!(rows[0].candle.open_time, 100 * 60_000);
+    assert_eq!(rows[199].candle.open_time, 299 * 60_000);
+}
+
+#[tokio::test]
 async fn batch_upsert_handles_multiple_sql_chunks_and_conflicts() {
     let store = SqliteStore::connect_with_retention("sqlite::memory:", 0)
         .await

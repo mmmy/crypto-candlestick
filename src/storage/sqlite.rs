@@ -1,7 +1,11 @@
 use crate::domain::candle::Candle;
 use serde::{Deserialize, Serialize};
 use sqlx::{sqlite::SqlitePoolOptions, QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
-use std::collections::HashMap;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
+use tokio::sync::Mutex;
 
 pub const DEFAULT_RETENTION_BARS: u32 = 5_000;
 const DEFAULT_READ_CONNECTIONS: u32 = 4;
@@ -11,6 +15,7 @@ pub struct SqliteStore {
     read_pool: SqlitePool,
     write_pool: SqlitePool,
     retention_bars: u32,
+    prune_pending: Arc<Mutex<HashMap<(String, String), usize>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -19,25 +24,6 @@ pub struct StoredKline {
     pub interval: String,
     pub candle: Candle,
 }
-
-const UPSERT_CANDLE_SQL: &str = r#"
-    INSERT INTO klines (
-        symbol, interval, open_time, close_time, open, high, low, close,
-        volume, quote_volume, trade_count, is_closed, updated_at
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(symbol, interval, open_time) DO UPDATE SET
-        close_time = excluded.close_time,
-        open = excluded.open,
-        high = excluded.high,
-        low = excluded.low,
-        close = excluded.close,
-        volume = excluded.volume,
-        quote_volume = excluded.quote_volume,
-        trade_count = excluded.trade_count,
-        is_closed = excluded.is_closed,
-        updated_at = excluded.updated_at
-    "#;
 
 const UPSERT_CANDLE_CHUNK_ROWS: usize = 500;
 
@@ -70,6 +56,44 @@ const PRUNE_SERIES_SQL: &str = r#"
             LIMIT ?
         )
       )
+    "#;
+
+const CREATE_KLINES_TABLE_SQL: &str = r#"
+    CREATE TABLE klines (
+        symbol TEXT NOT NULL,
+        interval TEXT NOT NULL,
+        open_time INTEGER NOT NULL,
+        close_time INTEGER NOT NULL,
+        open REAL NOT NULL,
+        high REAL NOT NULL,
+        low REAL NOT NULL,
+        close REAL NOT NULL,
+        volume REAL NOT NULL,
+        quote_volume REAL NOT NULL,
+        trade_count INTEGER NOT NULL,
+        is_closed INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (symbol, interval, open_time)
+    ) WITHOUT ROWID;
+    "#;
+
+const CREATE_KLINES_MIGRATION_TABLE_SQL: &str = r#"
+    CREATE TABLE klines_without_rowid_migration (
+        symbol TEXT NOT NULL,
+        interval TEXT NOT NULL,
+        open_time INTEGER NOT NULL,
+        close_time INTEGER NOT NULL,
+        open REAL NOT NULL,
+        high REAL NOT NULL,
+        low REAL NOT NULL,
+        close REAL NOT NULL,
+        volume REAL NOT NULL,
+        quote_volume REAL NOT NULL,
+        trade_count INTEGER NOT NULL,
+        is_closed INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (symbol, interval, open_time)
+    ) WITHOUT ROWID;
     "#;
 
 #[derive(Clone, Copy)]
@@ -142,6 +166,7 @@ impl SqliteStore {
             read_pool: write_pool.clone(),
             write_pool,
             retention_bars,
+            prune_pending: Arc::new(Mutex::new(HashMap::new())),
         };
         store.init().await?;
 
@@ -170,28 +195,56 @@ impl SqliteStore {
         sqlx::query("PRAGMA journal_mode = WAL;")
             .execute(&self.write_pool)
             .await?;
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS klines (
-                symbol TEXT NOT NULL,
-                interval TEXT NOT NULL,
-                open_time INTEGER NOT NULL,
-                close_time INTEGER NOT NULL,
-                open REAL NOT NULL,
-                high REAL NOT NULL,
-                low REAL NOT NULL,
-                close REAL NOT NULL,
-                volume REAL NOT NULL,
-                quote_volume REAL NOT NULL,
-                trade_count INTEGER NOT NULL,
-                is_closed INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL,
-                PRIMARY KEY (symbol, interval, open_time)
-            );
-            "#,
+        self.ensure_without_rowid_schema().await?;
+        Ok(())
+    }
+
+    async fn ensure_without_rowid_schema(&self) -> Result<(), sqlx::Error> {
+        let schema = sqlx::query_scalar::<_, String>(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'klines'",
         )
-        .execute(&self.write_pool)
+        .fetch_optional(&self.write_pool)
         .await?;
+
+        match schema {
+            None => {
+                sqlx::query(CREATE_KLINES_TABLE_SQL)
+                    .execute(&self.write_pool)
+                    .await?;
+            }
+            Some(schema) if schema.to_ascii_uppercase().contains("WITHOUT ROWID") => {}
+            Some(_) => {
+                tracing::info!("migrating klines table to WITHOUT ROWID");
+                let mut tx = self.write_pool.begin().await?;
+                sqlx::query("DROP TABLE IF EXISTS klines_without_rowid_migration")
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query(CREATE_KLINES_MIGRATION_TABLE_SQL)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query(
+                    r#"
+                    INSERT INTO klines_without_rowid_migration (
+                        symbol, interval, open_time, close_time, open, high, low, close,
+                        volume, quote_volume, trade_count, is_closed, updated_at
+                    )
+                    SELECT
+                        symbol, interval, open_time, close_time, open, high, low, close,
+                        volume, quote_volume, trade_count, is_closed, updated_at
+                    FROM klines
+                    "#,
+                )
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query("DROP TABLE klines").execute(&mut *tx).await?;
+                sqlx::query("ALTER TABLE klines_without_rowid_migration RENAME TO klines")
+                    .execute(&mut *tx)
+                    .await?;
+                tx.commit().await?;
+                tracing::info!("klines table migration to WITHOUT ROWID completed");
+            }
+        }
+
         Ok(())
     }
 
@@ -201,24 +254,8 @@ impl SqliteStore {
         interval: &str,
         candle: &Candle,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query(UPSERT_CANDLE_SQL)
-            .bind(symbol)
-            .bind(interval)
-            .bind(candle.open_time)
-            .bind(candle.close_time)
-            .bind(candle.open)
-            .bind(candle.high)
-            .bind(candle.low)
-            .bind(candle.close)
-            .bind(candle.volume)
-            .bind(candle.quote_volume)
-            .bind(candle.trade_count as i64)
-            .bind(i64::from(candle.is_closed))
-            .bind(chrono::Utc::now().timestamp_millis())
-            .execute(&self.write_pool)
-            .await?;
-        self.prune_series(symbol, interval).await?;
-        Ok(())
+        self.upsert_candles(symbol, interval, std::slice::from_ref(candle))
+            .await
     }
 
     pub async fn upsert_candles(
@@ -231,6 +268,9 @@ impl SqliteStore {
             return Ok(());
         }
 
+        let key = (symbol.to_string(), interval.to_string());
+        let mut prune_pending = self.prune_pending.lock().await;
+        let should_prune = self.should_prune_series(&prune_pending, &key, candles.len());
         let updated_at = chrono::Utc::now().timestamp_millis();
         let mut tx = self.write_pool.begin().await?;
         let rows = candles
@@ -243,9 +283,12 @@ impl SqliteStore {
             .collect::<Vec<_>>();
         upsert_candle_rows(&mut tx, &rows, updated_at).await?;
 
-        self.prune_series_in_transaction(&mut tx, symbol, interval)
-            .await?;
+        if should_prune {
+            self.prune_series_in_transaction(&mut tx, symbol, interval)
+                .await?;
+        }
         tx.commit().await?;
+        self.record_prune_progress(&mut prune_pending, key, candles.len(), should_prune);
         Ok(())
     }
 
@@ -257,6 +300,17 @@ impl SqliteStore {
             return Ok(());
         }
 
+        let series_rows = grouped
+            .iter()
+            .filter(|(_, candles)| !candles.is_empty())
+            .map(|(key, candles)| (key.clone(), candles.len()))
+            .collect::<Vec<_>>();
+        let mut prune_pending = self.prune_pending.lock().await;
+        let series_to_prune = series_rows
+            .iter()
+            .filter(|(key, rows)| self.should_prune_series(&prune_pending, key, *rows))
+            .map(|(key, _)| key.clone())
+            .collect::<HashSet<_>>();
         let updated_at = chrono::Utc::now().timestamp_millis();
         let mut tx = self.write_pool.begin().await?;
 
@@ -272,16 +326,16 @@ impl SqliteStore {
             .collect::<Vec<_>>();
         upsert_candle_rows(&mut tx, &rows, updated_at).await?;
 
-        for ((symbol, interval), candles) in grouped {
-            if candles.is_empty() {
-                continue;
-            }
-
+        for (symbol, interval) in &series_to_prune {
             self.prune_series_in_transaction(&mut tx, symbol, interval)
                 .await?;
         }
 
         tx.commit().await?;
+        for (key, rows) in series_rows {
+            let pruned = series_to_prune.contains(&key);
+            self.record_prune_progress(&mut prune_pending, key, rows, pruned);
+        }
         Ok(())
     }
 
@@ -403,20 +457,40 @@ impl SqliteStore {
         row.try_get::<Option<i64>, _>("max_open_time")
     }
 
-    async fn prune_series(&self, symbol: &str, interval: &str) -> Result<(), sqlx::Error> {
+    fn should_prune_series(
+        &self,
+        prune_pending: &HashMap<(String, String), usize>,
+        key: &(String, String),
+        new_rows: usize,
+    ) -> bool {
         if self.retention_bars == 0 {
-            return Ok(());
+            return false;
         }
 
-        sqlx::query(PRUNE_SERIES_SQL)
-            .bind(symbol)
-            .bind(interval)
-            .bind(symbol)
-            .bind(interval)
-            .bind(i64::from(self.retention_bars))
-            .execute(&self.write_pool)
-            .await?;
-        Ok(())
+        let Some(pending) = prune_pending.get(key).copied() else {
+            return true;
+        };
+
+        pending.saturating_add(new_rows) >= prune_check_rows(self.retention_bars)
+    }
+
+    fn record_prune_progress(
+        &self,
+        prune_pending: &mut HashMap<(String, String), usize>,
+        key: (String, String),
+        new_rows: usize,
+        pruned: bool,
+    ) {
+        if self.retention_bars == 0 {
+            return;
+        }
+
+        if pruned {
+            prune_pending.insert(key, 0);
+        } else {
+            let pending = prune_pending.entry(key).or_default();
+            *pending = pending.saturating_add(new_rows);
+        }
     }
 
     async fn prune_series_in_transaction(
@@ -444,6 +518,14 @@ impl SqliteStore {
 fn is_memory_database(database_url: &str) -> bool {
     let database_url = database_url.to_ascii_lowercase();
     database_url.contains(":memory:") || database_url.contains("mode=memory")
+}
+
+fn prune_check_rows(retention_bars: u32) -> usize {
+    if retention_bars < 100 {
+        1
+    } else {
+        (retention_bars / 20).max(100) as usize
+    }
 }
 
 #[cfg(test)]
@@ -536,6 +618,160 @@ mod tests {
                 .len(),
             1
         );
+
+        store.read_pool.close().await;
+        store.write_pool.close().await;
+        for path in [
+            database_path.clone(),
+            database_path.with_extension("db-wal"),
+            database_path.with_extension("db-shm"),
+        ] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[tokio::test]
+    async fn migrates_a_rowid_table_without_losing_existing_klines() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let database_path = std::env::temp_dir().join(format!(
+            "crypto-candlestick-rowid-migration-{}-{unique}.db",
+            std::process::id()
+        ));
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            database_path.to_string_lossy().replace('\\', "/")
+        );
+
+        let legacy_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        let legacy_schema = CREATE_KLINES_TABLE_SQL.replace(" WITHOUT ROWID", "");
+        sqlx::query(&legacy_schema)
+            .execute(&legacy_pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO klines (
+                symbol, interval, open_time, close_time, open, high, low, close,
+                volume, quote_volume, trade_count, is_closed, updated_at
+            ) VALUES ('BTCUSDT', '1', 60000, 119999, 100.0, 101.0, 99.0, 100.5,
+                      12.5, 1250.0, 3, 1, 60000)
+            "#,
+        )
+        .execute(&legacy_pool)
+        .await
+        .unwrap();
+        legacy_pool.close().await;
+
+        let store = SqliteStore::connect_with_retention(&database_url, 0)
+            .await
+            .unwrap();
+        let schema = sqlx::query_scalar::<_, String>(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'klines'",
+        )
+        .fetch_one(&store.read_pool)
+        .await
+        .unwrap();
+        assert!(schema.to_ascii_uppercase().contains("WITHOUT ROWID"));
+
+        let rows = store
+            .query_klines("BTCUSDT", "1", None, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].candle.open_time, 60_000);
+        assert_eq!(rows[0].candle.close, 100.5);
+
+        store.read_pool.close().await;
+        store.write_pool.close().await;
+        for path in [
+            database_path.clone(),
+            database_path.with_extension("db-wal"),
+            database_path.with_extension("db-shm"),
+        ] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[tokio::test]
+    async fn first_write_after_restart_prunes_existing_rows() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let database_path = std::env::temp_dir().join(format!(
+            "crypto-candlestick-restart-prune-{}-{unique}.db",
+            std::process::id()
+        ));
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            database_path.to_string_lossy().replace('\\', "/")
+        );
+
+        let store = SqliteStore::connect_with_retention(&database_url, 0)
+            .await
+            .unwrap();
+        let candles = (0..299)
+            .map(|index| {
+                let open_time = index * 60_000;
+                Candle {
+                    open_time,
+                    close_time: open_time + 59_999,
+                    open: 100.0,
+                    high: 101.0,
+                    low: 99.0,
+                    close: 100.5,
+                    volume: 12.5,
+                    quote_volume: 1_250.0,
+                    trade_count: 3,
+                    is_closed: true,
+                }
+            })
+            .collect::<Vec<_>>();
+        store
+            .upsert_candles("BTCUSDT", "1", &candles)
+            .await
+            .unwrap();
+        store.read_pool.close().await;
+        store.write_pool.close().await;
+
+        let store = SqliteStore::connect_with_retention(&database_url, 200)
+            .await
+            .unwrap();
+        let open_time = 299 * 60_000;
+        store
+            .upsert_candle(
+                "BTCUSDT",
+                "1",
+                &Candle {
+                    open_time,
+                    close_time: open_time + 59_999,
+                    open: 100.0,
+                    high: 101.0,
+                    low: 99.0,
+                    close: 100.5,
+                    volume: 12.5,
+                    quote_volume: 1_250.0,
+                    trade_count: 3,
+                    is_closed: true,
+                },
+            )
+            .await
+            .unwrap();
+
+        let rows = store
+            .query_klines("BTCUSDT", "1", None, None, 500)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 200);
+        assert_eq!(rows[0].candle.open_time, 100 * 60_000);
+        assert_eq!(rows[199].candle.open_time, 299 * 60_000);
 
         store.read_pool.close().await;
         store.write_pool.close().await;

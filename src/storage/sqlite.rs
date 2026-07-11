@@ -1,6 +1,6 @@
 use crate::domain::candle::Candle;
 use serde::{Deserialize, Serialize};
-use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
+use sqlx::{sqlite::SqlitePoolOptions, QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
 use std::collections::HashMap;
 
 pub const DEFAULT_RETENTION_BARS: u32 = 5_000;
@@ -37,6 +37,22 @@ const UPSERT_CANDLE_SQL: &str = r#"
         updated_at = excluded.updated_at
     "#;
 
+const UPSERT_CANDLE_CHUNK_ROWS: usize = 500;
+
+const UPSERT_CANDLE_CONFLICT_SQL: &str = r#"
+    ON CONFLICT(symbol, interval, open_time) DO UPDATE SET
+        close_time = excluded.close_time,
+        open = excluded.open,
+        high = excluded.high,
+        low = excluded.low,
+        close = excluded.close,
+        volume = excluded.volume,
+        quote_volume = excluded.quote_volume,
+        trade_count = excluded.trade_count,
+        is_closed = excluded.is_closed,
+        updated_at = excluded.updated_at
+    "#;
+
 const PRUNE_SERIES_SQL: &str = r#"
     DELETE FROM klines
     WHERE symbol = ?
@@ -53,6 +69,48 @@ const PRUNE_SERIES_SQL: &str = r#"
         )
       )
     "#;
+
+#[derive(Clone, Copy)]
+struct CandleUpsertRow<'a> {
+    symbol: &'a str,
+    interval: &'a str,
+    candle: &'a Candle,
+}
+
+async fn upsert_candle_rows(
+    tx: &mut Transaction<'_, Sqlite>,
+    rows: &[CandleUpsertRow<'_>],
+    updated_at: i64,
+) -> Result<(), sqlx::Error> {
+    for rows in rows.chunks(UPSERT_CANDLE_CHUNK_ROWS) {
+        let mut query_builder = QueryBuilder::<Sqlite>::new(
+            "INSERT INTO klines (\
+                symbol, interval, open_time, close_time, open, high, low, close, \
+                volume, quote_volume, trade_count, is_closed, updated_at\
+            ) ",
+        );
+        query_builder.push_values(rows, |mut query_row, row| {
+            query_row
+                .push_bind(row.symbol)
+                .push_bind(row.interval)
+                .push_bind(row.candle.open_time)
+                .push_bind(row.candle.close_time)
+                .push_bind(row.candle.open)
+                .push_bind(row.candle.high)
+                .push_bind(row.candle.low)
+                .push_bind(row.candle.close)
+                .push_bind(row.candle.volume)
+                .push_bind(row.candle.quote_volume)
+                .push_bind(row.candle.trade_count as i64)
+                .push_bind(i64::from(row.candle.is_closed))
+                .push_bind(updated_at);
+        });
+        query_builder.push(UPSERT_CANDLE_CONFLICT_SQL);
+        query_builder.build().execute(&mut **tx).await?;
+    }
+
+    Ok(())
+}
 
 impl SqliteStore {
     pub async fn connect(database_url: &str) -> Result<Self, sqlx::Error> {
@@ -145,24 +203,15 @@ impl SqliteStore {
 
         let updated_at = chrono::Utc::now().timestamp_millis();
         let mut tx = self.pool.begin().await?;
-        for candle in candles {
-            sqlx::query(UPSERT_CANDLE_SQL)
-                .bind(symbol)
-                .bind(interval)
-                .bind(candle.open_time)
-                .bind(candle.close_time)
-                .bind(candle.open)
-                .bind(candle.high)
-                .bind(candle.low)
-                .bind(candle.close)
-                .bind(candle.volume)
-                .bind(candle.quote_volume)
-                .bind(candle.trade_count as i64)
-                .bind(i64::from(candle.is_closed))
-                .bind(updated_at)
-                .execute(&mut *tx)
-                .await?;
-        }
+        let rows = candles
+            .iter()
+            .map(|candle| CandleUpsertRow {
+                symbol,
+                interval,
+                candle,
+            })
+            .collect::<Vec<_>>();
+        upsert_candle_rows(&mut tx, &rows, updated_at).await?;
 
         self.prune_series_in_transaction(&mut tx, symbol, interval)
             .await?;
@@ -181,28 +230,21 @@ impl SqliteStore {
         let updated_at = chrono::Utc::now().timestamp_millis();
         let mut tx = self.pool.begin().await?;
 
+        let rows = grouped
+            .iter()
+            .flat_map(|((symbol, interval), candles)| {
+                candles.iter().map(move |candle| CandleUpsertRow {
+                    symbol,
+                    interval,
+                    candle,
+                })
+            })
+            .collect::<Vec<_>>();
+        upsert_candle_rows(&mut tx, &rows, updated_at).await?;
+
         for ((symbol, interval), candles) in grouped {
             if candles.is_empty() {
                 continue;
-            }
-
-            for candle in candles {
-                sqlx::query(UPSERT_CANDLE_SQL)
-                    .bind(symbol)
-                    .bind(interval)
-                    .bind(candle.open_time)
-                    .bind(candle.close_time)
-                    .bind(candle.open)
-                    .bind(candle.high)
-                    .bind(candle.low)
-                    .bind(candle.close)
-                    .bind(candle.volume)
-                    .bind(candle.quote_volume)
-                    .bind(candle.trade_count as i64)
-                    .bind(i64::from(candle.is_closed))
-                    .bind(updated_at)
-                    .execute(&mut *tx)
-                    .await?;
             }
 
             self.prune_series_in_transaction(&mut tx, symbol, interval)

@@ -145,6 +145,53 @@ async fn batch_upsert_prunes_once_after_inserted_rows() {
 }
 
 #[tokio::test]
+async fn batch_upsert_handles_multiple_sql_chunks_and_conflicts() {
+    let store = SqliteStore::connect_with_retention("sqlite::memory:", 0)
+        .await
+        .unwrap();
+    let mut candles = (0..1_101)
+        .map(|index| {
+            let open_time = index * 60_000;
+            Candle {
+                open_time,
+                close_time: open_time + 59_999,
+                open: 100.0,
+                high: 101.0,
+                low: 99.0,
+                close: 100.5,
+                volume: 12.5,
+                quote_volume: 1_250.0,
+                trade_count: 3,
+                is_closed: true,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    store
+        .upsert_candles("BTCUSDT", "1", &candles)
+        .await
+        .unwrap();
+
+    for candle in &mut candles {
+        candle.close = 101.5;
+        candle.trade_count = 4;
+    }
+    store
+        .upsert_candles("BTCUSDT", "1", &candles)
+        .await
+        .unwrap();
+
+    let rows = store
+        .query_klines("BTCUSDT", "1", None, None, 2_000)
+        .await
+        .unwrap();
+
+    assert_eq!(rows.len(), 1_101);
+    assert!(rows.iter().all(|row| row.candle.close == 101.5));
+    assert!(rows.iter().all(|row| row.candle.trade_count == 4));
+}
+
+#[tokio::test]
 async fn grouped_upsert_persists_and_prunes_multiple_series_in_one_batch() {
     let store = SqliteStore::connect_with_retention("sqlite::memory:", 2)
         .await

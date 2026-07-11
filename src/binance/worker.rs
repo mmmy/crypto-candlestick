@@ -307,12 +307,8 @@ impl BinanceWorker {
                 if let Ok(source_interval) = Interval::parse(&interval) {
                     let source = source_interval.canonical();
                     self.latest.upsert(&symbol, &source, candle.clone()).await;
-                    if let Err(err) = self
-                        .refresh_custom_latest_from_open(&symbol, &source, candle)
-                        .await
-                    {
-                        tracing::warn!("failed to refresh custom latest: {}", err);
-                    }
+                    self.refresh_custom_latest_from_open(&symbol, &source, candle)
+                        .await;
                 }
             }
             MarketEvent::ClosedKline {
@@ -438,45 +434,34 @@ impl BinanceWorker {
         symbol: &str,
         source: &str,
         open_candle: crate::domain::candle::Candle,
-    ) -> Result<(), sqlx::Error> {
-        let targets = self
+    ) {
+        let previews = self
             .custom_aggregators
-            .keys()
-            .filter(|key| key.0 == symbol && key.1 == source)
-            .cloned()
+            .iter()
+            .filter(|(key, _)| key.0 == symbol && key.1 == source)
+            .filter_map(|(key, aggregator)| {
+                let mut preview = aggregator.clone();
+                if let Err(err) = preview.ingest_candle(open_candle.clone()) {
+                    tracing::warn!(
+                        symbol,
+                        source,
+                        target = %key.2,
+                        "failed to preview custom latest: {}",
+                        err
+                    );
+                    return None;
+                }
+
+                preview.current().map(|mut current| {
+                    current.is_closed = false;
+                    (key.2.clone(), current)
+                })
+            })
             .collect::<Vec<_>>();
 
-        for key in targets {
-            let Ok(target_interval) = Interval::parse(&key.2) else {
-                continue;
-            };
-            let start_time = target_interval.bucket_start_ms(open_candle.open_time);
-            let rows = self
-                .store
-                .query_klines(
-                    &key.0,
-                    &key.1,
-                    Some(start_time),
-                    Some(open_candle.open_time.saturating_sub(1)),
-                    10_000,
-                )
-                .await?;
-            let mut aggregator = Aggregator::new(target_interval);
-
-            for row in rows {
-                if row.candle.close_time < open_candle.open_time {
-                    let _ = aggregator.ingest_candle(row.candle);
-                }
-            }
-            let _ = aggregator.ingest_candle(open_candle.clone());
-
-            if let Some(mut current) = aggregator.current() {
-                current.is_closed = false;
-                self.latest.upsert(&key.0, &key.2, current).await;
-            }
+        for (target, current) in previews {
+            self.latest.upsert(symbol, &target, current).await;
         }
-
-        Ok(())
     }
 }
 
@@ -497,5 +482,125 @@ pub async fn flush_closed_buffer(
         tracing::warn!(series, rows, "failed to flush closed kline buffer: {}", err);
     } else {
         closed_buffer.remove_flushed(&grouped).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn custom_open_preview_uses_unflushed_closed_base_candles() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let latest = LatestCache::default();
+        let closed_buffer = ClosedKlineBuffer::default();
+        let mut worker = BinanceWorker::new(
+            store.clone(),
+            latest.clone(),
+            MemorySeriesStore::default(),
+            closed_buffer.clone(),
+            RuntimeHealth::default(),
+            vec!["BTCUSDT".to_string()],
+            vec![
+                Interval::parse("5").unwrap(),
+                Interval::parse("10").unwrap(),
+            ],
+            1_500,
+            false,
+            usize::MAX,
+            Arc::new(Mutex::new(())),
+        );
+
+        worker
+            .handle_event(MarketEvent::ClosedKline {
+                symbol: "BTCUSDT".to_string(),
+                interval: "5".to_string(),
+                candle: Candle {
+                    open_time: 0,
+                    close_time: 299_999,
+                    open: 100.0,
+                    high: 105.0,
+                    low: 99.0,
+                    close: 104.0,
+                    volume: 1.0,
+                    quote_volume: 102.0,
+                    trade_count: 2,
+                    is_closed: true,
+                },
+            })
+            .await;
+
+        assert!(store
+            .query_klines("BTCUSDT", "5", None, None, 10)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            closed_buffer
+                .query("BTCUSDT", "5", None, None, 10)
+                .await
+                .len(),
+            1
+        );
+
+        worker
+            .handle_event(MarketEvent::OpenKline {
+                symbol: "BTCUSDT".to_string(),
+                interval: "5".to_string(),
+                candle: Candle {
+                    open_time: 300_000,
+                    close_time: 599_999,
+                    open: 104.0,
+                    high: 112.0,
+                    low: 103.0,
+                    close: 111.0,
+                    volume: 2.0,
+                    quote_volume: 216.0,
+                    trade_count: 3,
+                    is_closed: false,
+                },
+            })
+            .await;
+
+        let preview = latest.get("BTCUSDT", "10").await.unwrap();
+        assert_eq!(preview.open_time, 0);
+        assert_eq!(preview.close_time, 599_999);
+        assert_eq!(preview.open, 100.0);
+        assert_eq!(preview.high, 112.0);
+        assert_eq!(preview.low, 99.0);
+        assert_eq!(preview.close, 111.0);
+        assert_eq!(preview.volume, 3.0);
+        assert_eq!(preview.quote_volume, 318.0);
+        assert_eq!(preview.trade_count, 5);
+        assert!(!preview.is_closed);
+
+        worker
+            .handle_event(MarketEvent::OpenKline {
+                symbol: "BTCUSDT".to_string(),
+                interval: "5".to_string(),
+                candle: Candle {
+                    open_time: 300_000,
+                    close_time: 599_999,
+                    open: 104.0,
+                    high: 114.0,
+                    low: 102.0,
+                    close: 113.0,
+                    volume: 2.5,
+                    quote_volume: 270.0,
+                    trade_count: 4,
+                    is_closed: false,
+                },
+            })
+            .await;
+
+        let updated_preview = latest.get("BTCUSDT", "10").await.unwrap();
+        assert_eq!(updated_preview.open, 100.0);
+        assert_eq!(updated_preview.high, 114.0);
+        assert_eq!(updated_preview.low, 99.0);
+        assert_eq!(updated_preview.close, 113.0);
+        assert_eq!(updated_preview.volume, 3.5);
+        assert_eq!(updated_preview.quote_volume, 372.0);
+        assert_eq!(updated_preview.trade_count, 6);
+        assert!(!updated_preview.is_closed);
     }
 }

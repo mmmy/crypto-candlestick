@@ -77,25 +77,6 @@ const CREATE_KLINES_TABLE_SQL: &str = r#"
     ) WITHOUT ROWID;
     "#;
 
-const CREATE_KLINES_MIGRATION_TABLE_SQL: &str = r#"
-    CREATE TABLE klines_without_rowid_migration (
-        symbol TEXT NOT NULL,
-        interval TEXT NOT NULL,
-        open_time INTEGER NOT NULL,
-        close_time INTEGER NOT NULL,
-        open REAL NOT NULL,
-        high REAL NOT NULL,
-        low REAL NOT NULL,
-        close REAL NOT NULL,
-        volume REAL NOT NULL,
-        quote_volume REAL NOT NULL,
-        trade_count INTEGER NOT NULL,
-        is_closed INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL,
-        PRIMARY KEY (symbol, interval, open_time)
-    ) WITHOUT ROWID;
-    "#;
-
 #[derive(Clone, Copy)]
 struct CandleUpsertRow<'a> {
     symbol: &'a str,
@@ -213,36 +194,10 @@ impl SqliteStore {
                     .await?;
             }
             Some(schema) if schema.to_ascii_uppercase().contains("WITHOUT ROWID") => {}
-            Some(_) => {
-                tracing::info!("migrating klines table to WITHOUT ROWID");
-                let mut tx = self.write_pool.begin().await?;
-                sqlx::query("DROP TABLE IF EXISTS klines_without_rowid_migration")
-                    .execute(&mut *tx)
-                    .await?;
-                sqlx::query(CREATE_KLINES_MIGRATION_TABLE_SQL)
-                    .execute(&mut *tx)
-                    .await?;
-                sqlx::query(
-                    r#"
-                    INSERT INTO klines_without_rowid_migration (
-                        symbol, interval, open_time, close_time, open, high, low, close,
-                        volume, quote_volume, trade_count, is_closed, updated_at
-                    )
-                    SELECT
-                        symbol, interval, open_time, close_time, open, high, low, close,
-                        volume, quote_volume, trade_count, is_closed, updated_at
-                    FROM klines
-                    "#,
-                )
-                .execute(&mut *tx)
-                .await?;
-                sqlx::query("DROP TABLE klines").execute(&mut *tx).await?;
-                sqlx::query("ALTER TABLE klines_without_rowid_migration RENAME TO klines")
-                    .execute(&mut *tx)
-                    .await?;
-                tx.commit().await?;
-                tracing::info!("klines table migration to WITHOUT ROWID completed");
-            }
+            Some(_) => return Err(sqlx::Error::Protocol(
+                "klines table must use WITHOUT ROWID; migrate the database before starting the service"
+                    .to_string(),
+            )),
         }
 
         Ok(())
@@ -631,13 +586,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrates_a_rowid_table_without_losing_existing_klines() {
+    async fn rejects_a_legacy_rowid_table() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let database_path = std::env::temp_dir().join(format!(
-            "crypto-candlestick-rowid-migration-{}-{unique}.db",
+            "crypto-candlestick-legacy-rowid-{}-{unique}.db",
             std::process::id()
         ));
         let database_url = format!(
@@ -669,27 +624,30 @@ mod tests {
         .unwrap();
         legacy_pool.close().await;
 
-        let store = SqliteStore::connect_with_retention(&database_url, 0)
+        let error = SqliteStore::connect_with_retention(&database_url, 0)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("must use WITHOUT ROWID"));
+
+        let verification_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
             .await
             .unwrap();
         let schema = sqlx::query_scalar::<_, String>(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'klines'",
         )
-        .fetch_one(&store.read_pool)
+        .fetch_one(&verification_pool)
         .await
         .unwrap();
-        assert!(schema.to_ascii_uppercase().contains("WITHOUT ROWID"));
-
-        let rows = store
-            .query_klines("BTCUSDT", "1", None, None, 10)
+        let row_count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM klines")
+            .fetch_one(&verification_pool)
             .await
             .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].candle.open_time, 60_000);
-        assert_eq!(rows[0].candle.close, 100.5);
+        assert!(!schema.to_ascii_uppercase().contains("WITHOUT ROWID"));
+        assert_eq!(row_count, 1);
+        verification_pool.close().await;
 
-        store.read_pool.close().await;
-        store.write_pool.close().await;
         for path in [
             database_path.clone(),
             database_path.with_extension("db-wal"),

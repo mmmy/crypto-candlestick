@@ -1,3 +1,4 @@
+use crate::storage::sqlite::Alert;
 use crate::{
     domain::{candle::Candle, interval::Interval},
     http::routes::AppState,
@@ -6,8 +7,9 @@ use crate::{
     storage::sqlite::StoredKline,
     time_format::format_timestamp_ms,
 };
+use axum::http::StatusCode;
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     Json,
 };
 use chrono::Local;
@@ -21,6 +23,222 @@ pub struct HealthResponse {
 
 pub async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { ok: true })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AlertRequest {
+    pub symbol: String,
+    pub interval: String,
+    pub price: f64,
+    pub direction: String,
+    pub expires_at: Option<i64>,
+    pub webhook_url: String,
+    #[serde(alias = "message")]
+    pub message_template: String,
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AlertPatch {
+    pub symbol: Option<String>,
+    pub interval: Option<String>,
+    pub price: Option<f64>,
+    pub direction: Option<String>,
+    pub expires_at: Option<i64>,
+    pub webhook_url: Option<String>,
+    #[serde(alias = "message")]
+    pub message_template: Option<String>,
+    pub status: Option<String>,
+}
+
+fn validate_alert(
+    state: &AppState,
+    symbol: &str,
+    interval: &str,
+    price: f64,
+    direction: &str,
+    url: &str,
+    message: &str,
+) -> Result<(String, String), (StatusCode, String)> {
+    let symbol = symbol.trim().to_uppercase();
+    let parsed = Interval::parse(interval).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let interval = parsed.canonical();
+    if !state
+        .health_targets
+        .iter()
+        .any(|t| t.symbol == symbol && t.interval == interval)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "symbol and interval are not subscribed".to_string(),
+        ));
+    }
+    if !price.is_finite() || price <= 0.0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "price must be a positive finite number".to_string(),
+        ));
+    }
+    if !matches!(direction, "cross_up" | "cross_down" | "cross_any") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "direction must be cross_up, cross_down, or cross_any".to_string(),
+        ));
+    }
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "webhookUrl must be an http(s) URL".to_string(),
+        ));
+    }
+    serde_json::from_str::<serde_json::Value>(message).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("messageTemplate must be valid JSON: {e}"),
+        )
+    })?;
+    Ok((symbol, interval))
+}
+
+pub async fn alerts(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<Alert>>, (StatusCode, String)> {
+    state
+        .store
+        .list_alerts()
+        .await
+        .map(Json)
+        .map_err(internal_error)
+}
+
+pub async fn get_alert(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Alert>, (StatusCode, String)> {
+    state
+        .store
+        .get_alert(id)
+        .await
+        .map_err(internal_error)?
+        .map(Json)
+        .ok_or((StatusCode::NOT_FOUND, "alert not found".to_string()))
+}
+
+pub async fn create_alert(
+    State(state): State<AppState>,
+    Json(request): Json<AlertRequest>,
+) -> Result<(StatusCode, Json<Alert>), (StatusCode, String)> {
+    let (symbol, interval) = validate_alert(
+        &state,
+        &request.symbol,
+        &request.interval,
+        request.price,
+        &request.direction,
+        &request.webhook_url,
+        &request.message_template,
+    )?;
+    let now = chrono::Utc::now().timestamp_millis();
+    let status = request.status.unwrap_or_else(|| "active".to_string());
+    if !matches!(status.as_str(), "active" | "disabled") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "status must be active or disabled".to_string(),
+        ));
+    }
+    let alert = Alert {
+        id: 0,
+        symbol,
+        interval,
+        price: request.price,
+        direction: request.direction,
+        status,
+        expires_at: request.expires_at,
+        webhook_url: request.webhook_url,
+        message_template: request.message_template,
+        created_at: now,
+        updated_at: now,
+        triggered_at: None,
+        delivery_status: None,
+        delivery_error: None,
+    };
+    state
+        .store
+        .insert_alert(&alert)
+        .await
+        .map(|created| (StatusCode::CREATED, Json(created)))
+        .map_err(internal_error)
+}
+
+pub async fn update_alert(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(patch): Json<AlertPatch>,
+) -> Result<Json<Alert>, (StatusCode, String)> {
+    let mut alert = state
+        .store
+        .get_alert(id)
+        .await
+        .map_err(internal_error)?
+        .ok_or((StatusCode::NOT_FOUND, "alert not found".to_string()))?;
+    let symbol = patch.symbol.as_deref().unwrap_or(&alert.symbol);
+    let interval = patch.interval.as_deref().unwrap_or(&alert.interval);
+    let price = patch.price.unwrap_or(alert.price);
+    let direction = patch.direction.as_deref().unwrap_or(&alert.direction);
+    let url = patch.webhook_url.as_deref().unwrap_or(&alert.webhook_url);
+    let message = patch
+        .message_template
+        .as_deref()
+        .unwrap_or(&alert.message_template);
+    let (symbol, interval) =
+        validate_alert(&state, symbol, interval, price, direction, url, message)?;
+    alert.symbol = symbol;
+    alert.interval = interval;
+    alert.price = price;
+    alert.direction = direction.to_string();
+    alert.webhook_url = url.to_string();
+    alert.message_template = message.to_string();
+    if let Some(status) = patch.status {
+        if !matches!(status.as_str(), "active" | "disabled") {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "status must be active or disabled".to_string(),
+            ));
+        }
+        alert.status = status;
+        if alert.status == "active" {
+            alert.triggered_at = None;
+            alert.delivery_status = None;
+            alert.delivery_error = None;
+        }
+    }
+    alert.expires_at = patch.expires_at.or(alert.expires_at);
+    alert.updated_at = chrono::Utc::now().timestamp_millis();
+    if !state
+        .store
+        .update_alert(&alert)
+        .await
+        .map_err(internal_error)?
+    {
+        return Err((StatusCode::NOT_FOUND, "alert not found".to_string()));
+    }
+    Ok(Json(alert))
+}
+
+pub async fn delete_alert(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    if state.store.delete_alert(id).await.map_err(internal_error)? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err((StatusCode::NOT_FOUND, "alert not found".to_string()))
+    }
+}
+
+fn internal_error(error: sqlx::Error) -> (StatusCode, String) {
+    (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
 }
 
 const DEEP_HEALTH_SCAN_LIMIT: u32 = 5_000;

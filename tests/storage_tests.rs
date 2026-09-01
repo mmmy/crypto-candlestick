@@ -1,5 +1,5 @@
 use crypto_candlestick::domain::candle::Candle;
-use crypto_candlestick::storage::sqlite::SqliteStore;
+use crypto_candlestick::storage::sqlite::{Alert, SqliteStore};
 use std::collections::HashMap;
 
 #[tokio::test]
@@ -360,4 +360,33 @@ async fn query_marks_rows_with_future_close_time_as_open() {
         .unwrap();
 
     assert!(!rows[0].candle.is_closed);
+}
+
+#[tokio::test]
+async fn persists_and_claims_alert_once() {
+    let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let alert = Alert {
+        id: 0,
+        symbol: "BTCUSDT".to_string(),
+        interval: "1".to_string(),
+        price: 100.0,
+        direction: "cross_up".to_string(),
+        status: "active".to_string(),
+        expires_at: None,
+        webhook_url: "https://example.com/hook".to_string(),
+        message_template: "{}".to_string(),
+        created_at: 1,
+        updated_at: 1,
+        triggered_at: None,
+        delivery_status: None,
+        delivery_error: None,
+    };
+    let created = store.insert_alert(&alert).await.unwrap();
+    assert_eq!(store.list_alerts().await.unwrap().len(), 1);
+    assert!(store.claim_alert(created.id, 2).await.unwrap());
+    assert!(!store.claim_alert(created.id, 3).await.unwrap());
+    assert_eq!(
+        store.get_alert(created.id).await.unwrap().unwrap().status,
+        "triggered"
+    );
 }

@@ -5,7 +5,10 @@ use crate::{
 };
 use axum::{routing::get, Router};
 
-use super::handlers::{deep_health, guaili, health, health_summary, klines};
+use super::handlers::{
+    alerts, create_alert, deep_health, delete_alert, get_alert, guaili, health, health_summary,
+    klines, update_alert,
+};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -33,5 +36,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/health/deep", get(deep_health))
         .route("/api/klines", get(klines))
         .route("/api/indicators/guaili", get(guaili))
+        .route("/api/alerts", get(alerts).post(create_alert))
+        .route(
+            "/api/alerts/:id",
+            get(get_alert).patch(update_alert).delete(delete_alert),
+        )
         .with_state(state)
 }

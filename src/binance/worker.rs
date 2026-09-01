@@ -147,6 +147,7 @@ pub struct BinanceWorker {
     flush_lock: FlushLock,
     custom_aggregators: HashMap<(String, String, String), Aggregator>,
     second_aggregators: HashMap<(String, String), Aggregator>,
+    alert_last_sides: HashMap<i64, i8>,
 }
 
 pub type FlushLock = Arc<Mutex<()>>;
@@ -194,6 +195,7 @@ impl BinanceWorker {
             flush_lock,
             custom_aggregators,
             second_aggregators,
+            alert_last_sides: HashMap::new(),
         }
     }
 
@@ -306,6 +308,12 @@ impl BinanceWorker {
             } => {
                 if let Ok(source_interval) = Interval::parse(&interval) {
                     let source = source_interval.canonical();
+                    self.evaluate_price_alerts(
+                        &symbol,
+                        candle.close,
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await;
                     self.latest.upsert(&symbol, &source, candle.clone()).await;
                     self.refresh_custom_latest_from_open(&symbol, &source, candle)
                         .await;
@@ -365,6 +373,8 @@ impl BinanceWorker {
                 }
             }
             MarketEvent::AggTrade { symbol, trade } => {
+                self.evaluate_price_alerts(&symbol, trade.price, trade.timestamp_ms)
+                    .await;
                 for (key, agg) in self.second_aggregators.iter_mut() {
                     if key.0 == symbol {
                         if let Ok(Some(closed)) = agg.ingest_trade(TradeTick {
@@ -384,6 +394,86 @@ impl BinanceWorker {
                 }
             }
             MarketEvent::Ignored => {}
+        }
+    }
+
+    async fn evaluate_price_alerts(&mut self, symbol: &str, price: f64, now_ms: i64) {
+        let alerts = match self
+            .store
+            .active_alerts_for_symbol(&symbol.to_uppercase(), now_ms)
+            .await
+        {
+            Ok(alerts) => alerts,
+            Err(err) => {
+                tracing::warn!(symbol, "failed to load alerts: {}", err);
+                return;
+            }
+        };
+        for alert in alerts {
+            let side = if price > alert.price {
+                1
+            } else if price < alert.price {
+                -1
+            } else {
+                0
+            };
+            let previous = self.alert_last_sides.insert(alert.id, side).unwrap_or(0);
+            let crossed = side != 0
+                && previous != 0
+                && side != previous
+                && ((alert.direction == "cross_up" && previous < 0 && side > 0)
+                    || (alert.direction == "cross_down" && previous > 0 && side < 0)
+                    || (alert.direction == "cross_any"));
+            if !crossed {
+                continue;
+            }
+            if let Ok(true) = self.store.claim_alert(alert.id, now_ms).await {
+                let store = self.store.clone();
+                tokio::spawn(async move {
+                    let body = render_alert_message(&alert.message_template, &alert, price, now_ms);
+                    let result = match serde_json::from_str::<serde_json::Value>(&body) {
+                        Ok(json) => {
+                            let client = reqwest::Client::new();
+                            let mut result = Err("webhook delivery failed".to_string());
+                            for attempt in 0..3 {
+                                result = client
+                                    .post(&alert.webhook_url)
+                                    .json(&json)
+                                    .timeout(Duration::from_secs(5))
+                                    .send()
+                                    .await
+                                    .map_err(|e| e.to_string())
+                                    .and_then(|response| {
+                                        if response.status().is_success() {
+                                            Ok(response)
+                                        } else {
+                                            Err(format!("webhook returned {}", response.status()))
+                                        }
+                                    });
+                                if result.is_ok() {
+                                    break;
+                                }
+                                if attempt < 2 {
+                                    tokio::time::sleep(Duration::from_millis(250 * (1 << attempt)))
+                                        .await;
+                                }
+                            }
+                            result
+                        }
+                        Err(e) => Err(format!("invalid rendered message JSON: {e}")),
+                    };
+                    match result {
+                        Ok(_) => {
+                            let _ = store.set_alert_delivery(alert.id, "success", None).await;
+                        }
+                        Err(err) => {
+                            let _ = store
+                                .set_alert_delivery(alert.id, "failed", Some(&err))
+                                .await;
+                        }
+                    }
+                });
+            }
         }
     }
 
@@ -463,6 +553,28 @@ impl BinanceWorker {
             self.latest.upsert(symbol, &target, current).await;
         }
     }
+}
+
+fn render_alert_message(
+    template: &str,
+    alert: &crate::storage::sqlite::Alert,
+    price: f64,
+    now_ms: i64,
+) -> String {
+    let mut rendered = template.to_string();
+    for (key, value) in [
+        ("{{ticker}}", alert.symbol.clone()),
+        ("{{symbol}}", alert.symbol.clone()),
+        ("{{exchange}}", "BINANCE".to_string()),
+        ("{{interval}}", alert.interval.clone()),
+        ("{{price}}", price.to_string()),
+        ("{{close}}", price.to_string()),
+        ("{{alertId}}", alert.id.to_string()),
+        ("{{time}}", now_ms.to_string()),
+    ] {
+        rendered = rendered.replace(key, &value);
+    }
+    rendered
 }
 
 pub async fn flush_closed_buffer(

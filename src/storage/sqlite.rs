@@ -19,6 +19,25 @@ pub struct SqliteStore {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Alert {
+    pub id: i64,
+    pub symbol: String,
+    pub interval: String,
+    pub price: f64,
+    pub direction: String,
+    pub status: String,
+    pub expires_at: Option<i64>,
+    pub webhook_url: String,
+    pub message_template: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub triggered_at: Option<i64>,
+    pub delivery_status: Option<String>,
+    pub delivery_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoredKline {
     pub symbol: String,
     pub interval: String,
@@ -75,6 +94,25 @@ const CREATE_KLINES_TABLE_SQL: &str = r#"
         updated_at INTEGER NOT NULL,
         PRIMARY KEY (symbol, interval, open_time)
     ) WITHOUT ROWID;
+    "#;
+
+const CREATE_ALERTS_TABLE_SQL: &str = r#"
+    CREATE TABLE IF NOT EXISTS alerts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT NOT NULL,
+        interval TEXT NOT NULL,
+        price REAL NOT NULL,
+        direction TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active',
+        expires_at INTEGER,
+        webhook_url TEXT NOT NULL,
+        message_template TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        triggered_at INTEGER,
+        delivery_status TEXT,
+        delivery_error TEXT
+    );
     "#;
 
 #[derive(Clone, Copy)]
@@ -177,6 +215,14 @@ impl SqliteStore {
             .execute(&self.write_pool)
             .await?;
         self.ensure_without_rowid_schema().await?;
+        sqlx::query(CREATE_ALERTS_TABLE_SQL)
+            .execute(&self.write_pool)
+            .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_alerts_symbol_status ON alerts(symbol, status)",
+        )
+        .execute(&self.write_pool)
+        .await?;
         Ok(())
     }
 
@@ -468,6 +514,97 @@ impl SqliteStore {
             .await?;
         Ok(())
     }
+
+    pub async fn list_alerts(&self) -> Result<Vec<Alert>, sqlx::Error> {
+        let rows = sqlx::query("SELECT id,symbol,interval,price,direction,status,expires_at,webhook_url,message_template,created_at,updated_at,triggered_at,delivery_status,delivery_error FROM alerts ORDER BY id DESC")
+            .fetch_all(&self.read_pool).await?;
+        rows.into_iter().map(alert_from_row).collect()
+    }
+
+    pub async fn get_alert(&self, id: i64) -> Result<Option<Alert>, sqlx::Error> {
+        let row = sqlx::query("SELECT id,symbol,interval,price,direction,status,expires_at,webhook_url,message_template,created_at,updated_at,triggered_at,delivery_status,delivery_error FROM alerts WHERE id = ?")
+            .bind(id).fetch_optional(&self.read_pool).await?;
+        row.map(alert_from_row).transpose()
+    }
+
+    pub async fn insert_alert(&self, alert: &Alert) -> Result<Alert, sqlx::Error> {
+        let result = sqlx::query("INSERT INTO alerts (symbol,interval,price,direction,status,expires_at,webhook_url,message_template,created_at,updated_at,triggered_at,delivery_status,delivery_error) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)")
+            .bind(&alert.symbol).bind(&alert.interval).bind(alert.price).bind(&alert.direction)
+            .bind(&alert.status).bind(alert.expires_at).bind(&alert.webhook_url).bind(&alert.message_template)
+            .bind(alert.created_at).bind(alert.updated_at).bind(alert.triggered_at).bind(&alert.delivery_status).bind(&alert.delivery_error)
+            .execute(&self.write_pool).await?;
+        let mut created = alert.clone();
+        created.id = result.last_insert_rowid();
+        Ok(created)
+    }
+
+    pub async fn update_alert(&self, alert: &Alert) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query("UPDATE alerts SET symbol=?,interval=?,price=?,direction=?,status=?,expires_at=?,webhook_url=?,message_template=?,updated_at=? WHERE id=?")
+            .bind(&alert.symbol).bind(&alert.interval).bind(alert.price).bind(&alert.direction)
+            .bind(&alert.status).bind(alert.expires_at).bind(&alert.webhook_url).bind(&alert.message_template)
+            .bind(alert.updated_at).bind(alert.id).execute(&self.write_pool).await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn delete_alert(&self, id: i64) -> Result<bool, sqlx::Error> {
+        Ok(sqlx::query("DELETE FROM alerts WHERE id=?")
+            .bind(id)
+            .execute(&self.write_pool)
+            .await?
+            .rows_affected()
+            == 1)
+    }
+
+    pub async fn active_alerts_for_symbol(
+        &self,
+        symbol: &str,
+        now_ms: i64,
+    ) -> Result<Vec<Alert>, sqlx::Error> {
+        let rows = sqlx::query("SELECT id,symbol,interval,price,direction,status,expires_at,webhook_url,message_template,created_at,updated_at,triggered_at,delivery_status,delivery_error FROM alerts WHERE symbol=? AND status='active' AND (expires_at IS NULL OR expires_at > ?)")
+            .bind(symbol).bind(now_ms).fetch_all(&self.read_pool).await?;
+        rows.into_iter().map(alert_from_row).collect()
+    }
+
+    pub async fn claim_alert(&self, id: i64, now_ms: i64) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query("UPDATE alerts SET status='triggered',triggered_at=?,updated_at=? WHERE id=? AND status='active' AND (expires_at IS NULL OR expires_at > ?)")
+            .bind(now_ms).bind(now_ms).bind(id).bind(now_ms).execute(&self.write_pool).await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn set_alert_delivery(
+        &self,
+        id: i64,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE alerts SET delivery_status=?,delivery_error=?,updated_at=? WHERE id=?")
+            .bind(status)
+            .bind(error)
+            .bind(chrono::Utc::now().timestamp_millis())
+            .bind(id)
+            .execute(&self.write_pool)
+            .await?;
+        Ok(())
+    }
+}
+
+fn alert_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Alert, sqlx::Error> {
+    Ok(Alert {
+        id: row.try_get("id")?,
+        symbol: row.try_get("symbol")?,
+        interval: row.try_get("interval")?,
+        price: row.try_get("price")?,
+        direction: row.try_get("direction")?,
+        status: row.try_get("status")?,
+        expires_at: row.try_get("expires_at")?,
+        webhook_url: row.try_get("webhook_url")?,
+        message_template: row.try_get("message_template")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+        triggered_at: row.try_get("triggered_at")?,
+        delivery_status: row.try_get("delivery_status")?,
+        delivery_error: row.try_get("delivery_error")?,
+    })
 }
 
 fn is_memory_database(database_url: &str) -> bool {

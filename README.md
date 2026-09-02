@@ -342,6 +342,9 @@ GET /api/indicators/guaili?symbols=BTCUSDT,ETHUSDT&intervals=1,5,15&limit=200
 }
 ```
 
+多品种、多级别乖离信号的历史验证、阈值建议和数据质量限制，见
+[乖离多级别信号验证记录](docs/guaili-multi-interval-signal-validation.md)。
+
 ## 数据存储
 
 SQLite 表名为 `klines`，主键为 `(symbol, interval, open_time)`。服务会在启动时自动创建表，并启用 WAL。分钟级及以上周期会持久化到 SQLite；`10S`、`15S`、`30S`、`45S` 等秒级周期来自 aggTrade 聚合，当前保存在内存中，适合实时展示但不会跨进程保留。

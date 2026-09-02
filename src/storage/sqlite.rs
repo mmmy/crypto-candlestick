@@ -38,6 +38,18 @@ pub struct Alert {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AlertEvent {
+    pub id: i64,
+    pub alert_id: i64,
+    pub triggered_at: i64,
+    pub trigger_price: f64,
+    pub direction: String,
+    pub delivery_status: Option<String>,
+    pub delivery_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoredKline {
     pub symbol: String,
     pub interval: String,
@@ -113,6 +125,20 @@ const CREATE_ALERTS_TABLE_SQL: &str = r#"
         delivery_status TEXT,
         delivery_error TEXT
     );
+    "#;
+
+const CREATE_ALERT_EVENTS_TABLE_SQL: &str = r#"
+    CREATE TABLE IF NOT EXISTS alert_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        alert_id INTEGER NOT NULL,
+        triggered_at INTEGER NOT NULL,
+        trigger_price REAL NOT NULL,
+        direction TEXT NOT NULL,
+        delivery_status TEXT,
+        delivery_error TEXT,
+        created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_alert_events_alert_id ON alert_events(alert_id, id DESC);
     "#;
 
 #[derive(Clone, Copy)]
@@ -218,6 +244,13 @@ impl SqliteStore {
         sqlx::query(CREATE_ALERTS_TABLE_SQL)
             .execute(&self.write_pool)
             .await?;
+        for statement in CREATE_ALERT_EVENTS_TABLE_SQL
+            .split(';')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            sqlx::query(statement).execute(&self.write_pool).await?;
+        }
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_alerts_symbol_status ON alerts(symbol, status)",
         )
@@ -547,12 +580,19 @@ impl SqliteStore {
     }
 
     pub async fn delete_alert(&self, id: i64) -> Result<bool, sqlx::Error> {
-        Ok(sqlx::query("DELETE FROM alerts WHERE id=?")
+        let mut tx = self.write_pool.begin().await?;
+        sqlx::query("DELETE FROM alert_events WHERE alert_id=?")
             .bind(id)
-            .execute(&self.write_pool)
+            .execute(&mut *tx)
+            .await?;
+        let deleted = sqlx::query("DELETE FROM alerts WHERE id=?")
+            .bind(id)
+            .execute(&mut *tx)
             .await?
             .rows_affected()
-            == 1)
+            == 1;
+        tx.commit().await?;
+        Ok(deleted)
     }
 
     pub async fn active_alerts_for_symbol(
@@ -571,6 +611,33 @@ impl SqliteStore {
         Ok(result.rows_affected() == 1)
     }
 
+    pub async fn claim_alert_with_event(
+        &self,
+        id: i64,
+        now_ms: i64,
+        trigger_price: f64,
+        direction: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let mut tx = self.write_pool.begin().await?;
+        let result = sqlx::query("UPDATE alerts SET status='triggered',triggered_at=?,updated_at=? WHERE id=? AND status='active' AND (expires_at IS NULL OR expires_at > ?)")
+            .bind(now_ms).bind(now_ms).bind(id).bind(now_ms).execute(&mut *tx).await?;
+        if result.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        sqlx::query("INSERT INTO alert_events (alert_id,triggered_at,trigger_price,direction,delivery_status,delivery_error,created_at) VALUES (?,?,?,?,?,?,?)")
+            .bind(id).bind(now_ms).bind(trigger_price).bind(direction).bind(Option::<String>::None).bind(Option::<String>::None).bind(now_ms)
+            .execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    pub async fn list_alert_events(&self, alert_id: i64) -> Result<Vec<AlertEvent>, sqlx::Error> {
+        let rows = sqlx::query("SELECT id,alert_id,triggered_at,trigger_price,direction,delivery_status,delivery_error FROM alert_events WHERE alert_id=? ORDER BY id DESC")
+            .bind(alert_id).fetch_all(&self.read_pool).await?;
+        rows.into_iter().map(alert_event_from_row).collect()
+    }
+
     pub async fn set_alert_delivery(
         &self,
         id: i64,
@@ -584,6 +651,8 @@ impl SqliteStore {
             .bind(id)
             .execute(&self.write_pool)
             .await?;
+        sqlx::query("UPDATE alert_events SET delivery_status=?,delivery_error=? WHERE id=(SELECT id FROM alert_events WHERE alert_id=? ORDER BY id DESC LIMIT 1)")
+            .bind(status).bind(error).bind(id).execute(&self.write_pool).await?;
         Ok(())
     }
 }
@@ -602,6 +671,18 @@ fn alert_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Alert, sqlx::Error> {
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
         triggered_at: row.try_get("triggered_at")?,
+        delivery_status: row.try_get("delivery_status")?,
+        delivery_error: row.try_get("delivery_error")?,
+    })
+}
+
+fn alert_event_from_row(row: sqlx::sqlite::SqliteRow) -> Result<AlertEvent, sqlx::Error> {
+    Ok(AlertEvent {
+        id: row.try_get("id")?,
+        alert_id: row.try_get("alert_id")?,
+        triggered_at: row.try_get("triggered_at")?,
+        trigger_price: row.try_get("trigger_price")?,
+        direction: row.try_get("direction")?,
         delivery_status: row.try_get("delivery_status")?,
         delivery_error: row.try_get("delivery_error")?,
     })

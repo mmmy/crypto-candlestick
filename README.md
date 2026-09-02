@@ -345,6 +345,37 @@ GET /api/indicators/guaili?symbols=BTCUSDT,ETHUSDT&intervals=1,5,15&limit=200
 多品种、多级别乖离信号的历史验证、阈值建议和数据质量限制，见
 [乖离多级别信号验证记录](docs/guaili-multi-interval-signal-validation.md)。
 
+### 价格警报
+
+警报只能创建在 `BINANCE_SYMBOLS` 与 `BINANCE_INTERVALS` 已订阅的组合上。触发使用交易对实时价格，价格严格从警戒线一侧穿到另一侧时触发；等于警戒线不触发。警报为一次性触发，到期后保持原 `expiresAt` 但不再触发。Webhook 失败仍会标记为已触发，并记录投递失败状态，后台最多重试 3 次。
+
+```http
+POST   /api/alerts
+GET    /api/alerts
+GET    /api/alerts/:id
+GET    /api/alerts/:id/events
+PATCH  /api/alerts/:id
+DELETE /api/alerts/:id
+```
+
+创建示例：
+
+```json
+{
+  "symbol": "BTCUSDT",
+  "interval": "1",
+  "price": 100000,
+  "direction": "cross_down",
+  "expiresAt": 1788266400000,
+  "webhookUrl": "https://example.com/webhook",
+  "messageTemplate": "{\"des\":\"{{interval}}底部合约多{{ticker}}下穿{{close}}\",\"symbol\":\"{{ticker}}\",\"price\":\"{{close}}\"}"
+}
+```
+
+`direction` 支持 `cross_up`、`cross_down`、`cross_any`。模板支持 `{{ticker}}`、`{{symbol}}`、`{{exchange}}`、`{{interval}}`、`{{price}}`、`{{close}}`、`{{alertId}}`、`{{time}}`。重新设置已触发或禁用的警报时，PATCH 传入 `status: "active"`。
+
+触发记录按警报 ID 保存，`GET /api/alerts/:id/events` 返回该警报的触发价格、方向和 Webhook 投递结果；删除警报时同步删除其触发记录。
+
 ## 数据存储
 
 SQLite 表名为 `klines`，主键为 `(symbol, interval, open_time)`。服务会在启动时自动创建表，并启用 WAL。分钟级及以上周期会持久化到 SQLite；`10S`、`15S`、`30S`、`45S` 等秒级周期来自 aggTrade 聚合，当前保存在内存中，适合实时展示但不会跨进程保留。

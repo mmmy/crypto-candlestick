@@ -1,4 +1,4 @@
-use crate::storage::sqlite::Alert;
+use crate::storage::sqlite::{Alert, AlertEvent};
 use crate::{
     domain::{candle::Candle, interval::Interval},
     http::routes::AppState,
@@ -46,7 +46,7 @@ pub struct AlertPatch {
     pub interval: Option<String>,
     pub price: Option<f64>,
     pub direction: Option<String>,
-    pub expires_at: Option<i64>,
+    pub expires_at: Option<Option<i64>>,
     pub webhook_url: Option<String>,
     #[serde(alias = "message")]
     pub message_template: Option<String>,
@@ -139,6 +139,23 @@ pub async fn create_alert(
         &request.webhook_url,
         &request.message_template,
     )?;
+    if state
+        .store
+        .list_alerts()
+        .await
+        .map_err(internal_error)?
+        .iter()
+        .any(|item| {
+            item.symbol == symbol
+                && item.interval == interval
+                && (item.price - request.price).abs() < f64::EPSILON
+        })
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "an alert already exists at this price line".to_string(),
+        ));
+    }
     let now = chrono::Utc::now().timestamp_millis();
     let status = request.status.unwrap_or_else(|| "active".to_string());
     if !matches!(status.as_str(), "active" | "disabled") {
@@ -193,6 +210,24 @@ pub async fn update_alert(
         .unwrap_or(&alert.message_template);
     let (symbol, interval) =
         validate_alert(&state, symbol, interval, price, direction, url, message)?;
+    if state
+        .store
+        .list_alerts()
+        .await
+        .map_err(internal_error)?
+        .iter()
+        .any(|item| {
+            item.id != id
+                && item.symbol == symbol
+                && item.interval == interval
+                && (item.price - price).abs() < f64::EPSILON
+        })
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "an alert already exists at this price line".to_string(),
+        ));
+    }
     alert.symbol = symbol;
     alert.interval = interval;
     alert.price = price;
@@ -213,7 +248,9 @@ pub async fn update_alert(
             alert.delivery_error = None;
         }
     }
-    alert.expires_at = patch.expires_at.or(alert.expires_at);
+    if let Some(expires_at) = patch.expires_at {
+        alert.expires_at = expires_at;
+    }
     alert.updated_at = chrono::Utc::now().timestamp_millis();
     if !state
         .store
@@ -224,6 +261,27 @@ pub async fn update_alert(
         return Err((StatusCode::NOT_FOUND, "alert not found".to_string()));
     }
     Ok(Json(alert))
+}
+
+pub async fn alert_events(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Vec<AlertEvent>>, (StatusCode, String)> {
+    if state
+        .store
+        .get_alert(id)
+        .await
+        .map_err(internal_error)?
+        .is_none()
+    {
+        return Err((StatusCode::NOT_FOUND, "alert not found".to_string()));
+    }
+    state
+        .store
+        .list_alert_events(id)
+        .await
+        .map(Json)
+        .map_err(internal_error)
 }
 
 pub async fn delete_alert(

@@ -427,7 +427,16 @@ impl BinanceWorker {
             if !crossed {
                 continue;
             }
-            if let Ok(true) = self.store.claim_alert(alert.id, now_ms).await {
+            let crossed_direction = if side > previous {
+                "cross_up"
+            } else {
+                "cross_down"
+            };
+            if let Ok(true) = self
+                .store
+                .claim_alert_with_event(alert.id, now_ms, price, crossed_direction)
+                .await
+            {
                 let store = self.store.clone();
                 tokio::spawn(async move {
                     let body = render_alert_message(&alert.message_template, &alert, price, now_ms);

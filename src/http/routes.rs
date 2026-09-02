@@ -6,8 +6,8 @@ use crate::{
 use axum::{routing::get, Router};
 
 use super::handlers::{
-    alerts, create_alert, deep_health, delete_alert, get_alert, guaili, health, health_summary,
-    klines, update_alert,
+    alert_events, alerts, create_alert, deep_health, delete_alert, get_alert, guaili, health,
+    health_summary, klines, update_alert,
 };
 
 #[derive(Clone)]
@@ -41,5 +41,6 @@ pub fn router(state: AppState) -> Router {
             "/api/alerts/:id",
             get(get_alert).patch(update_alert).delete(delete_alert),
         )
+        .route("/api/alerts/:id/events", get(alert_events))
         .with_state(state)
 }

@@ -1,69 +1,74 @@
 use crypto_candlestick::binance::worker::SubscriptionPlan;
+use crypto_candlestick::config::{RealtimeSource, SymbolSubscription};
 use crypto_candlestick::domain::interval::Interval;
 
-#[test]
-fn subscribes_native_klines_directly_and_only_aggregates_custom_intervals() {
-    let intervals = vec![
-        Interval::parse("10S").unwrap(),
-        Interval::parse("15S").unwrap(),
-        Interval::parse("1").unwrap(),
-        Interval::parse("2").unwrap(),
-        Interval::parse("60").unwrap(),
-        Interval::parse("90").unwrap(),
-        Interval::parse("D").unwrap(),
-        Interval::parse("2D").unwrap(),
-        Interval::parse("3D").unwrap(),
-        Interval::parse("W").unwrap(),
-    ];
-
-    let plan = SubscriptionPlan::new(vec!["BTCUSDT".to_string()], intervals);
-    let streams = plan.streams();
-
-    assert!(streams.contains(&"btcusdt@aggTrade".to_string()));
-    assert!(streams.contains(&"btcusdt@kline_1m".to_string()));
-    assert!(streams.contains(&"btcusdt@kline_30m".to_string()));
-    assert!(streams.contains(&"btcusdt@kline_1h".to_string()));
-    assert!(streams.contains(&"btcusdt@kline_1d".to_string()));
-    assert!(streams.contains(&"btcusdt@kline_3d".to_string()));
-    assert!(streams.contains(&"btcusdt@kline_1w".to_string()));
-    assert!(!streams.contains(&"btcusdt@kline_2m".to_string()));
-    assert!(!streams.contains(&"btcusdt@kline_90m".to_string()));
-
-    let aggregation_targets = plan.aggregation_targets();
-    assert!(aggregation_targets.contains(&(
-        "BTCUSDT".to_string(),
-        "1".to_string(),
-        "2".to_string()
-    )));
-    assert!(aggregation_targets.contains(&(
-        "BTCUSDT".to_string(),
-        "30".to_string(),
-        "90".to_string()
-    )));
-    assert!(aggregation_targets.contains(&(
-        "BTCUSDT".to_string(),
-        "D".to_string(),
-        "2D".to_string()
-    )));
-    assert!(!aggregation_targets.contains(&(
-        "BTCUSDT".to_string(),
-        "1".to_string(),
-        "60".to_string()
-    )));
+fn intervals(values: &[&str]) -> Vec<Interval> {
+    values
+        .iter()
+        .map(|value| Interval::parse(value).unwrap())
+        .collect()
 }
 
 #[test]
-fn exposes_native_kline_sources_for_rest_sync() {
-    let intervals = vec![
-        Interval::parse("2").unwrap(),
-        Interval::parse("20").unwrap(),
-        Interval::parse("60").unwrap(),
-        Interval::parse("90").unwrap(),
-        Interval::parse("2D").unwrap(),
-        Interval::parse("3D").unwrap(),
-    ];
+fn auto_selects_one_stream_per_symbol_from_minimum_interval() {
+    let plan = SubscriptionPlan::from_subscriptions(vec![
+        SymbolSubscription::new(
+            "BTCUSDT",
+            intervals(&["5", "15", "60"]),
+            RealtimeSource::Auto,
+        ),
+        SymbolSubscription::new(
+            "ETHUSDT",
+            intervals(&["1", "5", "15"]),
+            RealtimeSource::Auto,
+        ),
+        SymbolSubscription::new("SOLUSDT", intervals(&["15", "60"]), RealtimeSource::Trade),
+        SymbolSubscription::new("BNBUSDT", intervals(&["1", "15"]), RealtimeSource::Kline1m),
+        SymbolSubscription::new(
+            "XRPUSDT",
+            intervals(&["15S", "1", "5"]),
+            RealtimeSource::Auto,
+        ),
+    ]);
 
-    let plan = SubscriptionPlan::new(vec!["btcusdt".to_string()], intervals);
+    assert_eq!(
+        plan.streams(),
+        vec![
+            "bnbusdt@kline_1m".to_string(),
+            "btcusdt@kline_1m".to_string(),
+            "ethusdt@kline_1m".to_string(),
+            "solusdt@aggTrade".to_string(),
+            "xrpusdt@aggTrade".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn kline_mode_aggregates_every_configured_higher_interval_from_one_minute() {
+    let plan = SubscriptionPlan::from_subscriptions(vec![SymbolSubscription::new(
+        "BTCUSDT",
+        intervals(&["5", "20", "60", "D"]),
+        RealtimeSource::Auto,
+    )]);
+
+    assert_eq!(
+        plan.realtime_kline_targets(),
+        vec![
+            ("BTCUSDT".to_string(), "1".to_string(), "20".to_string()),
+            ("BTCUSDT".to_string(), "1".to_string(), "5".to_string()),
+            ("BTCUSDT".to_string(), "1".to_string(), "60".to_string()),
+            ("BTCUSDT".to_string(), "1".to_string(), "D".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn exposes_native_sources_for_history_and_one_minute_for_realtime_seed() {
+    let plan = SubscriptionPlan::from_subscriptions(vec![SymbolSubscription::new(
+        "BTCUSDT",
+        intervals(&["5", "20", "60", "W"]),
+        RealtimeSource::Auto,
+    )]);
     let sources = plan
         .kline_sources()
         .into_iter()
@@ -78,24 +83,46 @@ fn exposes_native_kline_sources_for_rest_sync() {
 
     assert!(sources.contains(&("BTCUSDT".to_string(), "1".to_string(), "1m".to_string())));
     assert!(sources.contains(&("BTCUSDT".to_string(), "5".to_string(), "5m".to_string())));
-    assert!(sources.contains(&("BTCUSDT".to_string(), "30".to_string(), "30m".to_string())));
     assert!(sources.contains(&("BTCUSDT".to_string(), "60".to_string(), "1h".to_string())));
     assert!(sources.contains(&("BTCUSDT".to_string(), "D".to_string(), "1d".to_string())));
-    assert!(sources.contains(&("BTCUSDT".to_string(), "3D".to_string(), "3d".to_string())));
+    assert!(sources.contains(&("BTCUSDT".to_string(), "W".to_string(), "1w".to_string())));
 }
 
 #[test]
-fn builds_market_stream_url_for_usdm_market_data() {
-    let plan = SubscriptionPlan::new(
-        vec!["BTCUSDT".to_string()],
-        vec![
-            Interval::parse("1").unwrap(),
-            Interval::parse("10").unwrap(),
-        ],
-    );
+fn keeps_native_history_plan_for_trade_mode_custom_intervals() {
+    let plan = SubscriptionPlan::from_subscriptions(vec![SymbolSubscription::new(
+        "BTCUSDT",
+        intervals(&["15S", "2", "90", "2D"]),
+        RealtimeSource::Trade,
+    )]);
+
+    assert_eq!(plan.streams(), vec!["btcusdt@aggTrade".to_string()]);
+    assert!(plan.aggregation_targets().contains(&(
+        "BTCUSDT".to_string(),
+        "1".to_string(),
+        "2".to_string()
+    )));
+    assert!(plan.aggregation_targets().contains(&(
+        "BTCUSDT".to_string(),
+        "30".to_string(),
+        "90".to_string()
+    )));
+    assert!(plan.aggregation_targets().contains(&(
+        "BTCUSDT".to_string(),
+        "D".to_string(),
+        "2D".to_string()
+    )));
+}
+
+#[test]
+fn builds_market_stream_url_for_mixed_sources() {
+    let plan = SubscriptionPlan::from_subscriptions(vec![
+        SymbolSubscription::new("BTCUSDT", intervals(&["1"]), RealtimeSource::Auto),
+        SymbolSubscription::new("ETHUSDT", intervals(&["15S", "1"]), RealtimeSource::Auto),
+    ]);
 
     assert_eq!(
         plan.stream_url(),
-        "wss://fstream.binance.com/market/stream?streams=btcusdt@kline_1m/btcusdt@kline_5m"
+        "wss://fstream.binance.com/market/stream?streams=btcusdt@kline_1m/ethusdt@aggTrade"
     );
 }

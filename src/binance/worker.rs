@@ -1,6 +1,7 @@
 use super::types::{parse_combined_stream_message, MarketEvent};
 use crate::{
     binance::rest::sync_native_klines,
+    config::{RealtimeSource, SymbolSubscription},
     domain::{candle::Candle, interval::Interval},
     engine::aggregator::{Aggregator, TradeTick},
     memory::{ClosedKlineBuffer, LatestCache, MemorySeriesStore},
@@ -30,40 +31,45 @@ pub struct KlineSource {
 
 #[derive(Debug, Clone)]
 pub struct SubscriptionPlan {
-    symbols: Vec<String>,
-    intervals: Vec<Interval>,
+    subscriptions: Vec<SymbolSubscription>,
 }
 
 impl SubscriptionPlan {
     pub fn new(symbols: Vec<String>, intervals: Vec<Interval>) -> Self {
-        Self {
-            symbols: symbols
+        Self::from_subscriptions(
+            symbols
                 .into_iter()
-                .map(|symbol| symbol.trim().to_uppercase())
-                .filter(|symbol| !symbol.is_empty())
+                .map(|symbol| {
+                    SymbolSubscription::new(symbol, intervals.clone(), RealtimeSource::Auto)
+                })
                 .collect(),
-            intervals,
+        )
+    }
+
+    pub fn from_subscriptions(subscriptions: Vec<SymbolSubscription>) -> Self {
+        Self {
+            subscriptions: subscriptions
+                .into_iter()
+                .filter(|subscription| {
+                    !subscription.symbol.is_empty() && !subscription.intervals.is_empty()
+                })
+                .collect(),
         }
     }
 
     pub fn streams(&self) -> Vec<String> {
         let mut streams = BTreeSet::new();
 
-        for symbol in &self.symbols {
-            let stream_symbol = symbol.to_lowercase();
-            for interval in &self.intervals {
-                if interval.as_millis() < 60_000 {
+        for subscription in &self.subscriptions {
+            let stream_symbol = subscription.symbol.to_lowercase();
+            match subscription.resolved_source() {
+                RealtimeSource::Trade => {
                     streams.insert(format!("{stream_symbol}@aggTrade"));
-                    continue;
                 }
-
-                if let Some(binance_interval) = interval.binance_interval().or_else(|| {
-                    interval
-                        .aggregation_base()
-                        .and_then(|base| base.binance_interval())
-                }) {
-                    streams.insert(format!("{stream_symbol}@kline_{binance_interval}"));
+                RealtimeSource::Kline1m => {
+                    streams.insert(format!("{stream_symbol}@kline_1m"));
                 }
+                RealtimeSource::Auto => unreachable!("auto source is always resolved"),
             }
         }
 
@@ -80,10 +86,14 @@ impl SubscriptionPlan {
     pub fn aggregation_targets(&self) -> Vec<(String, String, String)> {
         let mut targets = BTreeSet::new();
 
-        for symbol in &self.symbols {
-            for interval in &self.intervals {
+        for subscription in &self.subscriptions {
+            for interval in &subscription.intervals {
                 if let Some(base) = interval.aggregation_base() {
-                    targets.insert((symbol.clone(), base.canonical(), interval.canonical()));
+                    targets.insert((
+                        subscription.symbol.clone(),
+                        base.canonical(),
+                        interval.canonical(),
+                    ));
                 }
             }
         }
@@ -95,21 +105,49 @@ impl SubscriptionPlan {
         let mut seen = BTreeSet::new();
         let mut sources = Vec::new();
 
-        for symbol in &self.symbols {
-            for interval in &self.intervals {
+        for subscription in &self.subscriptions {
+            for interval in &subscription.intervals {
                 if interval.as_millis() < 60_000 {
                     continue;
                 }
 
                 let source_interval = interval.aggregation_base().unwrap_or(*interval);
                 if let Some(binance_interval) = source_interval.binance_interval() {
-                    let key = (symbol.clone(), source_interval.canonical());
+                    let key = (subscription.symbol.clone(), source_interval.canonical());
                     if seen.insert(key.clone()) {
                         sources.push(KlineSource {
-                            symbol: symbol.clone(),
+                            symbol: subscription.symbol.clone(),
                             canonical_interval: key.1,
                             binance_interval,
                             interval: source_interval,
+                        });
+                    }
+                }
+            }
+
+            if subscription.resolved_source() == RealtimeSource::Kline1m {
+                let key = (subscription.symbol.clone(), "1".to_string());
+                if seen.insert(key.clone()) {
+                    sources.push(KlineSource {
+                        symbol: subscription.symbol.clone(),
+                        canonical_interval: key.1,
+                        binance_interval: "1m",
+                        interval: Interval::Minutes(1),
+                    });
+                }
+
+                if subscription
+                    .intervals
+                    .iter()
+                    .any(|interval| interval.as_millis() > Interval::Days(1).as_millis())
+                {
+                    let key = (subscription.symbol.clone(), "D".to_string());
+                    if seen.insert(key.clone()) {
+                        sources.push(KlineSource {
+                            symbol: subscription.symbol.clone(),
+                            canonical_interval: key.1,
+                            binance_interval: "1d",
+                            interval: Interval::Days(1),
                         });
                     }
                 }
@@ -119,17 +157,49 @@ impl SubscriptionPlan {
         sources
     }
 
-    fn second_targets(&self) -> Vec<(String, String)> {
+    pub fn realtime_kline_targets(&self) -> Vec<(String, String, String)> {
         let mut targets = BTreeSet::new();
 
-        for symbol in &self.symbols {
-            for interval in &self.intervals {
-                if interval.as_millis() < 60_000 {
-                    targets.insert((symbol.clone(), interval.canonical()));
+        for subscription in &self.subscriptions {
+            if subscription.resolved_source() != RealtimeSource::Kline1m {
+                continue;
+            }
+            for interval in &subscription.intervals {
+                if interval.as_millis() > 60_000 {
+                    targets.insert((
+                        subscription.symbol.clone(),
+                        "1".to_string(),
+                        interval.canonical(),
+                    ));
                 }
             }
         }
 
+        targets.into_iter().collect()
+    }
+
+    fn trade_targets(&self) -> Vec<(String, String)> {
+        let mut targets = BTreeSet::new();
+
+        for subscription in &self.subscriptions {
+            if subscription.resolved_source() != RealtimeSource::Trade {
+                continue;
+            }
+            for interval in &subscription.intervals {
+                targets.insert((subscription.symbol.clone(), interval.canonical()));
+            }
+        }
+
+        targets.into_iter().collect()
+    }
+
+    pub fn configured_targets(&self) -> Vec<(String, String)> {
+        let mut targets = BTreeSet::new();
+        for subscription in &self.subscriptions {
+            for interval in &subscription.intervals {
+                targets.insert((subscription.symbol.clone(), interval.canonical()));
+            }
+        }
         targets.into_iter().collect()
     }
 }
@@ -145,8 +215,8 @@ pub struct BinanceWorker {
     catch_up_on_first_connect: bool,
     flush_max_rows: usize,
     flush_lock: FlushLock,
-    custom_aggregators: HashMap<(String, String, String), Aggregator>,
-    second_aggregators: HashMap<(String, String), Aggregator>,
+    kline_aggregators: HashMap<(String, String, String), Aggregator>,
+    trade_aggregators: HashMap<(String, String), Aggregator>,
     alert_last_sides: HashMap<i64, i8>,
 }
 
@@ -159,26 +229,24 @@ impl BinanceWorker {
         memory_series: MemorySeriesStore,
         closed_buffer: ClosedKlineBuffer,
         runtime_health: RuntimeHealth,
-        symbols: Vec<String>,
-        intervals: Vec<Interval>,
+        plan: SubscriptionPlan,
         sync_lookback_bars: u32,
         catch_up_on_first_connect: bool,
         flush_max_rows: usize,
         flush_lock: FlushLock,
     ) -> Self {
-        let plan = SubscriptionPlan::new(symbols, intervals);
-        let mut custom_aggregators = HashMap::new();
-        let mut second_aggregators = HashMap::new();
+        let mut kline_aggregators = HashMap::new();
+        let mut trade_aggregators = HashMap::new();
 
-        for (symbol, base, target) in plan.aggregation_targets() {
+        for (symbol, base, target) in plan.realtime_kline_targets() {
             if let Ok(interval) = Interval::parse(&target) {
-                custom_aggregators.insert((symbol, base, target), Aggregator::new(interval));
+                kline_aggregators.insert((symbol, base, target), Aggregator::new(interval));
             }
         }
 
-        for (symbol, target) in plan.second_targets() {
+        for (symbol, target) in plan.trade_targets() {
             if let Ok(interval) = Interval::parse(&target) {
-                second_aggregators.insert((symbol, target), Aggregator::new(interval));
+                trade_aggregators.insert((symbol, target), Aggregator::new(interval));
             }
         }
 
@@ -193,8 +261,8 @@ impl BinanceWorker {
             catch_up_on_first_connect,
             flush_max_rows,
             flush_lock,
-            custom_aggregators,
-            second_aggregators,
+            kline_aggregators,
+            trade_aggregators,
             alert_last_sides: HashMap::new(),
         }
     }
@@ -205,8 +273,8 @@ impl BinanceWorker {
             return;
         }
 
-        if let Err(err) = self.seed_custom_aggregators().await {
-            tracing::warn!("failed to seed custom aggregators: {}", err);
+        if let Err(err) = self.seed_kline_aggregators().await {
+            tracing::warn!("failed to seed kline aggregators: {}", err);
         }
 
         let url = self.plan.stream_url();
@@ -220,15 +288,17 @@ impl BinanceWorker {
                     self.runtime_health.mark_connected().await;
                     backoff_secs = 1;
                     if should_catch_up_on_connect {
-                        if let Err(err) = sync_native_klines(
-                            &self.store,
-                            self.plan.symbols.clone(),
-                            self.plan.intervals.clone(),
-                            self.sync_lookback_bars,
-                        )
-                        .await
+                        flush_closed_buffer(&self.store, &self.closed_buffer, &self.flush_lock)
+                            .await;
+                        if let Err(err) =
+                            sync_native_klines(&self.store, &self.plan, self.sync_lookback_bars)
+                                .await
                         {
                             tracing::warn!("websocket reconnect kline catch-up failed: {}", err);
+                        }
+                        self.reset_kline_aggregators();
+                        if let Err(err) = self.seed_kline_aggregators().await {
+                            tracing::warn!("failed to reseed kline aggregators: {}", err);
                         }
                     } else {
                         should_catch_up_on_connect = true;
@@ -302,6 +372,11 @@ impl BinanceWorker {
     async fn handle_event(&mut self, event: MarketEvent) {
         match event {
             MarketEvent::OpenKline {
+                symbol: _,
+                interval: _,
+                candle: _,
+            } => {}
+            MarketEvent::ClosedKline {
                 symbol,
                 interval,
                 candle,
@@ -314,23 +389,11 @@ impl BinanceWorker {
                         chrono::Utc::now().timestamp_millis(),
                     )
                     .await;
-                    self.latest.upsert(&symbol, &source, candle.clone()).await;
-                    self.refresh_custom_latest_from_open(&symbol, &source, candle)
-                        .await;
-                }
-            }
-            MarketEvent::ClosedKline {
-                symbol,
-                interval,
-                candle,
-            } => {
-                if let Ok(source_interval) = Interval::parse(&interval) {
-                    let source = source_interval.canonical();
                     self.buffer_closed_candle(&symbol, &source, candle.clone())
                         .await;
                     self.latest.remove(&symbol, &source).await;
 
-                    for (key, agg) in self.custom_aggregators.iter_mut() {
+                    for (key, agg) in self.kline_aggregators.iter_mut() {
                         if key.0 == symbol && key.1 == source {
                             if let Ok(Some(closed)) = agg.ingest_candle(candle.clone()) {
                                 let rows = self.closed_buffer.upsert(&symbol, &key.2, closed).await;
@@ -375,16 +438,31 @@ impl BinanceWorker {
             MarketEvent::AggTrade { symbol, trade } => {
                 self.evaluate_price_alerts(&symbol, trade.price, trade.timestamp_ms)
                     .await;
-                for (key, agg) in self.second_aggregators.iter_mut() {
+                for (key, agg) in self.trade_aggregators.iter_mut() {
                     if key.0 == symbol {
                         if let Ok(Some(closed)) = agg.ingest_trade(TradeTick {
                             timestamp_ms: trade.timestamp_ms,
                             price: trade.price,
                             quantity: trade.quantity,
                         }) {
-                            self.memory_series
-                                .push_closed(&symbol, &key.1, closed)
-                                .await;
+                            if Interval::parse(&key.1)
+                                .map(|interval| interval.as_millis() < 60_000)
+                                .unwrap_or(false)
+                            {
+                                self.memory_series
+                                    .push_closed(&symbol, &key.1, closed)
+                                    .await;
+                            } else {
+                                let rows = self.closed_buffer.upsert(&symbol, &key.1, closed).await;
+                                if rows >= self.flush_max_rows {
+                                    flush_closed_buffer(
+                                        &self.store,
+                                        &self.closed_buffer,
+                                        &self.flush_lock,
+                                    )
+                                    .await;
+                                }
+                            }
                             self.latest.remove(&symbol, &key.1).await;
                         }
                         if let Some(current) = agg.current() {
@@ -493,25 +571,35 @@ impl BinanceWorker {
         }
     }
 
-    async fn seed_custom_aggregators(&mut self) -> Result<(), sqlx::Error> {
-        for (key, agg) in self.custom_aggregators.iter_mut() {
+    async fn seed_kline_aggregators(&mut self) -> Result<(), sqlx::Error> {
+        for (key, agg) in self.kline_aggregators.iter_mut() {
+            self.latest.remove(&key.0, &key.2).await;
             let Ok(target_interval) = Interval::parse(&key.2) else {
                 continue;
             };
-
-            let Some(latest_base_open_time) = self.store.max_open_time(&key.0, &key.1).await?
-            else {
-                continue;
-            };
-
-            let start_time = target_interval.bucket_start_ms(latest_base_open_time);
-            let rows = self
-                .store
-                .query_klines(&key.0, &key.1, Some(start_time), None, 10_000)
-                .await?;
-
             let now_ms = chrono::Utc::now().timestamp_millis();
-            for row in rows {
+            let start_time = target_interval.bucket_start_ms(now_ms);
+            let mut minute_start = start_time;
+
+            if target_interval.as_millis() > Interval::Days(1).as_millis() {
+                let daily_rows = self
+                    .store
+                    .query_klines(&key.0, "D", Some(start_time), None, 32)
+                    .await?;
+                for row in daily_rows {
+                    if row.candle.close_time < now_ms {
+                        minute_start = minute_start.max(row.candle.close_time + 1);
+                        let _ = agg.ingest_candle(row.candle);
+                    }
+                }
+            }
+
+            let seed_limit = ((now_ms - minute_start).max(0) / 60_000 + 1) as u32;
+            let minute_rows = self
+                .store
+                .query_klines(&key.0, &key.1, Some(minute_start), None, seed_limit.max(1))
+                .await?;
+            for row in minute_rows {
                 if row.candle.close_time < now_ms {
                     let _ = agg.ingest_candle(row.candle);
                 }
@@ -528,38 +616,11 @@ impl BinanceWorker {
         Ok(())
     }
 
-    async fn refresh_custom_latest_from_open(
-        &self,
-        symbol: &str,
-        source: &str,
-        open_candle: crate::domain::candle::Candle,
-    ) {
-        let previews = self
-            .custom_aggregators
-            .iter()
-            .filter(|(key, _)| key.0 == symbol && key.1 == source)
-            .filter_map(|(key, aggregator)| {
-                let mut preview = aggregator.clone();
-                if let Err(err) = preview.ingest_candle(open_candle.clone()) {
-                    tracing::warn!(
-                        symbol,
-                        source,
-                        target = %key.2,
-                        "failed to preview custom latest: {}",
-                        err
-                    );
-                    return None;
-                }
-
-                preview.current().map(|mut current| {
-                    current.is_closed = false;
-                    (key.2.clone(), current)
-                })
-            })
-            .collect::<Vec<_>>();
-
-        for (target, current) in previews {
-            self.latest.upsert(symbol, &target, current).await;
+    fn reset_kline_aggregators(&mut self) {
+        for (key, aggregator) in self.kline_aggregators.iter_mut() {
+            if let Ok(interval) = Interval::parse(&key.2) {
+                *aggregator = Aggregator::new(interval);
+            }
         }
     }
 }
@@ -609,23 +670,25 @@ pub async fn flush_closed_buffer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{RealtimeSource, SymbolSubscription};
 
     #[tokio::test]
-    async fn custom_open_preview_uses_unflushed_closed_base_candles() {
+    async fn closed_one_minute_klines_refresh_higher_interval_once_per_minute() {
         let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
         let latest = LatestCache::default();
         let closed_buffer = ClosedKlineBuffer::default();
+        let plan = SubscriptionPlan::from_subscriptions(vec![SymbolSubscription::new(
+            "BTCUSDT",
+            vec![Interval::parse("5").unwrap()],
+            RealtimeSource::Auto,
+        )]);
         let mut worker = BinanceWorker::new(
             store.clone(),
             latest.clone(),
             MemorySeriesStore::default(),
             closed_buffer.clone(),
             RuntimeHealth::default(),
-            vec!["BTCUSDT".to_string()],
-            vec![
-                Interval::parse("5").unwrap(),
-                Interval::parse("10").unwrap(),
-            ],
+            plan,
             1_500,
             false,
             usize::MAX,
@@ -633,23 +696,49 @@ mod tests {
         );
 
         worker
-            .handle_event(MarketEvent::ClosedKline {
+            .handle_event(MarketEvent::OpenKline {
                 symbol: "BTCUSDT".to_string(),
-                interval: "5".to_string(),
+                interval: "1".to_string(),
                 candle: Candle {
                     open_time: 0,
-                    close_time: 299_999,
-                    open: 100.0,
-                    high: 105.0,
-                    low: 99.0,
-                    close: 104.0,
-                    volume: 1.0,
-                    quote_volume: 102.0,
-                    trade_count: 2,
-                    is_closed: true,
+                    close_time: 59_999,
+                    open: 1.0,
+                    high: 999.0,
+                    low: 1.0,
+                    close: 999.0,
+                    volume: 999.0,
+                    quote_volume: 999.0,
+                    trade_count: 999,
+                    is_closed: false,
                 },
             })
             .await;
+        assert!(latest.get("BTCUSDT", "5").await.is_none());
+
+        let bucket_start = Interval::parse("5")
+            .unwrap()
+            .bucket_start_ms(chrono::Utc::now().timestamp_millis());
+        for index in 0..2 {
+            let open_time = bucket_start + index * 60_000;
+            worker
+                .handle_event(MarketEvent::ClosedKline {
+                    symbol: "BTCUSDT".to_string(),
+                    interval: "1".to_string(),
+                    candle: Candle {
+                        open_time,
+                        close_time: open_time + 59_999,
+                        open: 100.0 + index as f64,
+                        high: 102.0 + index as f64,
+                        low: 99.0,
+                        close: 101.0 + index as f64,
+                        volume: 10.0,
+                        quote_volume: 1_000.0,
+                        trade_count: 10,
+                        is_closed: true,
+                    },
+                })
+                .await;
+        }
 
         assert!(store
             .query_klines("BTCUSDT", "5", None, None, 10)
@@ -658,70 +747,74 @@ mod tests {
             .is_empty());
         assert_eq!(
             closed_buffer
-                .query("BTCUSDT", "5", None, None, 10)
+                .query("BTCUSDT", "1", None, None, 10)
                 .await
                 .len(),
-            1
+            2
+        );
+
+        let preview = latest.get("BTCUSDT", "5").await.unwrap();
+        assert_eq!(preview.open_time, bucket_start);
+        assert_eq!(preview.close_time, bucket_start + 299_999);
+        assert_eq!(preview.open, 100.0);
+        assert_eq!(preview.high, 103.0);
+        assert_eq!(preview.low, 99.0);
+        assert_eq!(preview.close, 102.0);
+        assert_eq!(preview.volume, 20.0);
+        assert_eq!(preview.quote_volume, 2_000.0);
+        assert_eq!(preview.trade_count, 20);
+        assert!(!preview.is_closed);
+    }
+
+    #[tokio::test]
+    async fn trade_source_builds_and_buffers_minute_klines() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let latest = LatestCache::default();
+        let closed_buffer = ClosedKlineBuffer::default();
+        let plan = SubscriptionPlan::from_subscriptions(vec![SymbolSubscription::new(
+            "BTCUSDT",
+            vec![
+                Interval::parse("15S").unwrap(),
+                Interval::parse("1").unwrap(),
+            ],
+            RealtimeSource::Auto,
+        )]);
+        let mut worker = BinanceWorker::new(
+            store,
+            latest.clone(),
+            MemorySeriesStore::default(),
+            closed_buffer.clone(),
+            RuntimeHealth::default(),
+            plan,
+            1_500,
+            false,
+            usize::MAX,
+            Arc::new(Mutex::new(())),
         );
 
         worker
-            .handle_event(MarketEvent::OpenKline {
+            .handle_event(MarketEvent::AggTrade {
                 symbol: "BTCUSDT".to_string(),
-                interval: "5".to_string(),
-                candle: Candle {
-                    open_time: 300_000,
-                    close_time: 599_999,
-                    open: 104.0,
-                    high: 112.0,
-                    low: 103.0,
-                    close: 111.0,
-                    volume: 2.0,
-                    quote_volume: 216.0,
-                    trade_count: 3,
-                    is_closed: false,
-                },
+                trade: TradeTick::new(1_000, 100.0, 2.0),
             })
             .await;
-
-        let preview = latest.get("BTCUSDT", "10").await.unwrap();
-        assert_eq!(preview.open_time, 0);
-        assert_eq!(preview.close_time, 599_999);
-        assert_eq!(preview.open, 100.0);
-        assert_eq!(preview.high, 112.0);
-        assert_eq!(preview.low, 99.0);
-        assert_eq!(preview.close, 111.0);
-        assert_eq!(preview.volume, 3.0);
-        assert_eq!(preview.quote_volume, 318.0);
-        assert_eq!(preview.trade_count, 5);
-        assert!(!preview.is_closed);
-
         worker
-            .handle_event(MarketEvent::OpenKline {
+            .handle_event(MarketEvent::AggTrade {
                 symbol: "BTCUSDT".to_string(),
-                interval: "5".to_string(),
-                candle: Candle {
-                    open_time: 300_000,
-                    close_time: 599_999,
-                    open: 104.0,
-                    high: 114.0,
-                    low: 102.0,
-                    close: 113.0,
-                    volume: 2.5,
-                    quote_volume: 270.0,
-                    trade_count: 4,
-                    is_closed: false,
-                },
+                trade: TradeTick::new(61_000, 101.0, 3.0),
             })
             .await;
 
-        let updated_preview = latest.get("BTCUSDT", "10").await.unwrap();
-        assert_eq!(updated_preview.open, 100.0);
-        assert_eq!(updated_preview.high, 114.0);
-        assert_eq!(updated_preview.low, 99.0);
-        assert_eq!(updated_preview.close, 113.0);
-        assert_eq!(updated_preview.volume, 3.5);
-        assert_eq!(updated_preview.quote_volume, 372.0);
-        assert_eq!(updated_preview.trade_count, 6);
-        assert!(!updated_preview.is_closed);
+        let closed = closed_buffer.query("BTCUSDT", "1", None, None, 10).await;
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].candle.open_time, 0);
+        assert_eq!(closed[0].candle.close, 100.0);
+        assert_eq!(closed[0].candle.volume, 2.0);
+
+        let current = latest.get("BTCUSDT", "1").await.unwrap();
+        assert_eq!(current.open_time, 60_000);
+        assert_eq!(current.close, 101.0);
+        assert_eq!(current.volume, 3.0);
+        assert!(!current.is_closed);
     }
 }

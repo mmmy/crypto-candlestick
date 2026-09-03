@@ -151,11 +151,9 @@ pub fn parse_rest_klines(payload: Value) -> Result<Vec<Candle>, RestError> {
 
 pub async fn sync_native_klines(
     store: &SqliteStore,
-    symbols: Vec<String>,
-    intervals: Vec<Interval>,
+    plan: &SubscriptionPlan,
     lookback_bars: u32,
 ) -> Result<(), RestError> {
-    let plan = SubscriptionPlan::new(symbols, intervals);
     let client = reqwest::Client::new();
 
     for source in plan.kline_sources() {
@@ -185,7 +183,7 @@ pub async fn sync_native_klines(
         }
     }
 
-    rebuild_custom_klines(store, &plan, DEFAULT_REBUILD_LIMIT).await?;
+    rebuild_custom_klines(store, plan, DEFAULT_REBUILD_LIMIT).await?;
 
     Ok(())
 }

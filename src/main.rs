@@ -1,6 +1,6 @@
 use crypto_candlestick::binance::{
     rest::sync_native_klines,
-    worker::{flush_closed_buffer, BinanceWorker, FlushLock},
+    worker::{flush_closed_buffer, BinanceWorker, FlushLock, SubscriptionPlan},
 };
 use crypto_candlestick::config::AppConfig;
 use crypto_candlestick::http::{router, AppState, HealthTarget};
@@ -13,9 +13,27 @@ use tokio::sync::Mutex;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = AppConfig::load();
-    let _log_guard = logging::init(&config.log_dir)?;
-    tracing::info!(log_dir = %config.log_dir, "logging initialized");
+    let config = AppConfig::load()?;
+    let _log_guard = logging::init(&config.log_dir, &config.log_level)?;
+    tracing::info!(log_dir = %config.log_dir, log_level = %config.log_level, "logging initialized");
+
+    for subscription in &config.subscriptions {
+        let intervals = subscription
+            .intervals
+            .iter()
+            .map(|interval| interval.canonical())
+            .collect::<Vec<_>>()
+            .join(",");
+        tracing::info!(
+            symbol = %subscription.symbol,
+            configured_source = %subscription.source,
+            resolved_source = %subscription.resolved_source(),
+            intervals,
+            "configured market subscription"
+        );
+    }
+
+    let plan = SubscriptionPlan::from_subscriptions(config.subscriptions.clone());
 
     let store =
         SqliteStore::connect_with_retention(&config.database_url, config.retention_bars).await?;
@@ -24,29 +42,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let closed_buffer = ClosedKlineBuffer::default();
     let flush_lock: FlushLock = Arc::new(Mutex::new(()));
     let runtime_health = RuntimeHealth::default();
-    let health_targets = config
-        .symbols
-        .iter()
-        .flat_map(|symbol| {
-            config.intervals.iter().map(move |interval| HealthTarget {
-                symbol: symbol.to_uppercase(),
-                interval: interval.canonical(),
-            })
-        })
+    let health_targets = plan
+        .configured_targets()
+        .into_iter()
+        .map(|(symbol, interval)| HealthTarget { symbol, interval })
         .collect::<Vec<_>>();
 
-    if !config.symbols.is_empty() && !config.intervals.is_empty() {
+    if !plan.streams().is_empty() {
         let mut initial_sync_completed = false;
         if config.sync_on_start {
             tracing::info!("syncing native Binance klines before websocket startup");
-            if let Err(err) = sync_native_klines(
-                &store,
-                config.symbols.clone(),
-                config.intervals.clone(),
-                config.sync_lookback_bars,
-            )
-            .await
-            {
+            if let Err(err) = sync_native_klines(&store, &plan, config.sync_lookback_bars).await {
                 tracing::warn!("startup sync failed: {}", err);
             } else {
                 initial_sync_completed = true;
@@ -59,8 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             memory_series.clone(),
             closed_buffer.clone(),
             runtime_health.clone(),
-            config.symbols,
-            config.intervals,
+            plan,
             config.sync_lookback_bars,
             !initial_sync_completed,
             config.realtime_flush_max_rows.max(1),

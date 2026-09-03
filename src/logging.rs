@@ -2,7 +2,7 @@ use std::{fs, path::Path};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-pub fn init(log_dir: impl AsRef<Path>) -> Result<WorkerGuard, std::io::Error> {
+pub fn init(log_dir: impl AsRef<Path>, log_level: &str) -> Result<WorkerGuard, std::io::Error> {
     let log_dir = log_dir.as_ref();
     fs::create_dir_all(log_dir)?;
 
@@ -13,10 +13,11 @@ pub fn init(log_dir: impl AsRef<Path>) -> Result<WorkerGuard, std::io::Error> {
         .with_writer(file_writer)
         .with_ansi(false);
 
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let log_filter = EnvFilter::try_new(log_level)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
 
     tracing_subscriber::registry()
-        .with(env_filter)
+        .with(log_filter)
         .with(stdout_layer)
         .with(file_layer)
         .init();

@@ -1,0 +1,45 @@
+[server]
+bind_addr = "127.0.0.1:3005"
+
+[database]
+url = "sqlite://candles.db?mode=rwc"
+retention_bars = 2000
+
+[binance]
+sync_on_start = true
+sync_lookback_bars = 1500
+
+# source 可选 auto、trade、kline_1m；省略时默认为 auto。
+# auto 在最小周期 >= 1 分钟时选择 kline_1m，否则选择 trade。
+[[binance.symbols]]
+symbol = "BTCUSDT"
+intervals = ["10S", "15S", "30S", "45S", "1", "2", "3", "5", "8", "10", "15", "20", "30", "45", "60", "90", "120", "180", "240", "360", "480", "720", "D", "2D", "3D", "4D", "10D", "W"]
+source = "auto"
+
+[[binance.symbols]]
+symbol = "XAUUSDT"
+intervals = ["10S", "15S", "30S", "45S", "1", "2", "3", "5", "8", "10", "15", "20", "30", "45", "60", "90", "120", "180", "240", "360", "480", "720", "D", "2D", "3D", "4D", "10D", "W"]
+source = "auto"
+
+[[binance.symbols]]
+symbol = "QQQUSDT"
+intervals = ["10S", "15S", "30S", "45S", "1", "2", "3", "5", "8", "10", "15", "20", "30", "45", "60", "90", "120", "180", "240", "360", "480", "720", "D", "2D", "3D", "4D", "10D", "W"]
+source = "auto"
+
+[[binance.symbols]]
+symbol = "SKHYNIXUSDT"
+intervals = ["10S", "15S", "30S", "45S", "1", "2", "3", "5", "8", "10", "15", "20", "30", "45", "60", "90", "120", "180", "240", "360", "480", "720", "D", "2D", "3D", "4D", "10D", "W"]
+source = "auto"
+
+[[binance.symbols]]
+symbol = "CLUSDT"
+intervals = ["10S", "15S", "30S", "45S", "1", "2", "3", "5", "8", "10", "15", "20", "30", "45", "60", "90", "120", "180", "240", "360", "480", "720", "D", "2D", "3D", "4D", "10D", "W"]
+source = "auto"
+
+[realtime]
+flush_interval_secs = 300
+flush_max_rows = 1000
+
+[logging]
+dir = "logs"
+level = "info"

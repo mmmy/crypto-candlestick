@@ -276,6 +276,9 @@ impl BinanceWorker {
         if let Err(err) = self.seed_kline_aggregators().await {
             tracing::warn!("failed to seed kline aggregators: {}", err);
         }
+        if let Err(err) = self.seed_trade_aggregators().await {
+            tracing::warn!("failed to seed trade aggregators: {}", err);
+        }
 
         let url = self.plan.stream_url();
 
@@ -616,6 +619,48 @@ impl BinanceWorker {
         Ok(())
     }
 
+    async fn seed_trade_aggregators(&mut self) -> Result<(), sqlx::Error> {
+        for (key, agg) in self.trade_aggregators.iter_mut() {
+            let Ok(target_interval) = Interval::parse(&key.1) else {
+                continue;
+            };
+            if target_interval.as_millis() < 60_000 {
+                continue;
+            }
+
+            self.latest.remove(&key.0, &key.1).await;
+            let base_interval = target_interval
+                .aggregation_base()
+                .unwrap_or(target_interval);
+            let base = base_interval.canonical();
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let bucket_start = target_interval.bucket_start_ms(now_ms);
+            let seed_limit =
+                ((now_ms - bucket_start).max(0) / base_interval.as_millis() as i64 + 1) as u32;
+            let rows = self
+                .store
+                .query_klines(
+                    &key.0,
+                    &base,
+                    Some(bucket_start),
+                    Some(now_ms),
+                    seed_limit.max(1),
+                )
+                .await?;
+
+            for row in rows {
+                let _ = agg.ingest_candle(row.candle);
+            }
+
+            if let Some(mut current) = agg.current() {
+                current.is_closed = false;
+                self.latest.upsert(&key.0, &key.1, current).await;
+            }
+        }
+
+        Ok(())
+    }
+
     fn reset_kline_aggregators(&mut self) {
         for (key, aggregator) in self.kline_aggregators.iter_mut() {
             if let Ok(interval) = Interval::parse(&key.2) {
@@ -816,5 +861,82 @@ mod tests {
         assert_eq!(current.close, 101.0);
         assert_eq!(current.volume, 3.0);
         assert!(!current.is_closed);
+    }
+
+    #[tokio::test]
+    async fn trade_source_seeds_current_long_interval_before_live_trades() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let latest = LatestCache::default();
+        let closed_buffer = ClosedKlineBuffer::default();
+        let interval = Interval::parse("720").unwrap();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let bucket_start = interval.bucket_start_ms(now_ms);
+        let bucket_end = bucket_start + interval.as_millis() as i64 - 1;
+
+        store
+            .upsert_candle(
+                "XAUUSDT",
+                "720",
+                &Candle {
+                    open_time: bucket_start,
+                    close_time: bucket_end,
+                    open: 4_448.52,
+                    high: 4_514.81,
+                    low: 4_442.95,
+                    close: 4_497.70,
+                    volume: 100.0,
+                    quote_volume: 449_770.0,
+                    trade_count: 10,
+                    is_closed: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        let plan = SubscriptionPlan::from_subscriptions(vec![SymbolSubscription::new(
+            "XAUUSDT",
+            vec![Interval::parse("10S").unwrap(), interval],
+            RealtimeSource::Auto,
+        )]);
+        let mut worker = BinanceWorker::new(
+            store,
+            latest.clone(),
+            MemorySeriesStore::default(),
+            closed_buffer.clone(),
+            RuntimeHealth::default(),
+            plan,
+            1_500,
+            false,
+            usize::MAX,
+            Arc::new(Mutex::new(())),
+        );
+
+        worker.seed_trade_aggregators().await.unwrap();
+        worker
+            .handle_event(MarketEvent::AggTrade {
+                symbol: "XAUUSDT".to_string(),
+                trade: TradeTick::new(now_ms, 4_497.73, 1.0),
+            })
+            .await;
+
+        let current = latest.get("XAUUSDT", "720").await.unwrap();
+        assert_eq!(current.open, 4_448.52);
+        assert_eq!(current.high, 4_514.81);
+        assert_eq!(current.low, 4_442.95);
+        assert_eq!(current.close, 4_497.73);
+        assert_eq!(current.volume, 101.0);
+
+        worker
+            .handle_event(MarketEvent::AggTrade {
+                symbol: "XAUUSDT".to_string(),
+                trade: TradeTick::new(bucket_end + 1, 4_500.0, 2.0),
+            })
+            .await;
+
+        let closed = closed_buffer.query("XAUUSDT", "720", None, None, 10).await;
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].candle.open, 4_448.52);
+        assert_eq!(closed[0].candle.high, 4_514.81);
+        assert_eq!(closed[0].candle.low, 4_442.95);
     }
 }

@@ -11,6 +11,7 @@ use tokio::time::sleep;
 const BINANCE_FAPI_BASE: &str = "https://fapi.binance.com";
 const MAX_KLINE_LIMIT: u32 = 1500;
 const DEFAULT_REBUILD_LIMIT: u32 = 1_000_000;
+const STARTUP_REFRESH_CLOSED_BARS: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MissingKlineRange {
@@ -71,6 +72,17 @@ pub fn closed_lookback_window(interval: &Interval, lookback_bars: u32, now_ms: i
     let start_open_time = latest_closed_open_time - (bar_count - 1) * interval_ms;
 
     (start_open_time, latest_closed_open_time)
+}
+
+pub fn startup_refresh_window(interval: &Interval, now_ms: i64) -> RestKlinePage {
+    let interval_ms = interval.as_millis() as i64;
+    let current_bucket_start = interval.bucket_start_ms(now_ms);
+
+    RestKlinePage {
+        start_time: current_bucket_start - i64::from(STARTUP_REFRESH_CLOSED_BARS) * interval_ms,
+        end_time: now_ms,
+        limit: STARTUP_REFRESH_CLOSED_BARS + 1,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,6 +200,75 @@ pub async fn sync_native_klines(
     Ok(())
 }
 
+pub async fn rebuild_custom_kline_tail(
+    store: &SqliteStore,
+    plan: &SubscriptionPlan,
+    now_ms: i64,
+) -> Result<(), RestError> {
+    for (symbol, base, target) in plan.aggregation_targets() {
+        let target_interval = Interval::parse(&target).map_err(|_| RestError::InvalidPayload)?;
+        let base_interval = Interval::parse(&base).map_err(|_| RestError::InvalidPayload)?;
+        let base_ms = base_interval.as_millis() as i64;
+        let current_base_start = base_interval.bucket_start_ms(now_ms);
+        let refreshed_tail_start =
+            current_base_start - i64::from(STARTUP_REFRESH_CLOSED_BARS) * base_ms;
+        let rebuild_start = target_interval.bucket_start_ms(refreshed_tail_start);
+        let source_limit = ((now_ms - rebuild_start).max(0) / base_ms + 1) as u32;
+        let source_rows = store
+            .query_klines(
+                &symbol,
+                &base,
+                Some(rebuild_start),
+                Some(now_ms),
+                source_limit.max(1),
+            )
+            .await?;
+
+        let candles = aggregate_complete_custom_klines(source_rows, base_interval, target_interval);
+        store.upsert_candles(&symbol, &target, &candles).await?;
+    }
+
+    Ok(())
+}
+
+/// Force-refreshes the two latest closed source candles plus the current source
+/// candle. Unlike the normal missing-range sync, this repairs rows whose open
+/// time exists but whose OHLCV only contains trades observed after a restart.
+pub async fn refresh_startup_kline_tail(
+    store: &SqliteStore,
+    plan: &SubscriptionPlan,
+) -> Result<(), RestError> {
+    let client = reqwest::Client::new();
+
+    for source in plan.kline_sources() {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let page = startup_refresh_window(&source.interval, now_ms);
+        let mut candles = fetch_klines_page(
+            &client,
+            &source.symbol,
+            source.binance_interval,
+            page.start_time,
+            page.end_time,
+            page.limit,
+        )
+        .await?;
+
+        for candle in &mut candles {
+            candle.is_closed = candle.close_time < now_ms;
+        }
+
+        store
+            .upsert_candles(&source.symbol, &source.canonical_interval, &candles)
+            .await?;
+
+        sleep(Duration::from_millis(120)).await;
+    }
+
+    rebuild_custom_kline_tail(store, plan, chrono::Utc::now().timestamp_millis()).await?;
+
+    Ok(())
+}
+
 pub async fn rebuild_custom_klines(
     store: &SqliteStore,
     plan: &SubscriptionPlan,
@@ -282,7 +363,10 @@ fn aggregate_complete_bucket(
     let bucket_start = target_interval.bucket_start_ms(first.open_time);
     let expected_count = (target_interval.as_millis() as i64 / base_ms) as usize;
 
-    if bucket_rows.len() != expected_count || first.open_time != bucket_start {
+    if bucket_rows.len() != expected_count
+        || first.open_time != bucket_start
+        || bucket_rows.iter().any(|candle| !candle.is_closed)
+    {
         return None;
     }
 

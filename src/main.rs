@@ -1,5 +1,5 @@
 use crypto_candlestick::binance::{
-    rest::sync_native_klines,
+    rest::{refresh_startup_kline_tail, sync_native_klines},
     worker::{flush_closed_buffer, BinanceWorker, FlushLock, SubscriptionPlan},
 };
 use crypto_candlestick::config::AppConfig;
@@ -54,6 +54,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing::info!("syncing native Binance klines before websocket startup");
             if let Err(err) = sync_native_klines(&store, &plan, config.sync_lookback_bars).await {
                 tracing::warn!("startup sync failed: {}", err);
+            } else if let Err(err) = refresh_startup_kline_tail(&store, &plan).await {
+                tracing::warn!("startup tail refresh failed: {}", err);
             } else {
                 initial_sync_completed = true;
             }

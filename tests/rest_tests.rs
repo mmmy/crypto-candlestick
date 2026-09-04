@@ -1,9 +1,11 @@
 use crypto_candlestick::binance::rest::closed_lookback_window;
 use crypto_candlestick::binance::rest::missing_ranges_for_source;
 use crypto_candlestick::binance::rest::parse_rest_klines;
-use crypto_candlestick::binance::rest::rebuild_custom_klines;
 use crypto_candlestick::binance::rest::{detect_missing_kline_ranges, MissingKlineRange};
-use crypto_candlestick::binance::rest::{plan_rest_kline_pages, RestKlinePage};
+use crypto_candlestick::binance::rest::{
+    plan_rest_kline_pages, startup_refresh_window, RestKlinePage,
+};
+use crypto_candlestick::binance::rest::{rebuild_custom_kline_tail, rebuild_custom_klines};
 use crypto_candlestick::binance::worker::{KlineSource, SubscriptionPlan};
 use crypto_candlestick::domain::candle::Candle;
 use crypto_candlestick::domain::interval::Interval;
@@ -153,6 +155,84 @@ async fn rebuilds_missing_custom_interval_inside_existing_history() {
     assert_eq!(rows[1].candle.close, 103.5);
     assert_eq!(rows[1].candle.volume, 20.0);
     assert_eq!(rows[3].candle.open, 1.0);
+}
+
+#[tokio::test]
+async fn startup_tail_rebuild_overwrites_affected_custom_candle() {
+    let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    for index in 0..8 {
+        let open_time = index * 60_000;
+        store
+            .upsert_candle(
+                "BTCUSDT",
+                "1",
+                &Candle {
+                    open_time,
+                    close_time: open_time + 59_999,
+                    open: 100.0 + index as f64,
+                    high: 101.0 + index as f64,
+                    low: 99.0 + index as f64,
+                    close: 100.5 + index as f64,
+                    volume: 10.0,
+                    quote_volume: 1_000.0,
+                    trade_count: 10,
+                    is_closed: true,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    store
+        .upsert_candle(
+            "BTCUSDT",
+            "2",
+            &Candle {
+                open_time: 240_000,
+                close_time: 359_999,
+                open: 999.0,
+                high: 999.0,
+                low: 999.0,
+                close: 999.0,
+                volume: 1.0,
+                quote_volume: 1.0,
+                trade_count: 1,
+                is_closed: true,
+            },
+        )
+        .await
+        .unwrap();
+
+    let plan = SubscriptionPlan::new(
+        vec!["BTCUSDT".to_string()],
+        vec![Interval::parse("2").unwrap()],
+    );
+    rebuild_custom_kline_tail(&store, &plan, 7 * 60_000)
+        .await
+        .unwrap();
+
+    let rows = store
+        .query_klines("BTCUSDT", "2", Some(240_000), Some(240_000), 1)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].candle.open, 104.0);
+    assert_eq!(rows[0].candle.close, 105.5);
+    assert_eq!(rows[0].candle.volume, 20.0);
+}
+
+#[test]
+fn startup_refresh_includes_two_closed_bars_and_the_current_bar() {
+    let interval = Interval::parse("720").unwrap();
+    let now_ms = 5 * 43_200_000 + 123_456;
+
+    assert_eq!(
+        startup_refresh_window(&interval, now_ms),
+        RestKlinePage {
+            start_time: 3 * 43_200_000,
+            end_time: now_ms,
+            limit: 3,
+        }
+    );
 }
 
 #[test]

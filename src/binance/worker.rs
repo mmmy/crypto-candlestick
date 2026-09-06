@@ -273,6 +273,9 @@ impl BinanceWorker {
             return;
         }
 
+        if let Err(err) = self.load_symbol_bucket_anchors().await {
+            tracing::warn!("failed to load symbol bucket anchors: {}", err);
+        }
         if let Err(err) = self.seed_kline_aggregators().await {
             tracing::warn!("failed to seed kline aggregators: {}", err);
         }
@@ -581,7 +584,7 @@ impl BinanceWorker {
                 continue;
             };
             let now_ms = chrono::Utc::now().timestamp_millis();
-            let start_time = target_interval.bucket_start_ms(now_ms);
+            let start_time = agg.bucket_start_ms(now_ms);
             let mut minute_start = start_time;
 
             if target_interval.as_millis() > Interval::Days(1).as_millis() {
@@ -634,7 +637,7 @@ impl BinanceWorker {
                 .unwrap_or(target_interval);
             let base = base_interval.canonical();
             let now_ms = chrono::Utc::now().timestamp_millis();
-            let bucket_start = target_interval.bucket_start_ms(now_ms);
+            let bucket_start = agg.bucket_start_ms(now_ms);
             let seed_limit =
                 ((now_ms - bucket_start).max(0) / base_interval.as_millis() as i64 + 1) as u32;
             let rows = self
@@ -661,13 +664,58 @@ impl BinanceWorker {
         Ok(())
     }
 
-    fn reset_kline_aggregators(&mut self) {
-        for (key, aggregator) in self.kline_aggregators.iter_mut() {
-            if let Ok(interval) = Interval::parse(&key.2) {
-                *aggregator = Aggregator::new(interval);
+    async fn load_symbol_bucket_anchors(&mut self) -> Result<(), sqlx::Error> {
+        for (key, agg) in self.kline_aggregators.iter_mut() {
+            let Ok(interval) = Interval::parse(&key.2) else {
+                continue;
+            };
+            if let Some(anchor_ms) =
+                stored_bucket_anchor(&self.store, &key.0, &key.2, interval).await?
+            {
+                agg.set_bucket_anchor_ms(anchor_ms);
             }
         }
+
+        for (key, agg) in self.trade_aggregators.iter_mut() {
+            let Ok(interval) = Interval::parse(&key.1) else {
+                continue;
+            };
+            if let Some(anchor_ms) =
+                stored_bucket_anchor(&self.store, &key.0, &key.1, interval).await?
+            {
+                agg.set_bucket_anchor_ms(anchor_ms);
+            }
+        }
+
+        Ok(())
     }
+
+    fn reset_kline_aggregators(&mut self) {
+        for aggregator in self.kline_aggregators.values_mut() {
+            aggregator.reset();
+        }
+    }
+}
+
+async fn stored_bucket_anchor(
+    store: &SqliteStore,
+    symbol: &str,
+    interval_name: &str,
+    interval: Interval,
+) -> Result<Option<i64>, sqlx::Error> {
+    if !interval.uses_symbol_specific_binance_alignment() {
+        return Ok(None);
+    }
+
+    let rows = store
+        .query_klines(symbol, interval_name, None, None, 32)
+        .await?;
+    let open_times = rows
+        .into_iter()
+        .map(|row| row.candle.open_time)
+        .collect::<Vec<_>>();
+
+    Ok(interval.infer_bucket_anchor_ms(&open_times))
 }
 
 fn render_alert_message(
@@ -938,5 +986,149 @@ mod tests {
         assert_eq!(closed[0].candle.open, 4_448.52);
         assert_eq!(closed[0].candle.high, 4_514.81);
         assert_eq!(closed[0].candle.low, 4_442.95);
+    }
+
+    #[tokio::test]
+    async fn trade_source_uses_stored_symbol_anchor_for_three_day_kline() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let latest = LatestCache::default();
+        let interval = Interval::parse("3D").unwrap();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let local_bucket_start = interval.bucket_start_ms(now_ms);
+        let symbol_anchor = local_bucket_start + Interval::Days(1).as_millis() as i64;
+        let current_open = interval.bucket_start_ms_with_anchor(now_ms, symbol_anchor);
+
+        for index in -2..=0 {
+            let open_time = current_open + i64::from(index) * interval.as_millis() as i64;
+            store
+                .upsert_candle(
+                    "BTCUSDT",
+                    "3D",
+                    &Candle {
+                        open_time,
+                        close_time: open_time + interval.as_millis() as i64 - 1,
+                        open: 100.0 + f64::from(index),
+                        high: 110.0,
+                        low: 90.0,
+                        close: 105.0,
+                        volume: 10.0,
+                        quote_volume: 1_000.0,
+                        trade_count: 10,
+                        is_closed: index < 0,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let plan = SubscriptionPlan::from_subscriptions(vec![SymbolSubscription::new(
+            "BTCUSDT",
+            vec![Interval::parse("10S").unwrap(), interval],
+            RealtimeSource::Auto,
+        )]);
+        let mut worker = BinanceWorker::new(
+            store,
+            latest.clone(),
+            MemorySeriesStore::default(),
+            ClosedKlineBuffer::default(),
+            RuntimeHealth::default(),
+            plan,
+            1_500,
+            false,
+            usize::MAX,
+            Arc::new(Mutex::new(())),
+        );
+
+        worker.load_symbol_bucket_anchors().await.unwrap();
+        worker.seed_trade_aggregators().await.unwrap();
+        worker
+            .handle_event(MarketEvent::AggTrade {
+                symbol: "BTCUSDT".to_string(),
+                trade: TradeTick::new(now_ms, 106.0, 1.0),
+            })
+            .await;
+
+        let current = latest.get("BTCUSDT", "3D").await.unwrap();
+        assert_ne!(current_open, local_bucket_start);
+        assert_eq!(current.open_time, current_open);
+        assert_eq!(current.open, 100.0);
+        assert_eq!(current.close, 106.0);
+    }
+
+    #[tokio::test]
+    async fn kline_source_uses_stored_symbol_anchor_for_three_day_kline() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let latest = LatestCache::default();
+        let interval = Interval::parse("3D").unwrap();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let local_bucket_start = interval.bucket_start_ms(now_ms);
+        let symbol_anchor = local_bucket_start + 2 * Interval::Days(1).as_millis() as i64;
+        let current_open = interval.bucket_start_ms_with_anchor(now_ms, symbol_anchor);
+
+        for index in -2..=0 {
+            let open_time = current_open + i64::from(index) * interval.as_millis() as i64;
+            store
+                .upsert_candle(
+                    "QQQUSDT",
+                    "3D",
+                    &Candle {
+                        open_time,
+                        close_time: open_time + interval.as_millis() as i64 - 1,
+                        open: 100.0,
+                        high: 110.0,
+                        low: 90.0,
+                        close: 105.0,
+                        volume: 10.0,
+                        quote_volume: 1_000.0,
+                        trade_count: 10,
+                        is_closed: index < 0,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let plan = SubscriptionPlan::from_subscriptions(vec![SymbolSubscription::new(
+            "QQQUSDT",
+            vec![Interval::parse("1").unwrap(), interval],
+            RealtimeSource::Auto,
+        )]);
+        let mut worker = BinanceWorker::new(
+            store,
+            latest.clone(),
+            MemorySeriesStore::default(),
+            ClosedKlineBuffer::default(),
+            RuntimeHealth::default(),
+            plan,
+            1_500,
+            false,
+            usize::MAX,
+            Arc::new(Mutex::new(())),
+        );
+
+        worker.load_symbol_bucket_anchors().await.unwrap();
+        worker
+            .handle_event(MarketEvent::ClosedKline {
+                symbol: "QQQUSDT".to_string(),
+                interval: "1".to_string(),
+                candle: Candle {
+                    open_time: now_ms.div_euclid(60_000) * 60_000,
+                    close_time: now_ms.div_euclid(60_000) * 60_000 + 59_999,
+                    open: 106.0,
+                    high: 107.0,
+                    low: 105.0,
+                    close: 106.5,
+                    volume: 1.0,
+                    quote_volume: 106.5,
+                    trade_count: 1,
+                    is_closed: true,
+                },
+            })
+            .await;
+
+        let current = latest.get("QQQUSDT", "3D").await.unwrap();
+        assert_ne!(current_open, local_bucket_start);
+        assert_eq!(current.open_time, current_open);
+        assert_eq!(current.open, 106.0);
     }
 }

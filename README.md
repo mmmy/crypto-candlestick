@@ -63,7 +63,7 @@ cargo run
 
 `kline_1m` 模式下，高级别动态 K 每分钟更新一次。币安仍会发送未收盘的 1m K 消息，但服务不会用这些消息更新 K 线或检查价格警报。显式使用 `kline_1m` 时不能配置秒级周期。
 
-断线或读取失败时，后台 worker 会写入 warn 日志，更新 `/api/health/deep` 中的 WebSocket 状态，并按 `1s, 2s, 4s ... 30s` 的退避节奏重连。重连成功后会补齐缺失的分钟级及以上 K 线、重建聚合状态，再使用同一个 stream URL 继续订阅。程序启动时还会通过 REST 强制刷新每种基础周期最近 2 根已收盘 K 和当前 K，再从数据库恢复正在形成的聚合 K；这不会增加稳态 WebSocket 数据流。
+断线或读取失败时，后台 worker 会写入 warn 日志，更新 `/api/health/deep` 中的 WebSocket 状态，并按 `1s, 2s, 4s ... 30s` 的退避节奏重连。重连成功后会补齐缺失的分钟级及以上 K 线、重建聚合状态，再使用同一个 stream URL 继续订阅。程序启动时还会通过 REST 强制刷新每种基础周期最近 2 根已收盘 K 和当前 K，再从数据库恢复正在形成的聚合 K；币安原生 3D 周期会从各交易对的历史 K 推断其独立分桶相位。这些恢复步骤不会增加稳态 WebSocket 数据流。
 
 如果连接没有显式断开，但 60 秒没有收到任何 WebSocket 消息，worker 会判定为空闲超时，主动断开当前读取循环并重连。此时深度健康检查中的 `websocket.ok` 会变为 `false`，`reason` 为 `websocket message stream is stale`。
 

@@ -1,5 +1,5 @@
 use chrono::{Datelike, TimeZone, Utc};
-use std::fmt;
+use std::{collections::BTreeMap, fmt};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Interval {
@@ -86,6 +86,30 @@ impl Interval {
             }
             _ => timestamp_ms.div_euclid(interval_ms) * interval_ms,
         }
+    }
+
+    pub fn bucket_start_ms_with_anchor(&self, timestamp_ms: i64, anchor_ms: i64) -> i64 {
+        let interval_ms = self.as_millis() as i64;
+        anchor_ms + (timestamp_ms - anchor_ms).div_euclid(interval_ms) * interval_ms
+    }
+
+    pub fn uses_symbol_specific_binance_alignment(&self) -> bool {
+        matches!(self, Self::Days(days) if *days > 1) && self.binance_interval().is_some()
+    }
+
+    pub fn infer_bucket_anchor_ms(&self, open_times: &[i64]) -> Option<i64> {
+        let interval_ms = self.as_millis() as i64;
+        let mut phase_counts = BTreeMap::new();
+        for open_time in open_times {
+            *phase_counts
+                .entry(open_time.rem_euclid(interval_ms))
+                .or_insert(0usize) += 1;
+        }
+
+        phase_counts
+            .into_iter()
+            .max_by_key(|(_, count)| *count)
+            .map(|(phase, _)| phase)
     }
 
     pub fn canonical(&self) -> String {

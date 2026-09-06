@@ -27,6 +27,7 @@ pub enum AggregationError {
 #[derive(Debug, Clone)]
 pub struct Aggregator {
     interval: Interval,
+    bucket_anchor_ms: Option<i64>,
     current: Option<Candle>,
 }
 
@@ -34,8 +35,26 @@ impl Aggregator {
     pub fn new(interval: Interval) -> Self {
         Self {
             interval,
+            bucket_anchor_ms: None,
             current: None,
         }
+    }
+
+    pub fn set_bucket_anchor_ms(&mut self, anchor_ms: i64) {
+        self.bucket_anchor_ms = Some(anchor_ms);
+    }
+
+    pub fn bucket_start_ms(&self, timestamp_ms: i64) -> i64 {
+        self.bucket_anchor_ms
+            .map(|anchor_ms| {
+                self.interval
+                    .bucket_start_ms_with_anchor(timestamp_ms, anchor_ms)
+            })
+            .unwrap_or_else(|| self.interval.bucket_start_ms(timestamp_ms))
+    }
+
+    pub fn reset(&mut self) {
+        self.current = None;
     }
 
     pub fn ingest_trade(&mut self, tick: TradeTick) -> Result<Option<Candle>, AggregationError> {
@@ -47,7 +66,7 @@ impl Aggregator {
     }
 
     pub fn ingest_candle(&mut self, mut input: Candle) -> Result<Option<Candle>, AggregationError> {
-        let bucket_start = self.interval.bucket_start_ms(input.open_time);
+        let bucket_start = self.bucket_start_ms(input.open_time);
         let bucket_end = bucket_start + self.interval.as_millis() as i64 - 1;
         input.open_time = bucket_start;
         input.close_time = bucket_end.max(input.close_time);

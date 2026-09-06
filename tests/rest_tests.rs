@@ -1,4 +1,5 @@
 use crypto_candlestick::binance::rest::closed_lookback_window;
+use crypto_candlestick::binance::rest::closed_lookback_window_with_anchor;
 use crypto_candlestick::binance::rest::missing_ranges_for_source;
 use crypto_candlestick::binance::rest::parse_rest_klines;
 use crypto_candlestick::binance::rest::{detect_missing_kline_ranges, MissingKlineRange};
@@ -232,6 +233,21 @@ fn startup_refresh_includes_two_closed_bars_and_the_current_bar() {
             end_time: now_ms,
             limit: 3,
         }
+    );
+}
+
+#[test]
+fn anchored_lookback_uses_native_three_day_phase() {
+    let interval = Interval::parse("3D").unwrap();
+    let current_open = 1_788_566_400_000i64; // 2026-09-05 00:00 UTC
+    let now_ms = current_open + 36 * 60 * 60 * 1_000;
+
+    assert_eq!(
+        closed_lookback_window_with_anchor(&interval, 2, now_ms, Some(current_open)),
+        (
+            current_open - 2 * interval.as_millis() as i64,
+            current_open - interval.as_millis() as i64,
+        )
     );
 }
 

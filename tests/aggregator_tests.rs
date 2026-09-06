@@ -23,3 +23,18 @@ fn rolls_seconds_into_correct_bucket() {
     assert_eq!(candle.trade_count, 1);
     assert!(candle.is_closed);
 }
+
+#[test]
+fn rolls_trades_into_symbol_anchored_three_day_bucket() {
+    let interval = Interval::parse("3D").unwrap();
+    let anchor = 1_788_566_400_000i64; // 2026-09-05 00:00 UTC
+    let mut agg = Aggregator::new(interval);
+    agg.set_bucket_anchor_ms(anchor);
+
+    agg.ingest_trade(TradeTick::new(1_788_687_118_271, 100.0, 1.0))
+        .unwrap();
+    let candle = agg.current().unwrap();
+
+    assert_eq!(candle.open_time, anchor);
+    assert_eq!(candle.close_time, anchor + interval.as_millis() as i64 - 1);
+}

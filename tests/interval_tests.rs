@@ -115,3 +115,35 @@ fn rejects_unsupported_intervals() {
         assert!(Interval::parse(raw).is_err(), "{raw} should be unsupported");
     }
 }
+
+#[test]
+fn aligns_native_multi_day_interval_to_symbol_anchor() {
+    let interval = Interval::parse("3D").unwrap();
+    let btc_anchor = 1_788_566_400_000i64; // 2026-09-05 00:00 UTC
+
+    assert!(interval.uses_symbol_specific_binance_alignment());
+    assert_eq!(
+        interval.bucket_start_ms_with_anchor(1_788_687_118_271, btc_anchor),
+        btc_anchor
+    );
+    assert!(!Interval::parse("2D")
+        .unwrap()
+        .uses_symbol_specific_binance_alignment());
+}
+
+#[test]
+fn infers_dominant_symbol_anchor_from_native_history() {
+    let interval = Interval::parse("3D").unwrap();
+    let official_phase = 86_400_000;
+    let open_times = [
+        official_phase,
+        official_phase + 259_200_000,
+        official_phase + 2 * 259_200_000,
+        3 * 259_200_000,
+    ];
+
+    assert_eq!(
+        interval.infer_bucket_anchor_ms(&open_times),
+        Some(official_phase)
+    );
+}

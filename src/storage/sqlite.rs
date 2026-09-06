@@ -373,6 +373,33 @@ impl SqliteStore {
         Ok(())
     }
 
+    pub async fn delete_klines_with_different_phase(
+        &self,
+        symbol: &str,
+        interval: &str,
+        interval_ms: i64,
+        phase_ms: i64,
+        start_time: i64,
+        end_time: i64,
+    ) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(
+            "DELETE FROM klines \
+             WHERE symbol = ? AND interval = ? \
+               AND open_time >= ? AND open_time <= ? \
+               AND (open_time % ?) != ?",
+        )
+        .bind(symbol)
+        .bind(interval)
+        .bind(start_time)
+        .bind(end_time)
+        .bind(interval_ms)
+        .bind(phase_ms)
+        .execute(&self.write_pool)
+        .await?;
+
+        Ok(result.rows_affected())
+    }
+
     pub async fn query_klines(
         &self,
         symbol: &str,
@@ -706,6 +733,57 @@ mod tests {
     use super::*;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn removes_only_klines_outside_the_authoritative_phase() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let interval_ms = 3 * 86_400_000;
+        for open_time in [86_400_000, 172_800_000, 345_600_000, 518_400_000] {
+            store
+                .upsert_candle(
+                    "BTCUSDT",
+                    "3D",
+                    &Candle {
+                        open_time,
+                        close_time: open_time + interval_ms - 1,
+                        open: 100.0,
+                        high: 101.0,
+                        low: 99.0,
+                        close: 100.5,
+                        volume: 1.0,
+                        quote_volume: 100.5,
+                        trade_count: 1,
+                        is_closed: true,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let deleted = store
+            .delete_klines_with_different_phase(
+                "BTCUSDT",
+                "3D",
+                interval_ms,
+                86_400_000,
+                0,
+                400_000_000,
+            )
+            .await
+            .unwrap();
+        let rows = store
+            .query_klines("BTCUSDT", "3D", None, None, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(deleted, 1);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.candle.open_time)
+                .collect::<Vec<_>>(),
+            vec![86_400_000, 345_600_000, 518_400_000]
+        );
+    }
 
     #[tokio::test]
     async fn file_database_reads_do_not_wait_for_the_writer_connection() {

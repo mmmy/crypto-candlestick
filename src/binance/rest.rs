@@ -65,8 +65,19 @@ pub fn detect_missing_kline_ranges(
 }
 
 pub fn closed_lookback_window(interval: &Interval, lookback_bars: u32, now_ms: i64) -> (i64, i64) {
+    closed_lookback_window_with_anchor(interval, lookback_bars, now_ms, None)
+}
+
+pub fn closed_lookback_window_with_anchor(
+    interval: &Interval,
+    lookback_bars: u32,
+    now_ms: i64,
+    anchor_ms: Option<i64>,
+) -> (i64, i64) {
     let interval_ms = interval.as_millis() as i64;
-    let current_bucket_start = interval.bucket_start_ms(now_ms);
+    let current_bucket_start = anchor_ms
+        .map(|anchor| interval.bucket_start_ms_with_anchor(now_ms, anchor))
+        .unwrap_or_else(|| interval.bucket_start_ms(now_ms));
     let latest_closed_open_time = current_bucket_start - interval_ms;
     let bar_count = i64::from(lookback_bars.max(1));
     let start_open_time = latest_closed_open_time - (bar_count - 1) * interval_ms;
@@ -75,8 +86,18 @@ pub fn closed_lookback_window(interval: &Interval, lookback_bars: u32, now_ms: i
 }
 
 pub fn startup_refresh_window(interval: &Interval, now_ms: i64) -> RestKlinePage {
+    startup_refresh_window_with_anchor(interval, now_ms, None)
+}
+
+pub fn startup_refresh_window_with_anchor(
+    interval: &Interval,
+    now_ms: i64,
+    anchor_ms: Option<i64>,
+) -> RestKlinePage {
     let interval_ms = interval.as_millis() as i64;
-    let current_bucket_start = interval.bucket_start_ms(now_ms);
+    let current_bucket_start = anchor_ms
+        .map(|anchor| interval.bucket_start_ms_with_anchor(now_ms, anchor))
+        .unwrap_or_else(|| interval.bucket_start_ms(now_ms));
 
     RestKlinePage {
         start_time: current_bucket_start - i64::from(STARTUP_REFRESH_CLOSED_BARS) * interval_ms,
@@ -170,8 +191,9 @@ pub async fn sync_native_klines(
 
     for source in plan.kline_sources() {
         let now_ms = chrono::Utc::now().timestamp_millis();
+        let anchor_ms = source_bucket_anchor(store, &source).await?;
         let (window_start, window_end) =
-            closed_lookback_window(&source.interval, lookback_bars, now_ms);
+            closed_lookback_window_with_anchor(&source.interval, lookback_bars, now_ms, anchor_ms);
         let ranges = missing_ranges_for_source(store, &source, window_start, window_end).await?;
 
         for range in ranges {
@@ -242,7 +264,8 @@ pub async fn refresh_startup_kline_tail(
 
     for source in plan.kline_sources() {
         let now_ms = chrono::Utc::now().timestamp_millis();
-        let page = startup_refresh_window(&source.interval, now_ms);
+        let anchor_ms = source_bucket_anchor(store, &source).await?;
+        let page = startup_refresh_window_with_anchor(&source.interval, now_ms, anchor_ms);
         let mut candles = fetch_klines_page(
             &client,
             &source.symbol,
@@ -257,6 +280,33 @@ pub async fn refresh_startup_kline_tail(
             candle.is_closed = candle.close_time < now_ms;
         }
 
+        if source.interval.uses_symbol_specific_binance_alignment() {
+            let open_times = candles
+                .iter()
+                .map(|candle| candle.open_time)
+                .collect::<Vec<_>>();
+            if let Some(phase_ms) = source.interval.infer_bucket_anchor_ms(&open_times) {
+                let deleted = store
+                    .delete_klines_with_different_phase(
+                        &source.symbol,
+                        &source.canonical_interval,
+                        source.interval.as_millis() as i64,
+                        phase_ms,
+                        page.start_time,
+                        page.end_time,
+                    )
+                    .await?;
+                if deleted > 0 {
+                    tracing::info!(
+                        symbol = %source.symbol,
+                        interval = %source.canonical_interval,
+                        deleted,
+                        "removed klines with a stale bucket phase"
+                    );
+                }
+            }
+        }
+
         store
             .upsert_candles(&source.symbol, &source.canonical_interval, &candles)
             .await?;
@@ -267,6 +317,25 @@ pub async fn refresh_startup_kline_tail(
     rebuild_custom_kline_tail(store, plan, chrono::Utc::now().timestamp_millis()).await?;
 
     Ok(())
+}
+
+async fn source_bucket_anchor(
+    store: &SqliteStore,
+    source: &KlineSource,
+) -> Result<Option<i64>, RestError> {
+    if !source.interval.uses_symbol_specific_binance_alignment() {
+        return Ok(None);
+    }
+
+    let rows = store
+        .query_klines(&source.symbol, &source.canonical_interval, None, None, 32)
+        .await?;
+    let open_times = rows
+        .into_iter()
+        .map(|row| row.candle.open_time)
+        .collect::<Vec<_>>();
+
+    Ok(source.interval.infer_bucket_anchor_ms(&open_times))
 }
 
 pub async fn rebuild_custom_klines(

@@ -52,13 +52,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut initial_sync_completed = false;
         if config.sync_on_start {
             tracing::info!("syncing native Binance klines before websocket startup");
-            if let Err(err) = sync_native_klines(&store, &plan, config.sync_lookback_bars).await {
-                tracing::warn!("startup sync failed: {}", err);
-            } else if let Err(err) = refresh_startup_kline_tail(&store, &plan).await {
+            let tail_refreshed = if let Err(err) = refresh_startup_kline_tail(&store, &plan).await {
                 tracing::warn!("startup tail refresh failed: {}", err);
+                false
             } else {
-                initial_sync_completed = true;
-            }
+                true
+            };
+            let history_synced = if let Err(err) =
+                sync_native_klines(&store, &plan, config.sync_lookback_bars).await
+            {
+                tracing::warn!("startup sync failed: {}", err);
+                false
+            } else {
+                true
+            };
+            initial_sync_completed = tail_refreshed && history_synced;
         }
 
         let worker = BinanceWorker::new(

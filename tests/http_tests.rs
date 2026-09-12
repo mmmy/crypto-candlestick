@@ -6,6 +6,13 @@ use crypto_candlestick::memory::{ClosedKlineBuffer, LatestCache, MemorySeriesSto
 use crypto_candlestick::runtime_health::RuntimeHealth;
 use crypto_candlestick::storage::sqlite::SqliteStore;
 
+fn configured_target(symbol: &str, interval: &str) -> Vec<HealthTarget> {
+    vec![HealthTarget {
+        symbol: symbol.to_string(),
+        interval: interval.to_string(),
+    }]
+}
+
 #[tokio::test]
 async fn health_endpoint_returns_ok() {
     let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
@@ -444,7 +451,7 @@ async fn klines_endpoint_returns_persisted_rows() {
         latest: LatestCache::default(),
         memory_series: MemorySeriesStore::default(),
         closed_buffer: ClosedKlineBuffer::default(),
-        health_targets: Vec::new(),
+        health_targets: configured_target("BTCUSDT", "1"),
         runtime_health: RuntimeHealth::default(),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -493,6 +500,93 @@ async fn klines_endpoint_returns_persisted_rows() {
 }
 
 #[tokio::test]
+async fn public_data_endpoints_hide_unconfigured_internal_intervals() {
+    let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    for interval in ["5", "8"] {
+        store
+            .upsert_candle(
+                "UVXYUSDT",
+                interval,
+                &Candle {
+                    open_time: 0,
+                    close_time: 60_000,
+                    open: 18.0,
+                    high: 18.1,
+                    low: 17.9,
+                    close: 18.05,
+                    volume: 10.0,
+                    quote_volume: 180.5,
+                    trade_count: 3,
+                    is_closed: true,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    let app = router(AppState {
+        store,
+        latest: LatestCache::default(),
+        memory_series: MemorySeriesStore::default(),
+        closed_buffer: ClosedKlineBuffer::default(),
+        health_targets: configured_target("UVXYUSDT", "8"),
+        runtime_health: RuntimeHealth::default(),
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let response = reqwest::get(format!(
+        "http://{addr}/api/klines?symbol=UVXYUSDT&intervals=5,8&limit=10"
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["series"][0]["interval"], "5");
+    assert_eq!(body["series"][0]["startTime"], serde_json::Value::Null);
+    assert_eq!(body["series"][0]["endTime"], serde_json::Value::Null);
+    assert_eq!(body["series"][0]["count"], 0);
+    assert_eq!(body["series"][0]["data"], serde_json::json!([]));
+    assert_eq!(body["series"][1]["interval"], "8");
+    assert_eq!(body["series"][1]["count"], 1);
+
+    let response = reqwest::get(format!(
+        "http://{addr}/api/indicators/guaili?symbols=UVXYUSDT&intervals=5,8&limit=10"
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["results"][0]["series"][0]["interval"], "5");
+    assert_eq!(
+        body["results"][0]["series"][0]["startTime"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        body["results"][0]["series"][0]["endTime"],
+        serde_json::Value::Null
+    );
+    assert_eq!(body["results"][0]["series"][0]["count"], 0);
+    assert_eq!(
+        body["results"][0]["series"][0]["latest"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        body["results"][0]["series"][0]["data"],
+        serde_json::json!([])
+    );
+    assert_eq!(body["results"][0]["series"][1]["interval"], "8");
+    assert_eq!(body["results"][0]["series"][1]["count"], 1);
+
+    server.abort();
+}
+
+#[tokio::test]
 async fn guaili_endpoint_returns_latest_indicator_values_for_each_symbol() {
     let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
     for symbol in ["BTCUSDT", "ETHUSDT"] {
@@ -526,7 +620,16 @@ async fn guaili_endpoint_returns_latest_indicator_values_for_each_symbol() {
         latest: LatestCache::default(),
         memory_series: MemorySeriesStore::default(),
         closed_buffer: ClosedKlineBuffer::default(),
-        health_targets: Vec::new(),
+        health_targets: vec![
+            HealthTarget {
+                symbol: "BTCUSDT".to_string(),
+                interval: "1".to_string(),
+            },
+            HealthTarget {
+                symbol: "ETHUSDT".to_string(),
+                interval: "1".to_string(),
+            },
+        ],
         runtime_health: RuntimeHealth::default(),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -599,7 +702,7 @@ async fn guaili_endpoint_uses_history_even_when_response_limit_is_one() {
         latest: LatestCache::default(),
         memory_series: MemorySeriesStore::default(),
         closed_buffer: ClosedKlineBuffer::default(),
-        health_targets: Vec::new(),
+        health_targets: configured_target("BTCUSDT", "1"),
         runtime_health: RuntimeHealth::default(),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -758,7 +861,7 @@ async fn klines_endpoint_returns_buffered_closed_rows() {
         latest: LatestCache::default(),
         memory_series: MemorySeriesStore::default(),
         closed_buffer,
-        health_targets: Vec::new(),
+        health_targets: configured_target("BTCUSDT", "1"),
         runtime_health: RuntimeHealth::default(),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -866,7 +969,7 @@ async fn klines_endpoint_appends_latest_open_candle_from_memory() {
         latest,
         memory_series: MemorySeriesStore::default(),
         closed_buffer: ClosedKlineBuffer::default(),
-        health_targets: Vec::new(),
+        health_targets: configured_target("BTCUSDT", "1"),
         runtime_health: RuntimeHealth::default(),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -947,7 +1050,7 @@ async fn klines_endpoint_can_return_closed_rows_only() {
         latest,
         memory_series: MemorySeriesStore::default(),
         closed_buffer: ClosedKlineBuffer::default(),
-        health_targets: Vec::new(),
+        health_targets: configured_target("BTCUSDT", "1"),
         runtime_health: RuntimeHealth::default(),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1028,7 +1131,7 @@ async fn klines_endpoint_keeps_latest_contiguous_rows_after_a_gap() {
         latest,
         memory_series: MemorySeriesStore::default(),
         closed_buffer: ClosedKlineBuffer::default(),
-        health_targets: Vec::new(),
+        health_targets: configured_target("BTCUSDT", "1"),
         runtime_health: RuntimeHealth::default(),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1108,7 +1211,7 @@ async fn second_interval_query_reads_closed_rows_from_memory_not_sqlite() {
         latest,
         memory_series,
         closed_buffer: ClosedKlineBuffer::default(),
-        health_targets: Vec::new(),
+        health_targets: configured_target("BTCUSDT", "15S"),
         runtime_health: RuntimeHealth::default(),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1183,7 +1286,16 @@ async fn klines_endpoint_returns_multiple_intervals_in_request_order() {
         latest,
         memory_series,
         closed_buffer: ClosedKlineBuffer::default(),
-        health_targets: Vec::new(),
+        health_targets: vec![
+            HealthTarget {
+                symbol: "BTCUSDT".to_string(),
+                interval: "15S".to_string(),
+            },
+            HealthTarget {
+                symbol: "BTCUSDT".to_string(),
+                interval: "1".to_string(),
+            },
+        ],
         runtime_health: RuntimeHealth::default(),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

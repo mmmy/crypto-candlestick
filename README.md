@@ -210,6 +210,8 @@ GET /api/klines?symbol=BTCUSDT&intervals=1,5,15&limit=1000
 | `limit` | 否 | 返回数量，默认 `200` |
 | `closedOnly` | 否 | 设为 `true` 时只返回已收线 K 线，默认 `false` |
 
+只有该交易对在 `config.toml` 中配置的周期会返回 K 线和 guaili 信号。未配置周期仍返回 HTTP 200，但对应 `series` 的 `startTime`、`endTime` 为 `null`，`count` 为 `0`，`latest`（如有）为 `null`，`data` 为空数组；数据库中的内部基础周期不会通过公开数据接口暴露。
+
 响应示例：
 
 ```json

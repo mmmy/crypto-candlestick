@@ -726,6 +726,16 @@ async fn query_kline_series(
     closed_only: bool,
 ) -> Result<KlineSeries, (axum::http::StatusCode, String)> {
     let canonical_interval = interval.canonical();
+    if !is_configured_series(state, symbol, &canonical_interval) {
+        return Ok(KlineSeries {
+            interval: canonical_interval,
+            start_time: None,
+            end_time: None,
+            count: 0,
+            data: Vec::new(),
+        });
+    }
+
     let rows = query_kline_rows(
         state,
         symbol,
@@ -752,6 +762,14 @@ async fn query_kline_series(
         count: data.len(),
         data,
     })
+}
+
+fn is_configured_series(state: &AppState, symbol: &str, interval: &str) -> bool {
+    let normalized_symbol = symbol.trim().to_uppercase();
+    state
+        .health_targets
+        .iter()
+        .any(|target| target.symbol == normalized_symbol && target.interval == interval)
 }
 
 async fn query_kline_rows(
@@ -996,6 +1014,18 @@ pub async fn guaili(
         let mut series = Vec::with_capacity(intervals.len());
         for interval in &intervals {
             let canonical_interval = interval.canonical();
+            if !is_configured_series(&state, symbol, &canonical_interval) {
+                series.push(GuailiSeries {
+                    interval: canonical_interval,
+                    start_time: None,
+                    end_time: None,
+                    count: 0,
+                    latest: None,
+                    data: Vec::new(),
+                });
+                continue;
+            }
+
             let rows = query_kline_rows(
                 &state,
                 symbol,

@@ -1,6 +1,7 @@
 use crate::{
     binance::worker::{KlineSource, SubscriptionPlan},
     domain::{candle::Candle, interval::Interval},
+    engine::aggregator::TradeTick,
     storage::sqlite::SqliteStore,
 };
 use serde_json::Value;
@@ -12,6 +13,85 @@ const BINANCE_FAPI_BASE: &str = "https://fapi.binance.com";
 const MAX_KLINE_LIMIT: u32 = 1500;
 const DEFAULT_REBUILD_LIMIT: u32 = 1_000_000;
 const STARTUP_REFRESH_CLOSED_BARS: u32 = 2;
+const MAX_AGGREGATE_TRADE_LIMIT: i64 = 1_000;
+const MAX_RECOVERY_TRADES: i64 = 100_000;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct AggregateTrade {
+    pub id: i64,
+    pub tick: TradeTick,
+}
+
+/// Trade IDs identify the exact replay boundary, unlike a live candle's end time.
+pub(crate) async fn fetch_aggregate_trade_gap(
+    symbol: &str,
+    first_id: i64,
+    last_id: i64,
+) -> Result<Vec<AggregateTrade>, RestError> {
+    let client = reqwest::Client::new();
+    fetch_aggregate_trade_gap_from(&client, BINANCE_FAPI_BASE, symbol, first_id, last_id).await
+}
+
+async fn fetch_aggregate_trade_gap_from(
+    client: &reqwest::Client,
+    base_url: &str,
+    symbol: &str,
+    first_id: i64,
+    last_id: i64,
+) -> Result<Vec<AggregateTrade>, RestError> {
+    if first_id > last_id {
+        return Ok(Vec::new());
+    }
+    if first_id < 0 || last_id.saturating_sub(first_id) >= MAX_RECOVERY_TRADES {
+        return Err(RestError::InvalidAggregateTradeGap(first_id));
+    }
+    let mut next_id = first_id;
+    let mut trades = Vec::new();
+    loop {
+        let limit = (last_id - next_id + 1).min(MAX_AGGREGATE_TRADE_LIMIT);
+        let payload = client
+            .get(format!("{base_url}/fapi/v1/aggTrades"))
+            .query(&[
+                ("symbol", symbol.to_string()),
+                ("fromId", next_id.to_string()),
+                ("limit", limit.to_string()),
+            ])
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+        let rows = payload.as_array().ok_or(RestError::InvalidPayload)?;
+        if rows.is_empty() {
+            return Err(RestError::InvalidAggregateTradeGap(next_id));
+        }
+        for row in rows {
+            let id = row["a"].as_i64().ok_or(RestError::InvalidPayload)?;
+            if id != next_id {
+                return Err(RestError::InvalidAggregateTradeGap(next_id));
+            }
+            let price = string_number(&row["p"])?;
+            let quantity = string_number(&row["q"])?;
+            if !price.is_finite() || price <= 0.0 || !quantity.is_finite() || quantity <= 0.0 {
+                return Err(RestError::InvalidPayload);
+            }
+            trades.push(AggregateTrade {
+                id,
+                tick: TradeTick::new(
+                    row["T"].as_i64().ok_or(RestError::InvalidPayload)?,
+                    price,
+                    quantity,
+                ),
+            });
+            if id == last_id {
+                return Ok(trades);
+            }
+            next_id += 1;
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MissingKlineRange {
@@ -173,6 +253,8 @@ pub enum RestError {
     Storage(#[from] sqlx::Error),
     #[error("invalid kline payload")]
     InvalidPayload,
+    #[error("aggregate trade recovery is incomplete or too large at ID {0}")]
+    InvalidAggregateTradeGap(i64),
     #[error("invalid number: {0}")]
     Number(#[from] std::num::ParseFloatError),
 }
@@ -506,4 +588,118 @@ fn string_number(value: &Value) -> Result<f64, RestError> {
         .as_str()
         .ok_or(RestError::InvalidPayload)?
         .parse::<f64>()?)
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use axum::{extract::Query, routing::get, Json, Router};
+    use std::collections::HashMap;
+
+    async fn serve(app: Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (url, task)
+    }
+
+    async fn page(Query(query): Query<HashMap<String, String>>) -> Json<Value> {
+        assert_eq!(query["symbol"], "BTCUSDT");
+        assert!(!query.contains_key("startTime") && !query.contains_key("endTime"));
+        let first: i64 = query["fromId"].parse().unwrap();
+        let count: i64 = query["limit"].parse().unwrap();
+        assert!((1..=1_000).contains(&count));
+        // Short pages exercise pagination without thousands of fixtures.
+        Json(Value::Array(
+            (first..first + count.min(2))
+                .map(|id| serde_json::json!({"a": id, "p": "100", "q": "2", "T": id * 1_000}))
+                .collect(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn recovery_fetches_exact_id_range_across_short_pages() {
+        let (url, task) = serve(Router::new().route("/fapi/v1/aggTrades", get(page))).await;
+        let trades =
+            fetch_aggregate_trade_gap_from(&reqwest::Client::new(), &url, "BTCUSDT", 11, 15)
+                .await
+                .unwrap();
+        task.abort();
+        assert_eq!(
+            trades.iter().map(|trade| trade.id).collect::<Vec<_>>(),
+            vec![11, 12, 13, 14, 15]
+        );
+        assert_eq!(trades[0].tick, TradeTick::new(11_000, 100.0, 2.0));
+    }
+
+    #[tokio::test]
+    async fn recovery_rejects_missing_ids_instead_of_returning_partial_data() {
+        let (url, task) = serve(Router::new().route(
+            "/fapi/v1/aggTrades",
+            get(|| async {
+                Json(serde_json::json!([
+                    {"a": 11, "p": "100", "q": "2", "T": 11_000},
+                    {"a": 13, "p": "100", "q": "2", "T": 13_000}
+                ]))
+            }),
+        ))
+        .await;
+        let result =
+            fetch_aggregate_trade_gap_from(&reqwest::Client::new(), &url, "BTCUSDT", 11, 13).await;
+        task.abort();
+        assert!(matches!(
+            result,
+            Err(RestError::InvalidAggregateTradeGap(12))
+        ));
+    }
+
+    #[tokio::test]
+    async fn recovery_rejects_unavailable_or_invalid_trade_history() {
+        let (url, task) = serve(Router::new().route(
+            "/fapi/v1/aggTrades",
+            get(|| async { Json(serde_json::json!([])) }),
+        ))
+        .await;
+        let result =
+            fetch_aggregate_trade_gap_from(&reqwest::Client::new(), &url, "BTCUSDT", 11, 12).await;
+        task.abort();
+        assert!(matches!(
+            result,
+            Err(RestError::InvalidAggregateTradeGap(11))
+        ));
+        let (url, task) = serve(Router::new().route(
+            "/fapi/v1/aggTrades",
+            get(|| async {
+                Json(serde_json::json!([{"a": 11, "p": "NaN", "q": "2", "T": 11_000}]))
+            }),
+        ))
+        .await;
+        let result =
+            fetch_aggregate_trade_gap_from(&reqwest::Client::new(), &url, "BTCUSDT", 11, 11).await;
+        task.abort();
+        assert!(matches!(result, Err(RestError::InvalidPayload)));
+    }
+
+    #[tokio::test]
+    async fn empty_gap_and_recovery_limit_do_not_make_requests() {
+        let client = reqwest::Client::new();
+        let empty = fetch_aggregate_trade_gap_from(&client, "invalid://unused", "BTCUSDT", 12, 11)
+            .await
+            .unwrap();
+        assert!(empty.is_empty());
+        let result = fetch_aggregate_trade_gap_from(
+            &client,
+            "invalid://unused",
+            "BTCUSDT",
+            1,
+            MAX_RECOVERY_TRADES + 1,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(RestError::InvalidAggregateTradeGap(1))
+        ));
+    }
 }

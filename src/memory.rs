@@ -162,6 +162,13 @@ impl MemorySeriesStore {
         }
     }
 
+    pub async fn clear(&self, symbol: &str, interval: &str) {
+        self.inner
+            .write()
+            .await
+            .remove(&(symbol.to_uppercase(), interval.to_string()));
+    }
+
     pub async fn push_closed(&self, symbol: &str, interval: &str, mut candle: Candle) {
         candle.is_closed = true;
         let mut inner = self.inner.write().await;

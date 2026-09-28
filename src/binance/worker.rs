@@ -1,6 +1,9 @@
 use super::types::{parse_combined_stream_message, MarketEvent};
 use crate::{
-    binance::rest::sync_native_klines,
+    binance::rest::{
+        fetch_aggregate_trade_gap, refresh_startup_kline_tail, sync_native_klines, AggregateTrade,
+        RestError,
+    },
     config::{RealtimeSource, SymbolSubscription},
     domain::{candle::Candle, interval::Interval},
     engine::aggregator::{Aggregator, TradeTick},
@@ -217,6 +220,8 @@ pub struct BinanceWorker {
     flush_lock: FlushLock,
     kline_aggregators: HashMap<(String, String, String), Aggregator>,
     trade_aggregators: HashMap<(String, String), Aggregator>,
+    trade_cursors: HashMap<String, AggregateTrade>,
+    trade_recovery: HashMap<String, HashMap<(String, String), Aggregator>>,
     alert_last_sides: HashMap<i64, i8>,
 }
 
@@ -263,6 +268,8 @@ impl BinanceWorker {
             flush_lock,
             kline_aggregators,
             trade_aggregators,
+            trade_cursors: HashMap::new(),
+            trade_recovery: HashMap::new(),
             alert_last_sides: HashMap::new(),
         }
     }
@@ -291,23 +298,18 @@ impl BinanceWorker {
             match connect_async(&url).await {
                 Ok((ws, _)) => {
                     tracing::info!("connected to Binance websocket");
-                    self.runtime_health.mark_connected().await;
-                    backoff_secs = 1;
                     if should_catch_up_on_connect {
-                        flush_closed_buffer(&self.store, &self.closed_buffer, &self.flush_lock)
-                            .await;
-                        if let Err(err) =
-                            sync_native_klines(&self.store, &self.plan, self.sync_lookback_bars)
-                                .await
-                        {
+                        if let Err(err) = self.recover_on_connect().await {
                             tracing::warn!("websocket reconnect kline catch-up failed: {}", err);
+                            self.runtime_health.mark_disconnected(err.to_string()).await;
+                            sleep(Duration::from_secs(backoff_secs)).await;
+                            backoff_secs = (backoff_secs * 2).min(30);
+                            continue;
                         }
-                        self.reset_kline_aggregators();
-                        if let Err(err) = self.seed_kline_aggregators().await {
-                            tracing::warn!("failed to reseed kline aggregators: {}", err);
-                        }
-                    } else {
-                        should_catch_up_on_connect = true;
+                    }
+                    if self.trade_recovery.is_empty() {
+                        self.runtime_health.mark_connected().await;
+                        backoff_secs = 1;
                     }
                     let (_, mut read) = ws.split();
                     loop {
@@ -336,8 +338,37 @@ impl BinanceWorker {
                                 self.runtime_health.mark_message_now().await;
                                 if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text)
                                 {
+                                    let trade_id = value["data"]["a"].as_i64();
                                     if let Ok(event) = parse_combined_stream_message(value) {
-                                        self.handle_event(event).await;
+                                        if let MarketEvent::AggTrade { symbol, trade } = event {
+                                            let result = match trade_id {
+                                                Some(id) if id >= 0 => {
+                                                    self.handle_aggregate_trade(
+                                                        &symbol,
+                                                        AggregateTrade { id, tick: trade },
+                                                    )
+                                                    .await
+                                                }
+                                                _ => Err(RestError::InvalidPayload),
+                                            };
+                                            if let Err(err) = result {
+                                                tracing::warn!(
+                                                    symbol,
+                                                    "trade recovery failed: {}",
+                                                    err
+                                                );
+                                                self.runtime_health
+                                                    .mark_reconnecting(err.to_string())
+                                                    .await;
+                                                break;
+                                            }
+                                            if self.trade_recovery.is_empty() {
+                                                self.runtime_health.mark_connected().await;
+                                                backoff_secs = 1;
+                                            }
+                                        } else {
+                                            self.handle_event(event).await;
+                                        }
                                     }
                                 }
                             }
@@ -370,9 +401,138 @@ impl BinanceWorker {
                 }
             }
 
+            self.invalidate_trade_aggregators().await;
+            should_catch_up_on_connect = true;
             sleep(Duration::from_secs(backoff_secs)).await;
             backoff_secs = (backoff_secs * 2).min(30);
         }
+    }
+
+    async fn recover_on_connect(&mut self) -> Result<(), RestError> {
+        flush_closed_buffer(&self.store, &self.closed_buffer, &self.flush_lock).await;
+        refresh_startup_kline_tail(&self.store, &self.plan).await?;
+        sync_native_klines(&self.store, &self.plan, self.sync_lookback_bars).await?;
+        self.load_symbol_bucket_anchors().await?;
+        self.reset_kline_aggregators();
+        self.seed_kline_aggregators().await?;
+        // Cursor-backed symbols need exact ID replay; live REST candles would
+        // overlap the queued WebSocket trades and count their volume twice.
+        self.seed_trade_aggregators().await?;
+        Ok(())
+    }
+
+    async fn invalidate_trade_aggregators(&mut self) {
+        let symbols = self
+            .plan
+            .trade_targets()
+            .into_iter()
+            .map(|(symbol, _)| symbol)
+            .collect::<BTreeSet<_>>();
+        for symbol in symbols {
+            self.begin_trade_recovery(&symbol).await;
+        }
+        self.alert_last_sides.clear();
+    }
+
+    async fn begin_trade_recovery(&mut self, symbol: &str) {
+        if self.trade_cursors.contains_key(symbol) && !self.trade_recovery.contains_key(symbol) {
+            let prefix = self
+                .trade_aggregators
+                .iter()
+                .filter(|(key, _)| key.0 == symbol)
+                .map(|(key, agg)| (key.clone(), agg.clone()))
+                .collect();
+            self.trade_recovery.insert(symbol.to_string(), prefix);
+        }
+        for (key, agg) in &mut self.trade_aggregators {
+            if key.0 == symbol {
+                agg.reset();
+                self.latest.remove(symbol, &key.1).await;
+                if Interval::parse(&key.1)
+                    .map(|i| i.as_millis() < 60_000)
+                    .unwrap_or(false)
+                {
+                    self.memory_series.clear(symbol, &key.1).await;
+                }
+            }
+        }
+    }
+
+    async fn handle_aggregate_trade(
+        &mut self,
+        symbol: &str,
+        trade: AggregateTrade,
+    ) -> Result<(), RestError> {
+        if let Some(previous) = self.trade_cursors.get(symbol).copied() {
+            if trade.id <= previous.id {
+                return Ok(()); // WebSocket messages may overlap already replayed trades.
+            }
+            if trade.id != previous.id + 1 && !self.trade_recovery.contains_key(symbol) {
+                self.begin_trade_recovery(symbol).await;
+                self.runtime_health
+                    .mark_disconnected("aggregate trade ID gap")
+                    .await;
+            }
+            if self.trade_recovery.contains_key(symbol) {
+                let missing =
+                    fetch_aggregate_trade_gap(symbol, previous.id + 1, trade.id - 1).await?;
+                self.complete_trade_recovery(symbol, &missing, trade)
+                    .await?;
+                return Ok(());
+            }
+        }
+        self.handle_event(MarketEvent::AggTrade {
+            symbol: symbol.to_string(),
+            trade: trade.tick,
+        })
+        .await;
+        self.trade_cursors.insert(symbol.to_string(), trade);
+        Ok(())
+    }
+
+    async fn complete_trade_recovery(
+        &mut self,
+        symbol: &str,
+        missing: &[AggregateTrade],
+        live: AggregateTrade,
+    ) -> Result<(), RestError> {
+        let previous = self
+            .trade_cursors
+            .get(symbol)
+            .ok_or(RestError::InvalidPayload)?;
+        if live.id <= previous.id || missing.len() as i64 != live.id - previous.id - 1 {
+            return Err(RestError::InvalidAggregateTradeGap(previous.id + 1));
+        }
+        let mut expected_id = previous.id + 1;
+        let mut previous_time = previous.tick.timestamp_ms;
+        for trade in missing.iter().chain(std::iter::once(&live)) {
+            if trade.id != expected_id || trade.tick.timestamp_ms < previous_time {
+                return Err(RestError::InvalidAggregateTradeGap(expected_id));
+            }
+            previous_time = trade.tick.timestamp_ms;
+            if trade.id != live.id {
+                expected_id += 1;
+            }
+        }
+        let prefix = self
+            .trade_recovery
+            .remove(symbol)
+            .ok_or(RestError::InvalidPayload)?;
+        self.trade_aggregators.extend(prefix);
+        // Establish a fresh price-alert baseline instead of notifying on replay.
+        for trade in missing.iter().chain(std::iter::once(&live)) {
+            self.apply_trade(symbol, trade.tick).await;
+        }
+        self.trade_cursors.insert(symbol.to_string(), live);
+        self.alert_last_sides.clear();
+        self.evaluate_price_alerts(symbol, live.tick.price, live.tick.timestamp_ms)
+            .await;
+        tracing::info!(
+            symbol,
+            replayed_trades = missing.len(),
+            "trade aggregation recovered"
+        );
+        Ok(())
     }
 
     async fn handle_event(&mut self, event: MarketEvent) {
@@ -444,40 +604,40 @@ impl BinanceWorker {
             MarketEvent::AggTrade { symbol, trade } => {
                 self.evaluate_price_alerts(&symbol, trade.price, trade.timestamp_ms)
                     .await;
-                for (key, agg) in self.trade_aggregators.iter_mut() {
-                    if key.0 == symbol {
-                        if let Ok(Some(closed)) = agg.ingest_trade(TradeTick {
-                            timestamp_ms: trade.timestamp_ms,
-                            price: trade.price,
-                            quantity: trade.quantity,
-                        }) {
-                            if Interval::parse(&key.1)
-                                .map(|interval| interval.as_millis() < 60_000)
-                                .unwrap_or(false)
-                            {
-                                self.memory_series
-                                    .push_closed(&symbol, &key.1, closed)
-                                    .await;
-                            } else {
-                                let rows = self.closed_buffer.upsert(&symbol, &key.1, closed).await;
-                                if rows >= self.flush_max_rows {
-                                    flush_closed_buffer(
-                                        &self.store,
-                                        &self.closed_buffer,
-                                        &self.flush_lock,
-                                    )
-                                    .await;
-                                }
-                            }
-                            self.latest.remove(&symbol, &key.1).await;
-                        }
-                        if let Some(current) = agg.current() {
-                            self.latest.upsert(&symbol, &key.1, current).await;
-                        }
-                    }
-                }
+                self.apply_trade(&symbol, trade).await;
             }
             MarketEvent::Ignored => {}
+        }
+    }
+
+    async fn apply_trade(&mut self, symbol: &str, trade: TradeTick) {
+        for (key, agg) in self.trade_aggregators.iter_mut() {
+            if key.0 == symbol {
+                if let Ok(Some(closed)) = agg.ingest_trade(TradeTick {
+                    timestamp_ms: trade.timestamp_ms,
+                    price: trade.price,
+                    quantity: trade.quantity,
+                }) {
+                    if Interval::parse(&key.1)
+                        .map(|interval| interval.as_millis() < 60_000)
+                        .unwrap_or(false)
+                    {
+                        self.memory_series
+                            .push_closed(&symbol, &key.1, closed)
+                            .await;
+                    } else {
+                        let rows = self.closed_buffer.upsert(&symbol, &key.1, closed).await;
+                        if rows >= self.flush_max_rows {
+                            flush_closed_buffer(&self.store, &self.closed_buffer, &self.flush_lock)
+                                .await;
+                        }
+                    }
+                    self.latest.remove(&symbol, &key.1).await;
+                }
+                if let Some(current) = agg.current() {
+                    self.latest.upsert(&symbol, &key.1, current).await;
+                }
+            }
         }
     }
 
@@ -624,6 +784,11 @@ impl BinanceWorker {
 
     async fn seed_trade_aggregators(&mut self) -> Result<(), sqlx::Error> {
         for (key, agg) in self.trade_aggregators.iter_mut() {
+            if self.trade_recovery.contains_key(&key.0) {
+                continue;
+            }
+            agg.reset();
+            self.latest.remove(&key.0, &key.1).await;
             let Ok(target_interval) = Interval::parse(&key.1) else {
                 continue;
             };
@@ -631,7 +796,6 @@ impl BinanceWorker {
                 continue;
             }
 
-            self.latest.remove(&key.0, &key.1).await;
             let base_interval = target_interval
                 .aggregation_base()
                 .unwrap_or(target_interval);
@@ -764,6 +928,217 @@ pub async fn flush_closed_buffer(
 mod tests {
     use super::*;
     use crate::config::{RealtimeSource, SymbolSubscription};
+
+    async fn recovery_worker() -> BinanceWorker {
+        BinanceWorker::new(
+            SqliteStore::connect("sqlite::memory:").await.unwrap(),
+            LatestCache::default(),
+            MemorySeriesStore::default(),
+            ClosedKlineBuffer::default(),
+            RuntimeHealth::default(),
+            SubscriptionPlan::from_subscriptions(vec![SymbolSubscription::new(
+                "BTCUSDT",
+                vec![Interval::Seconds(15), Interval::Minutes(1)],
+                RealtimeSource::Trade,
+            )]),
+            1_500,
+            false,
+            usize::MAX,
+            Arc::new(Mutex::new(())),
+        )
+    }
+
+    fn aggregate_trade(id: i64, time: i64, price: f64, quantity: f64) -> AggregateTrade {
+        AggregateTrade {
+            id,
+            tick: TradeTick::new(time, price, quantity),
+        }
+    }
+
+    #[tokio::test]
+    async fn disconnect_removes_live_candles_and_seconds_history() {
+        let mut worker = recovery_worker().await;
+        worker
+            .handle_aggregate_trade("BTCUSDT", aggregate_trade(10, 1_000, 100.0, 2.0))
+            .await
+            .unwrap();
+        worker
+            .handle_aggregate_trade("BTCUSDT", aggregate_trade(11, 16_000, 101.0, 3.0))
+            .await
+            .unwrap();
+        assert_eq!(
+            worker
+                .memory_series
+                .query("BTCUSDT", "15S", None, None, 10)
+                .await
+                .len(),
+            1
+        );
+        worker.invalidate_trade_aggregators().await;
+        assert!(worker.latest.get("BTCUSDT", "1").await.is_none());
+        assert!(worker.latest.get("BTCUSDT", "15S").await.is_none());
+        assert!(worker
+            .memory_series
+            .query("BTCUSDT", "15S", None, None, 10)
+            .await
+            .is_empty());
+        assert!(worker
+            .trade_aggregators
+            .values()
+            .all(|agg| agg.current().is_none()));
+        assert!(worker.trade_recovery.contains_key("BTCUSDT"));
+        // Repeated failed connections must retain the original trusted prefix.
+        worker.invalidate_trade_aggregators().await;
+        assert_eq!(
+            worker.trade_recovery["BTCUSDT"][&("BTCUSDT".into(), "1".into())]
+                .current()
+                .unwrap()
+                .volume,
+            5.0
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_replays_missing_trades_and_deduplicates_live_overlap() {
+        let mut worker = recovery_worker().await;
+        worker
+            .handle_aggregate_trade("BTCUSDT", aggregate_trade(10, 1_000, 100.0, 2.0))
+            .await
+            .unwrap();
+        worker.invalidate_trade_aggregators().await;
+        // Simulate a REST-repaired minute already present in the database.
+        let repaired = Candle {
+            open_time: 0,
+            close_time: 59_999,
+            open: 100.0,
+            high: 150.0,
+            low: 80.0,
+            close: 80.0,
+            volume: 9.0,
+            quote_volume: 970.0,
+            trade_count: 3,
+            is_closed: true,
+        };
+        worker
+            .store
+            .upsert_candle("BTCUSDT", "1", &repaired)
+            .await
+            .unwrap();
+        let missing = vec![
+            aggregate_trade(11, 30_000, 150.0, 3.0),
+            aggregate_trade(12, 55_000, 80.0, 4.0),
+        ];
+        let live = aggregate_trade(13, 61_000, 101.0, 5.0);
+        worker
+            .complete_trade_recovery("BTCUSDT", &missing, live)
+            .await
+            .unwrap();
+        let rows = worker
+            .closed_buffer
+            .query("BTCUSDT", "1", None, None, 10)
+            .await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].candle, repaired);
+        worker
+            .handle_aggregate_trade("BTCUSDT", live)
+            .await
+            .unwrap();
+        assert_eq!(worker.latest.get("BTCUSDT", "1").await.unwrap().volume, 5.0);
+        flush_closed_buffer(&worker.store, &worker.closed_buffer, &worker.flush_lock).await;
+        assert_eq!(
+            worker
+                .store
+                .query_klines("BTCUSDT", "1", Some(0), Some(0), 1)
+                .await
+                .unwrap()[0]
+                .candle,
+            repaired
+        );
+        assert!(!worker.trade_recovery.contains_key("BTCUSDT"));
+    }
+
+    #[tokio::test]
+    async fn incomplete_replay_does_not_publish_or_modify_a_partial_bucket() {
+        let mut worker = recovery_worker().await;
+        worker
+            .handle_aggregate_trade("BTCUSDT", aggregate_trade(10, 1_000, 100.0, 2.0))
+            .await
+            .unwrap();
+        worker.invalidate_trade_aggregators().await;
+        let incomplete = vec![aggregate_trade(12, 30_000, 150.0, 3.0)];
+        assert!(worker
+            .complete_trade_recovery(
+                "BTCUSDT",
+                &incomplete,
+                aggregate_trade(13, 61_000, 101.0, 5.0)
+            )
+            .await
+            .is_err());
+        assert!(worker.latest.get("BTCUSDT", "1").await.is_none());
+        assert!(worker
+            .closed_buffer
+            .query("BTCUSDT", "1", None, None, 10)
+            .await
+            .is_empty());
+        assert_eq!(worker.trade_cursors["BTCUSDT"].id, 10);
+        assert!(worker.trade_recovery.contains_key("BTCUSDT"));
+    }
+
+    #[tokio::test]
+    async fn replay_uses_ids_to_preserve_distinct_trades_in_the_same_millisecond() {
+        let mut worker = recovery_worker().await;
+        worker
+            .handle_aggregate_trade("BTCUSDT", aggregate_trade(10, 1_000, 100.0, 2.0))
+            .await
+            .unwrap();
+        worker.invalidate_trade_aggregators().await;
+        let missing = vec![aggregate_trade(11, 1_000, 110.0, 3.0)];
+        worker
+            .complete_trade_recovery("BTCUSDT", &missing, aggregate_trade(12, 1_000, 90.0, 4.0))
+            .await
+            .unwrap();
+        let current = worker.latest.get("BTCUSDT", "1").await.unwrap();
+        assert_eq!(
+            (current.high, current.low, current.volume),
+            (110.0, 90.0, 9.0)
+        );
+        assert_eq!(current.trade_count, 3);
+    }
+
+    #[tokio::test]
+    async fn trade_seed_is_idempotent_and_clears_a_stale_bucket() {
+        let mut worker = recovery_worker().await;
+        let now = chrono::Utc::now().timestamp_millis();
+        let start = Interval::Minutes(1).bucket_start_ms(now);
+        let current = Candle {
+            open_time: start,
+            close_time: start + 59_999,
+            open: 100.0,
+            high: 120.0,
+            low: 90.0,
+            close: 110.0,
+            volume: 10.0,
+            quote_volume: 1_000.0,
+            trade_count: 10,
+            is_closed: false,
+        };
+        worker
+            .store
+            .upsert_candle("BTCUSDT", "1", &current)
+            .await
+            .unwrap();
+        worker
+            .apply_trade("BTCUSDT", TradeTick::new(start - 1_000, 999.0, 999.0))
+            .await;
+        worker.seed_trade_aggregators().await.unwrap();
+        worker.seed_trade_aggregators().await.unwrap();
+        assert_eq!(worker.latest.get("BTCUSDT", "1").await.unwrap(), current);
+        assert!(worker
+            .closed_buffer
+            .query("BTCUSDT", "1", None, None, 10)
+            .await
+            .is_empty());
+    }
 
     #[tokio::test]
     async fn closed_one_minute_klines_refresh_higher_interval_once_per_minute() {

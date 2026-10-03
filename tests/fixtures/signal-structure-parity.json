@@ -1,0 +1,1844 @@
+{
+  "version": 1,
+  "note": "Both repos use this exact fixture. Android closed eligibility is satisfied only in the test adapter so equal values/trends test the same structure rules; server input stays dynamic.",
+  "cases": [
+    {
+      "name": "positive_threshold_inclusive",
+      "evidence": [
+        {
+          "interval": "10S",
+          "availability": "ready",
+          "value": 10,
+          "guaili": 1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "15S",
+          "availability": "ready",
+          "value": 10,
+          "guaili": 1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "30S",
+          "availability": "ready",
+          "value": 10,
+          "guaili": 1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "45S",
+          "availability": "ready",
+          "value": 10,
+          "guaili": 1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "1",
+          "availability": "ready",
+          "value": 10,
+          "guaili": 1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        }
+      ],
+      "expectedAll": [
+        "extreme:positive[10S,15S,30S,45S,1]"
+      ],
+      "expectedCandidates": [
+        "extreme:positive[10S,15S,30S,45S,1]"
+      ],
+      "expectedWidget": [
+        "extreme:positive[10S,15S,30S,45S,1]"
+      ]
+    },
+    {
+      "name": "negative_threshold_inclusive",
+      "evidence": [
+        {
+          "interval": "10S",
+          "availability": "ready",
+          "value": -10,
+          "guaili": -1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "15S",
+          "availability": "ready",
+          "value": -10,
+          "guaili": -1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "30S",
+          "availability": "ready",
+          "value": -10,
+          "guaili": -1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "45S",
+          "availability": "ready",
+          "value": -10,
+          "guaili": -1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "1",
+          "availability": "ready",
+          "value": -10,
+          "guaili": -1,
+          "longTrend": false,
+          "shortTrend": true,
+          "historyCount": 60
+        }
+      ],
+      "expectedAll": [
+        "extreme:negative[10S,15S,30S,45S,1]"
+      ],
+      "expectedCandidates": [
+        "extreme:negative[10S,15S,30S,45S,1]"
+      ],
+      "expectedWidget": [
+        "extreme:negative[10S,15S,30S,45S,1]"
+      ]
+    },
+    {
+      "name": "four_levels_never_form_a_structure",
+      "evidence": [
+        {
+          "interval": "10S",
+          "availability": "ready",
+          "value": 10,
+          "guaili": 1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "15S",
+          "availability": "ready",
+          "value": 10,
+          "guaili": 1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "30S",
+          "availability": "ready",
+          "value": 10,
+          "guaili": 1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "45S",
+          "availability": "ready",
+          "value": 10,
+          "guaili": 1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        }
+      ],
+      "expectedAll": [],
+      "expectedCandidates": [],
+      "expectedWidget": []
+    },
+    {
+      "name": "compression_threshold_inclusive",
+      "evidence": [
+        {
+          "interval": "10S",
+          "availability": "ready",
+          "value": -2,
+          "guaili": -0.2,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "15S",
+          "availability": "ready",
+          "value": -1,
+          "guaili": -0.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "30S",
+          "availability": "ready",
+          "value": 0,
+          "guaili": 0,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "45S",
+          "availability": "ready",
+          "value": 1,
+          "guaili": 0.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "1",
+          "availability": "ready",
+          "value": 2,
+          "guaili": 0.2,
+          "longTrend": false,
+          "shortTrend": false,
+          "historyCount": 60
+        }
+      ],
+      "expectedAll": [
+        "compression:neutral[10S,15S,30S,45S,1]"
+      ],
+      "expectedCandidates": [
+        "compression:neutral[10S,15S,30S,45S,1]"
+      ],
+      "expectedWidget": [
+        "compression:neutral[10S,15S,30S,45S,1]"
+      ]
+    },
+    {
+      "name": "missing_period_is_an_adjacency_barrier",
+      "evidence": [
+        {
+          "interval": "10S",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "15S",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "30S",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "45S",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "1",
+          "availability": "missing",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "2",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "3",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "4",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "5",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        }
+      ],
+      "expectedAll": [],
+      "expectedCandidates": [],
+      "expectedWidget": []
+    },
+    {
+      "name": "filtered_period_is_an_adjacency_barrier",
+      "evidence": [
+        {
+          "interval": "10S",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "15S",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "30S",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "45S",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "1",
+          "availability": "filtered",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "2",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "3",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "4",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "5",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        }
+      ],
+      "expectedAll": [],
+      "expectedCandidates": [],
+      "expectedWidget": []
+    },
+    {
+      "name": "warming_up_period_is_an_adjacency_barrier",
+      "evidence": [
+        {
+          "interval": "10S",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "15S",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "30S",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "45S",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "1",
+          "availability": "warming_up",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "2",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "3",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "4",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "5",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        }
+      ],
+      "expectedAll": [],
+      "expectedCandidates": [],
+      "expectedWidget": []
+    },
+    {
+      "name": "stale_period_is_an_adjacency_barrier",
+      "evidence": [
+        {
+          "interval": "10S",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "15S",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "30S",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "45S",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "1",
+          "availability": "stale",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "2",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "3",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "4",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "5",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        }
+      ],
+      "expectedAll": [],
+      "expectedCandidates": [],
+      "expectedWidget": []
+    },
+    {
+      "name": "gap_period_is_an_adjacency_barrier",
+      "evidence": [
+        {
+          "interval": "10S",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "15S",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "30S",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "45S",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "1",
+          "availability": "gap",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "2",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "3",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "4",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "5",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        }
+      ],
+      "expectedAll": [],
+      "expectedCandidates": [],
+      "expectedWidget": []
+    },
+    {
+      "name": "recovering_period_is_an_adjacency_barrier",
+      "evidence": [
+        {
+          "interval": "10S",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "15S",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "30S",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "45S",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "1",
+          "availability": "recovering",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "2",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "3",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "4",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "5",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        }
+      ],
+      "expectedAll": [],
+      "expectedCandidates": [],
+      "expectedWidget": []
+    },
+    {
+      "name": "invalid_period_is_an_adjacency_barrier",
+      "evidence": [
+        {
+          "interval": "10S",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "15S",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "30S",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "45S",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "1",
+          "availability": "invalid",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "2",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "3",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "4",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "5",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        }
+      ],
+      "expectedAll": [],
+      "expectedCandidates": [],
+      "expectedWidget": []
+    },
+    {
+      "name": "same_direction_prefers_minimum_strength",
+      "evidence": [
+        {
+          "interval": "10S",
+          "availability": "ready",
+          "value": 10,
+          "guaili": 1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "15S",
+          "availability": "ready",
+          "value": 10,
+          "guaili": 1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "30S",
+          "availability": "ready",
+          "value": 10,
+          "guaili": 1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "45S",
+          "availability": "ready",
+          "value": 10,
+          "guaili": 1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "1",
+          "availability": "ready",
+          "value": 10,
+          "guaili": 1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "2",
+          "availability": "ready",
+          "value": 3,
+          "guaili": 0.3,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "3",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "4",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "5",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "8",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "10",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        }
+      ],
+      "expectedAll": [
+        "extreme:positive[10S,15S,30S,45S,1]",
+        "extreme:positive[3,4,5,8,10]"
+      ],
+      "expectedCandidates": [
+        "extreme:positive[3,4,5,8,10]"
+      ],
+      "expectedWidget": [
+        "extreme:positive[3,4,5,8,10]"
+      ]
+    },
+    {
+      "name": "longer_run_precedes_stronger_run",
+      "evidence": [
+        {
+          "interval": "10S",
+          "availability": "ready",
+          "value": 10,
+          "guaili": 1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "15S",
+          "availability": "ready",
+          "value": 10,
+          "guaili": 1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "30S",
+          "availability": "ready",
+          "value": 10,
+          "guaili": 1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "45S",
+          "availability": "ready",
+          "value": 10,
+          "guaili": 1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "1",
+          "availability": "ready",
+          "value": 10,
+          "guaili": 1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "2",
+          "availability": "ready",
+          "value": 10,
+          "guaili": 1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "3",
+          "availability": "ready",
+          "value": 3,
+          "guaili": 0.3,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "4",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "5",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "8",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "10",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "15",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        }
+      ],
+      "expectedAll": [
+        "extreme:positive[10S,15S,30S,45S,1,2]",
+        "extreme:positive[4,5,8,10,15]"
+      ],
+      "expectedCandidates": [
+        "extreme:positive[10S,15S,30S,45S,1,2]"
+      ],
+      "expectedWidget": [
+        "extreme:positive[10S,15S,30S,45S,1,2]"
+      ]
+    },
+    {
+      "name": "conflict_selects_longest_anchor_hides_extremes_and_keeps_compression",
+      "evidence": [
+        {
+          "interval": "10S",
+          "availability": "ready",
+          "value": 10,
+          "guaili": 1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "15S",
+          "availability": "ready",
+          "value": 10,
+          "guaili": 1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "30S",
+          "availability": "ready",
+          "value": 10,
+          "guaili": 1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "45S",
+          "availability": "ready",
+          "value": 10,
+          "guaili": 1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "1",
+          "availability": "ready",
+          "value": 10,
+          "guaili": 1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "2",
+          "availability": "ready",
+          "value": -10,
+          "guaili": -1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "3",
+          "availability": "ready",
+          "value": -10,
+          "guaili": -1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "4",
+          "availability": "ready",
+          "value": -10,
+          "guaili": -1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "5",
+          "availability": "ready",
+          "value": -10,
+          "guaili": -1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "8",
+          "availability": "ready",
+          "value": -10,
+          "guaili": -1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "10",
+          "availability": "ready",
+          "value": 0,
+          "guaili": 0,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "15",
+          "availability": "ready",
+          "value": 0,
+          "guaili": 0,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "20",
+          "availability": "ready",
+          "value": 0,
+          "guaili": 0,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "30",
+          "availability": "ready",
+          "value": 0,
+          "guaili": 0,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "45",
+          "availability": "ready",
+          "value": 0,
+          "guaili": 0,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "60",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "90",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "120",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "180",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "240",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        }
+      ],
+      "expectedAll": [
+        "conflict:positive[10S,15S,30S,45S,1]>negative[2,3,4,5,8]",
+        "conflict:negative[2,3,4,5,8]>positive[60,90,120,180,240]",
+        "extreme:positive[10S,15S,30S,45S,1]",
+        "extreme:negative[2,3,4,5,8]",
+        "extreme:positive[60,90,120,180,240]",
+        "compression:neutral[10,15,20,30,45]"
+      ],
+      "expectedCandidates": [
+        "conflict:negative[2,3,4,5,8]>positive[60,90,120,180,240]",
+        "extreme:positive[60,90,120,180,240]",
+        "extreme:negative[2,3,4,5,8]",
+        "compression:neutral[10,15,20,30,45]"
+      ],
+      "expectedWidget": [
+        "conflict:negative[2,3,4,5,8]>positive[60,90,120,180,240]",
+        "compression:neutral[10,15,20,30,45]"
+      ]
+    },
+    {
+      "name": "conflict_total_levels_precede_later_anchor",
+      "evidence": [
+        {
+          "interval": "10S",
+          "availability": "ready",
+          "value": 10,
+          "guaili": 1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "15S",
+          "availability": "ready",
+          "value": 10,
+          "guaili": 1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "30S",
+          "availability": "ready",
+          "value": 10,
+          "guaili": 1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "45S",
+          "availability": "ready",
+          "value": 10,
+          "guaili": 1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "1",
+          "availability": "ready",
+          "value": 10,
+          "guaili": 1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "2",
+          "availability": "ready",
+          "value": 10,
+          "guaili": 1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "3",
+          "availability": "ready",
+          "value": -10,
+          "guaili": -1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "4",
+          "availability": "ready",
+          "value": -10,
+          "guaili": -1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "5",
+          "availability": "ready",
+          "value": -10,
+          "guaili": -1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "8",
+          "availability": "ready",
+          "value": -10,
+          "guaili": -1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "10",
+          "availability": "ready",
+          "value": -10,
+          "guaili": -1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "15",
+          "availability": "ready",
+          "value": 0,
+          "guaili": 0,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "20",
+          "availability": "ready",
+          "value": 0,
+          "guaili": 0,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "30",
+          "availability": "ready",
+          "value": 0,
+          "guaili": 0,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "45",
+          "availability": "ready",
+          "value": 0,
+          "guaili": 0,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "60",
+          "availability": "ready",
+          "value": 0,
+          "guaili": 0,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "90",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "120",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "180",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "240",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "360",
+          "availability": "ready",
+          "value": 11,
+          "guaili": 1.1,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        }
+      ],
+      "expectedAll": [
+        "conflict:positive[10S,15S,30S,45S,1,2]>negative[3,4,5,8,10]",
+        "conflict:negative[3,4,5,8,10]>positive[90,120,180,240,360]",
+        "extreme:positive[10S,15S,30S,45S,1,2]",
+        "extreme:negative[3,4,5,8,10]",
+        "extreme:positive[90,120,180,240,360]",
+        "compression:neutral[15,20,30,45,60]"
+      ],
+      "expectedCandidates": [
+        "conflict:positive[10S,15S,30S,45S,1,2]>negative[3,4,5,8,10]",
+        "extreme:positive[10S,15S,30S,45S,1,2]",
+        "extreme:negative[3,4,5,8,10]",
+        "compression:neutral[15,20,30,45,60]"
+      ],
+      "expectedWidget": [
+        "conflict:positive[10S,15S,30S,45S,1,2]>negative[3,4,5,8,10]",
+        "compression:neutral[15,20,30,45,60]"
+      ]
+    },
+    {
+      "name": "compression_uses_unrounded_guaili_maximum",
+      "evidence": [
+        {
+          "interval": "10S",
+          "availability": "ready",
+          "value": 0,
+          "guaili": 0.01,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "15S",
+          "availability": "ready",
+          "value": 0,
+          "guaili": 0.01,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "30S",
+          "availability": "ready",
+          "value": 0,
+          "guaili": 0.01,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "45S",
+          "availability": "ready",
+          "value": 0,
+          "guaili": 0.01,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "1",
+          "availability": "ready",
+          "value": 0,
+          "guaili": 0.01,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "2",
+          "availability": "ready",
+          "value": 3,
+          "guaili": 0.3,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "3",
+          "availability": "ready",
+          "value": 0,
+          "guaili": 0.09,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "4",
+          "availability": "ready",
+          "value": 0,
+          "guaili": 0.09,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "5",
+          "availability": "ready",
+          "value": 0,
+          "guaili": 0.09,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "8",
+          "availability": "ready",
+          "value": 0,
+          "guaili": 0.09,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "10",
+          "availability": "ready",
+          "value": 0,
+          "guaili": 0.09,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        }
+      ],
+      "expectedAll": [
+        "compression:neutral[10S,15S,30S,45S,1]",
+        "compression:neutral[3,4,5,8,10]"
+      ],
+      "expectedCandidates": [
+        "compression:neutral[10S,15S,30S,45S,1]"
+      ],
+      "expectedWidget": [
+        "compression:neutral[10S,15S,30S,45S,1]"
+      ]
+    },
+    {
+      "name": "compression_uses_mean_after_equal_maximum",
+      "evidence": [
+        {
+          "interval": "10S",
+          "availability": "ready",
+          "value": 2,
+          "guaili": 0.2,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "15S",
+          "availability": "ready",
+          "value": 2,
+          "guaili": 0.2,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "30S",
+          "availability": "ready",
+          "value": 2,
+          "guaili": 0.2,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "45S",
+          "availability": "ready",
+          "value": 2,
+          "guaili": 0.2,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "1",
+          "availability": "ready",
+          "value": 2,
+          "guaili": 0.2,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "2",
+          "availability": "ready",
+          "value": 3,
+          "guaili": 0.3,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "3",
+          "availability": "ready",
+          "value": 2,
+          "guaili": 0.2,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "4",
+          "availability": "ready",
+          "value": 0,
+          "guaili": 0,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "5",
+          "availability": "ready",
+          "value": 0,
+          "guaili": 0,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "8",
+          "availability": "ready",
+          "value": 0,
+          "guaili": 0,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "10",
+          "availability": "ready",
+          "value": 0,
+          "guaili": 0,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        }
+      ],
+      "expectedAll": [
+        "compression:neutral[10S,15S,30S,45S,1]",
+        "compression:neutral[3,4,5,8,10]"
+      ],
+      "expectedCandidates": [
+        "compression:neutral[3,4,5,8,10]"
+      ],
+      "expectedWidget": [
+        "compression:neutral[3,4,5,8,10]"
+      ]
+    },
+    {
+      "name": "compression_later_anchor_breaks_exact_statistic_tie",
+      "evidence": [
+        {
+          "interval": "10S",
+          "availability": "ready",
+          "value": 0,
+          "guaili": 0,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "15S",
+          "availability": "ready",
+          "value": 0,
+          "guaili": 0,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "30S",
+          "availability": "ready",
+          "value": 0,
+          "guaili": 0,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "45S",
+          "availability": "ready",
+          "value": 0,
+          "guaili": 0,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "1",
+          "availability": "ready",
+          "value": 0,
+          "guaili": 0,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "2",
+          "availability": "ready",
+          "value": 3,
+          "guaili": 0.3,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "3",
+          "availability": "ready",
+          "value": 0,
+          "guaili": 0,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "4",
+          "availability": "ready",
+          "value": 0,
+          "guaili": 0,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "5",
+          "availability": "ready",
+          "value": 0,
+          "guaili": 0,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "8",
+          "availability": "ready",
+          "value": 0,
+          "guaili": 0,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        },
+        {
+          "interval": "10",
+          "availability": "ready",
+          "value": 0,
+          "guaili": 0,
+          "longTrend": true,
+          "shortTrend": false,
+          "historyCount": 60
+        }
+      ],
+      "expectedAll": [
+        "compression:neutral[10S,15S,30S,45S,1]",
+        "compression:neutral[3,4,5,8,10]"
+      ],
+      "expectedCandidates": [
+        "compression:neutral[3,4,5,8,10]"
+      ],
+      "expectedWidget": [
+        "compression:neutral[3,4,5,8,10]"
+      ]
+    }
+  ]
+}

@@ -9,11 +9,13 @@ pub enum MarketEvent {
     OpenKline {
         symbol: String,
         interval: String,
+        event_time_ms: i64,
         candle: Candle,
     },
     ClosedKline {
         symbol: String,
         interval: String,
+        event_time_ms: i64,
         candle: Candle,
     },
     AggTrade {
@@ -52,7 +54,7 @@ enum StreamEvent {
 #[derive(Debug, Deserialize)]
 struct KlineEvent {
     #[serde(rename = "E")]
-    _event_time: i64,
+    event_time: i64,
     #[serde(rename = "s")]
     symbol: String,
     #[serde(rename = "k")]
@@ -119,6 +121,7 @@ pub fn parse_combined_stream_message(
                 MarketEvent::ClosedKline {
                     symbol: event.symbol,
                     interval,
+                    event_time_ms: event.event_time,
                     candle: Candle {
                         open_time: k.open_time,
                         close_time: k.close_time,
@@ -136,6 +139,7 @@ pub fn parse_combined_stream_message(
                 MarketEvent::OpenKline {
                     symbol: event.symbol,
                     interval,
+                    event_time_ms: event.event_time,
                     candle: Candle {
                         open_time: k.open_time,
                         close_time: k.close_time,

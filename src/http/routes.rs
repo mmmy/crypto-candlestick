@@ -27,6 +27,14 @@ pub struct HealthTarget {
 }
 
 pub fn router(state: AppState) -> Router {
+    let signals = crate::signals::service::SignalService::new(state.clone(), "signals.toml".into());
+    router_with_signals(state, signals)
+}
+
+pub fn router_with_signals(
+    state: AppState,
+    signals: crate::signals::service::SignalService,
+) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/health/summary", get(health_summary))
@@ -43,4 +51,5 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/alerts/:id/events", get(alert_events))
         .with_state(state)
+        .merge(super::signals::routes(signals))
 }

@@ -5,7 +5,7 @@ use crate::{
     storage::sqlite::SqliteStore,
 };
 use serde_json::Value;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -401,6 +401,191 @@ pub async fn refresh_startup_kline_tail(
     Ok(())
 }
 
+/// Initial history synchronization can finish minutes after the first symbol
+/// was fetched. Repair only this symbol's missing *closed* tail at the first
+/// observed trade's minute boundary; dynamic REST candles remain excluded.
+pub(crate) async fn refresh_trade_bootstrap_history(
+    store: &SqliteStore,
+    plan: &SubscriptionPlan,
+    symbol: &str,
+    closed_before_ms: i64,
+    lookback_bars: u32,
+) -> Result<(), RestError> {
+    refresh_trade_bootstrap_history_from(
+        &reqwest::Client::new(),
+        BINANCE_FAPI_BASE,
+        store,
+        plan,
+        symbol,
+        closed_before_ms,
+        lookback_bars,
+    )
+    .await
+}
+
+async fn refresh_trade_bootstrap_history_from(
+    client: &reqwest::Client,
+    base_url: &str,
+    store: &SqliteStore,
+    plan: &SubscriptionPlan,
+    symbol: &str,
+    closed_before_ms: i64,
+    lookback_bars: u32,
+) -> Result<(), RestError> {
+    let mut repaired_starts = BTreeMap::<String, i64>::new();
+    for source in plan
+        .kline_sources()
+        .into_iter()
+        .filter(|source| source.symbol == symbol)
+    {
+        let anchor_ms = source_bucket_anchor(store, &source).await?;
+        let (window_start, window_end) = closed_lookback_window_with_anchor(
+            &source.interval,
+            lookback_bars,
+            closed_before_ms,
+            anchor_ms,
+        );
+        let mut rows = store
+            .query_klines(
+                symbol,
+                &source.canonical_interval,
+                Some(window_start),
+                Some(window_end),
+                lookback_bars.max(1),
+            )
+            .await?;
+        // Native multi-day history can legitimately change phase. Only the
+        // latest uninterrupted phase suffix belongs to this closed window.
+        // Merely filtering wrong-phase rows can expose an older, coincidentally
+        // matching phase and request a false gap across years of other phases.
+        if let Some(barrier) = rows.iter().rposition(|row| {
+            (row.candle.open_time - window_start) % source.interval.as_millis() as i64 != 0
+        }) {
+            rows.drain(..=barrier);
+        }
+        if rows.is_empty() {
+            // An absent source may predate this contract's listing. Do not
+            // repeat startup's entire history request or prevent healthy
+            // periods from bootstrapping; quality gating keeps it unknown.
+            continue;
+        }
+        // Do not request unavailable pre-listing history again on each symbol
+        // bootstrap. Startup synchronization already owns the full lookback.
+        let repair_start = rows
+            .first()
+            .map_or(window_start, |row| row.candle.open_time);
+        let closed_open_times = rows
+            .iter()
+            .filter(|row| row.candle.is_closed && row.candle.close_time < closed_before_ms)
+            .map(|row| row.candle.open_time)
+            .collect::<Vec<_>>();
+        let ranges = detect_missing_kline_ranges(
+            repair_start,
+            window_end,
+            source.interval.as_millis() as i64,
+            &closed_open_times,
+        );
+        for range in ranges {
+            repaired_starts
+                .entry(source.canonical_interval.clone())
+                .and_modify(|start| *start = (*start).min(range.start_open_time))
+                .or_insert(range.start_open_time);
+            for page in plan_rest_kline_pages(&range) {
+                let candles = fetch_klines_page_from(
+                    client,
+                    base_url,
+                    symbol,
+                    source.binance_interval,
+                    page.start_time,
+                    page.end_time,
+                    page.limit,
+                )
+                .await
+                .map_err(|error| {
+                    tracing::warn!(
+                        symbol,
+                        interval = source.canonical_interval,
+                        start_time = page.start_time,
+                        end_time = page.end_time,
+                        closed_before_ms,
+                        "bootstrap closed-history request failed: {error}"
+                    );
+                    error
+                })?;
+                let mut closed_candles = Vec::new();
+                for candle in candles {
+                    if candle.close_time >= closed_before_ms
+                        || candle.open_time < page.start_time
+                        || candle.open_time > page.end_time
+                    {
+                        // REST uses open-time bounds. A returned dynamic or
+                        // neighboring edge bucket is ordinary unavailable
+                        // history, not a reason to restart every symbol.
+                        tracing::debug!(
+                            symbol,
+                            interval = source.canonical_interval,
+                            start_time = page.start_time,
+                            end_time = page.end_time,
+                            open_time = candle.open_time,
+                            close_time = candle.close_time,
+                            closed_before_ms,
+                            "excluded bootstrap REST boundary candle"
+                        );
+                        continue;
+                    }
+                    if (candle.open_time - page.start_time) % range.interval_ms != 0
+                        || candle.close_time != candle.open_time + range.interval_ms - 1
+                    {
+                        tracing::warn!(
+                            symbol,
+                            interval = source.canonical_interval,
+                            start_time = page.start_time,
+                            end_time = page.end_time,
+                            open_time = candle.open_time,
+                            close_time = candle.close_time,
+                            expected_interval_ms = range.interval_ms,
+                            "bootstrap REST closed candle has incompatible alignment or duration"
+                        );
+                        return Err(RestError::InvalidPayload);
+                    }
+                    closed_candles.push(candle);
+                }
+                store
+                    .upsert_candles(symbol, &source.canonical_interval, &closed_candles)
+                    .await?;
+            }
+        }
+    }
+    for (target_symbol, base, target) in plan.aggregation_targets() {
+        if target_symbol != symbol {
+            continue;
+        }
+        let Some(affected_start) = repaired_starts.get(&base) else {
+            continue;
+        };
+        let base_interval = Interval::parse(&base).map_err(|_| RestError::InvalidPayload)?;
+        let target_interval = Interval::parse(&target).map_err(|_| RestError::InvalidPayload)?;
+        let rebuild_start = target_interval.bucket_start_ms(*affected_start);
+        let limit = ((closed_before_ms - rebuild_start).max(0) / base_interval.as_millis() as i64
+            + 1) as u32;
+        let rows = store
+            .query_klines(
+                symbol,
+                &base,
+                Some(rebuild_start),
+                Some(closed_before_ms - 1),
+                limit.max(1),
+            )
+            .await?
+            .into_iter()
+            .filter(|row| row.candle.is_closed && row.candle.close_time < closed_before_ms)
+            .collect();
+        let candles = aggregate_complete_custom_klines(rows, base_interval, target_interval);
+        store.upsert_candles(symbol, &target, &candles).await?;
+    }
+    Ok(())
+}
+
 async fn source_bucket_anchor(
     store: &SqliteStore,
     source: &KlineSource,
@@ -545,8 +730,29 @@ async fn fetch_klines_page(
     end_time: i64,
     limit: u32,
 ) -> Result<Vec<Candle>, RestError> {
+    fetch_klines_page_from(
+        client,
+        BINANCE_FAPI_BASE,
+        symbol,
+        interval,
+        start_time,
+        end_time,
+        limit,
+    )
+    .await
+}
+
+async fn fetch_klines_page_from(
+    client: &reqwest::Client,
+    base_url: &str,
+    symbol: &str,
+    interval: &str,
+    start_time: i64,
+    end_time: i64,
+    limit: u32,
+) -> Result<Vec<Candle>, RestError> {
     let payload = client
-        .get(format!("{BINANCE_FAPI_BASE}/fapi/v1/klines"))
+        .get(format!("{base_url}/fapi/v1/klines"))
         .query(&[
             ("symbol", symbol.to_string()),
             ("interval", interval.to_string()),
@@ -554,6 +760,7 @@ async fn fetch_klines_page(
             ("endTime", end_time.to_string()),
             ("limit", limit.min(MAX_KLINE_LIMIT).to_string()),
         ])
+        .timeout(Duration::from_secs(10))
         .send()
         .await?
         .error_for_status()?
@@ -603,6 +810,352 @@ mod recovery_tests {
             axum::serve(listener, app).await.unwrap();
         });
         (url, task)
+    }
+
+    fn bootstrap_history_candle(open_time: i64, interval: Interval, closed: bool) -> Candle {
+        Candle {
+            open_time,
+            close_time: open_time + interval.as_millis() as i64 - 1,
+            open: 100.0,
+            high: 110.0,
+            low: 90.0,
+            close: 105.0,
+            volume: 2.0,
+            quote_volume: 200.0,
+            trade_count: 3,
+            is_closed: closed,
+        }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_repairs_only_symbol_closed_gaps_and_rebuilds_custom_tail() {
+        use crate::config::{RealtimeSource, SymbolSubscription};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let plan = SubscriptionPlan::from_subscriptions(vec![
+            SymbolSubscription::new(
+                "BTCUSDT",
+                vec![
+                    Interval::Minutes(1),
+                    Interval::Minutes(2),
+                    Interval::Minutes(5),
+                    Interval::Minutes(15),
+                ],
+                RealtimeSource::Trade,
+            ),
+            SymbolSubscription::new(
+                "ETHUSDT",
+                vec![Interval::Minutes(1), Interval::Minutes(5)],
+                RealtimeSource::Trade,
+            ),
+        ]);
+        for index in -80..4 {
+            store
+                .upsert_candle(
+                    "BTCUSDT",
+                    "1",
+                    &bootstrap_history_candle(index * 60_000, Interval::Minutes(1), true),
+                )
+                .await
+                .unwrap();
+        }
+        for index in -80..0 {
+            store
+                .upsert_candle(
+                    "BTCUSDT",
+                    "5",
+                    &bootstrap_history_candle(index * 300_000, Interval::Minutes(5), true),
+                )
+                .await
+                .unwrap();
+        }
+        // Old REST current rows now lie before the first WS minute cutoff.
+        // Open-time presence alone must not count them as closed history.
+        store
+            .upsert_candle(
+                "BTCUSDT",
+                "1",
+                &bootstrap_history_candle(240_000, Interval::Minutes(1), false),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_candle(
+                "BTCUSDT",
+                "5",
+                &bootstrap_history_candle(0, Interval::Minutes(5), false),
+            )
+            .await
+            .unwrap();
+        rebuild_custom_klines(&store, &plan, 1000).await.unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let request_count = requests.clone();
+        let router = Router::new().route(
+            "/fapi/v1/klines",
+            get(move |Query(query): Query<HashMap<String, String>>| {
+                let count = request_count.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(query["symbol"], "BTCUSDT");
+                    let start: i64 = query["startTime"].parse().unwrap();
+                    let end: i64 = query["endTime"].parse().unwrap();
+                    let limit: i64 = query["limit"].parse().unwrap();
+                    let duration = match query["interval"].as_str() {
+                        "1m" => {
+                            assert_eq!((start, end, limit), (240_000, 359_999, 2));
+                            60_000
+                        }
+                        "5m" => {
+                            assert_eq!((start, end, limit), (0, 299_999, 1));
+                            300_000
+                        }
+                        other => panic!("unexpected healthy-source request {other}"),
+                    };
+                    Json(Value::Array(
+                        (0..limit)
+                            .map(|index| {
+                                let open = start + index * duration;
+                                serde_json::json!([
+                                    open,
+                                    "100",
+                                    "110",
+                                    "90",
+                                    "105",
+                                    "2",
+                                    open + duration - 1,
+                                    "200",
+                                    3
+                                ])
+                            })
+                            .collect(),
+                    ))
+                }
+            }),
+        );
+        let (url, task) = serve(router).await;
+        refresh_trade_bootstrap_history_from(
+            &reqwest::Client::new(),
+            &url,
+            &store,
+            &plan,
+            "BTCUSDT",
+            360_000,
+            100,
+        )
+        .await
+        .unwrap();
+        task.abort();
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        let minute_rows = store
+            .query_klines("BTCUSDT", "1", None, Some(359_999), 100)
+            .await
+            .unwrap();
+        assert_eq!(minute_rows.len(), 86);
+        assert!(minute_rows.iter().all(|row| row.candle.is_closed));
+        assert!(minute_rows
+            .windows(2)
+            .all(|pair| pair[1].candle.open_time - pair[0].candle.open_time == 60_000));
+        let custom = store
+            .query_klines("BTCUSDT", "2", Some(240_000), Some(240_000), 1)
+            .await
+            .unwrap();
+        assert_eq!(custom.len(), 1);
+        assert_eq!(custom[0].candle.volume, 4.0);
+        assert!(custom[0].candle.is_closed);
+        assert!(store
+            .query_klines("ETHUSDT", "1", None, None, 100)
+            .await
+            .unwrap()
+            .is_empty());
+        // An up-to-date symbol requires no extra REST calls at all.
+        refresh_trade_bootstrap_history_from(
+            &reqwest::Client::new(),
+            "invalid://unused",
+            &store,
+            &plan,
+            "BTCUSDT",
+            360_000,
+            100,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn bootstrap_does_not_accept_dynamic_or_out_of_range_rest_history() {
+        use crate::config::{RealtimeSource, SymbolSubscription};
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let plan = SubscriptionPlan::from_subscriptions(vec![SymbolSubscription::new(
+            "BTCUSDT",
+            vec![Interval::Minutes(1)],
+            RealtimeSource::Trade,
+        )]);
+        store
+            .upsert_candle(
+                "BTCUSDT",
+                "1",
+                &bootstrap_history_candle(0, Interval::Minutes(1), true),
+            )
+            .await
+            .unwrap();
+        let (url, task) = serve(Router::new().route(
+            "/fapi/v1/klines",
+            get(|| async {
+                // The required 60k candle is replaced by the unclosed 120k one.
+                Json(serde_json::json!([[
+                    120000, "100", "110", "90", "105", "2", 179999, "200", 3
+                ]]))
+            }),
+        ))
+        .await;
+        let result = refresh_trade_bootstrap_history_from(
+            &reqwest::Client::new(),
+            &url,
+            &store,
+            &plan,
+            "BTCUSDT",
+            120_000,
+            2,
+        )
+        .await;
+        task.abort();
+        assert!(result.is_ok());
+        assert_eq!(
+            store
+                .query_klines("BTCUSDT", "1", None, None, 100)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_excludes_current_rest_edge_without_reconnecting() {
+        use crate::config::{RealtimeSource, SymbolSubscription};
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let plan = SubscriptionPlan::from_subscriptions(vec![SymbolSubscription::new(
+            "BTCUSDT",
+            vec![Interval::Minutes(5)],
+            RealtimeSource::Trade,
+        )]);
+        store
+            .upsert_candle(
+                "BTCUSDT",
+                "5",
+                &bootstrap_history_candle(0, Interval::Minutes(5), false),
+            )
+            .await
+            .unwrap();
+        let (url, task) = serve(Router::new().route(
+            "/fapi/v1/klines",
+            get(|Query(query): Query<HashMap<String, String>>| async move {
+                assert_eq!(query["interval"], "5m");
+                assert_eq!(query["startTime"], "0");
+                assert_eq!(query["endTime"], "299999");
+                Json(serde_json::json!([
+                    [0, "100", "110", "90", "105", "2", 299999, "200", 3],
+                    [300000, "100", "110", "90", "105", "2", 599999, "200", 3]
+                ]))
+            }),
+        ))
+        .await;
+        refresh_trade_bootstrap_history_from(
+            &reqwest::Client::new(),
+            &url,
+            &store,
+            &plan,
+            "BTCUSDT",
+            360_000,
+            3,
+        )
+        .await
+        .unwrap();
+        task.abort();
+        let stored = store
+            .query_klines("BTCUSDT", "5", None, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        assert!(stored[0].candle.is_closed);
+        assert_eq!(stored[0].candle.open_time, 0);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_repairs_only_latest_phase_suffix_even_if_older_phase_matches() {
+        use crate::config::{RealtimeSource, SymbolSubscription};
+        let day = 86_400_000;
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let plan = SubscriptionPlan::from_subscriptions(vec![SymbolSubscription::new(
+            "BTCUSDT",
+            vec![Interval::Days(3)],
+            RealtimeSource::Trade,
+        )]);
+        // Day 85 accidentally matches the current grid, but day 87 proves
+        // that it belongs to an earlier phase regime. Its stale closed flag
+        // must not cause a repair request to cross that phase barrier.
+        for open_day in [85, 87, 88, 91, 94, 97] {
+            store
+                .upsert_candle(
+                    "BTCUSDT",
+                    "3D",
+                    &bootstrap_history_candle(
+                        open_day * day,
+                        Interval::Days(3),
+                        open_day != 85 && open_day != 91,
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+        let router = Router::new().route(
+            "/fapi/v1/klines",
+            get(
+                move |Query(query): Query<HashMap<String, String>>| async move {
+                    assert_eq!(query["interval"], "3d");
+                    assert_eq!(query["startTime"], (91 * day).to_string());
+                    assert_eq!(query["endTime"], (94 * day - 1).to_string());
+                    assert_eq!(query["limit"], "1");
+                    Json(serde_json::json!([[
+                        91 * day,
+                        "100",
+                        "110",
+                        "90",
+                        "105",
+                        "2",
+                        94 * day - 1,
+                        "200",
+                        3
+                    ]]))
+                },
+            ),
+        );
+        let (url, task) = serve(router).await;
+        refresh_trade_bootstrap_history_from(
+            &reqwest::Client::new(),
+            &url,
+            &store,
+            &plan,
+            "BTCUSDT",
+            100 * day + 60_000,
+            100,
+        )
+        .await
+        .unwrap();
+        task.abort();
+        let repaired = store
+            .query_klines("BTCUSDT", "3D", Some(91 * day), Some(91 * day), 1)
+            .await
+            .unwrap();
+        assert!(repaired[0].candle.is_closed);
+        let historical = store
+            .query_klines("BTCUSDT", "3D", Some(85 * day), Some(85 * day), 1)
+            .await
+            .unwrap();
+        assert!(!historical[0].candle.is_closed);
     }
 
     async fn page(Query(query): Query<HashMap<String, String>>) -> Json<Value> {

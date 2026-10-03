@@ -1,5 +1,5 @@
 [server]
-bind_addr = "127.0.0.1:3005"
+bind_addr = "0.0.0.0:3005"
 
 [database]
 url = "sqlite://candles.db?mode=rwc"
@@ -8,9 +8,6 @@ retention_bars = 2000
 [binance]
 sync_on_start = true
 sync_lookback_bars = 1500
-
-# source 可选 auto、trade、kline_1m；省略时默认为 auto。
-# auto 在最小周期 >= 1 分钟时选择 kline_1m，否则选择 trade。
 
 [[binance.symbols]]
 symbol = "BTCUSDT"

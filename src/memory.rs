@@ -3,13 +3,41 @@ use std::{
     collections::{BTreeMap, HashMap},
     sync::Arc,
 };
-use tokio::sync::RwLock;
+use tokio::sync::{watch, RwLock};
 
 pub const DEFAULT_MEMORY_SERIES_LIMIT: usize = 5_000;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct LatestCache {
     inner: Arc<RwLock<HashMap<(String, String), Candle>>>,
+    live_symbols: Arc<RwLock<HashMap<String, LiveSymbolSnapshot>>>,
+    market_update_lock: Arc<RwLock<()>>,
+    recovery_changes: Arc<watch::Sender<u64>>,
+}
+
+impl Default for LatestCache {
+    fn default() -> Self {
+        let (recovery_changes, _) = watch::channel(0);
+        Self {
+            inner: Arc::default(),
+            live_symbols: Arc::default(),
+            market_update_lock: Arc::default(),
+            recovery_changes: Arc::new(recovery_changes),
+        }
+    }
+}
+
+/// One fully applied trade across every configured interval for a symbol.
+/// `close_time` on a dynamic candle is the future bucket end; freshness instead
+/// comes from the actual market event and local receipt timestamps below.
+#[derive(Debug, Clone)]
+pub struct LiveSymbolSnapshot {
+    pub candles: HashMap<String, Candle>,
+    pub market_event_time_ms: i64,
+    pub received_at_ms: i64,
+    pub sequence: u64,
+    pub generation: u64,
+    pub recovering: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -119,6 +147,94 @@ impl ClosedKlineBuffer {
 }
 
 impl LatestCache {
+    /// Writers hold this lock while changing historical rows and live candles.
+    /// Readers hold it only while copying a consistent input snapshot, then
+    /// release it before indicator calculation. Cache methods deliberately do
+    /// not acquire it again, so they can be called inside either guard.
+    pub fn market_update_lock(&self) -> Arc<RwLock<()>> {
+        self.market_update_lock.clone()
+    }
+
+    /// Subscribe to the beginning of a new recovery generation for any symbol.
+    /// Consumers revalidate their own symbol; repeated retries and ordinary
+    /// market updates do not wake senders or cancel unrelated requests.
+    pub fn recovery_changes(&self) -> watch::Receiver<u64> {
+        self.recovery_changes.subscribe()
+    }
+
+    pub async fn live_snapshot(&self, symbol: &str) -> Option<LiveSymbolSnapshot> {
+        self.live_symbols
+            .read()
+            .await
+            .get(&symbol.to_uppercase())
+            .cloned()
+    }
+
+    /// Lightweight timestamp lookup for the hot trade path, without copying
+    /// every interval's candle merely to reject an old message.
+    pub async fn live_market_event_time_ms(&self, symbol: &str) -> Option<i64> {
+        self.live_symbols
+            .read()
+            .await
+            .get(&symbol.to_uppercase())
+            .map(|snapshot| snapshot.market_event_time_ms)
+    }
+
+    /// Publishes once all intervals have incorporated the same accepted trade.
+    /// The caller owns the market update write guard.
+    pub async fn publish_live_symbol(
+        &self,
+        symbol: &str,
+        candles: HashMap<String, Candle>,
+        market_event_time_ms: i64,
+        received_at_ms: i64,
+    ) -> u64 {
+        let mut live_symbols = self.live_symbols.write().await;
+        let previous = live_symbols.get(&symbol.to_uppercase());
+        let sequence = previous.map_or(1, |snapshot| snapshot.sequence.saturating_add(1));
+        let generation = previous.map_or(1, |snapshot| snapshot.generation);
+        live_symbols.insert(
+            symbol.to_uppercase(),
+            LiveSymbolSnapshot {
+                candles,
+                market_event_time_ms,
+                received_at_ms,
+                sequence,
+                generation,
+                recovering: false,
+            },
+        );
+        sequence
+    }
+
+    /// Invalidate a symbol without promoting old data to a fresh market update.
+    /// Repeated failed reconnect attempts remain in the same generation.
+    /// The caller owns the market update write guard.
+    pub async fn mark_recovering(&self, symbol: &str) {
+        let mut live_symbols = self.live_symbols.write().await;
+        let snapshot = live_symbols
+            .entry(symbol.to_uppercase())
+            .or_insert_with(|| LiveSymbolSnapshot {
+                candles: HashMap::new(),
+                market_event_time_ms: 0,
+                received_at_ms: 0,
+                sequence: 0,
+                generation: 0,
+                recovering: false,
+            });
+        let new_recovery = !snapshot.recovering;
+        if new_recovery {
+            snapshot.generation = snapshot.generation.saturating_add(1);
+            snapshot.recovering = true;
+        }
+        snapshot.candles.clear();
+        drop(live_symbols);
+        if new_recovery {
+            self.recovery_changes
+                .send_modify(|revision| *revision = revision.wrapping_add(1));
+        }
+    }
+
     pub async fn upsert(&self, symbol: &str, interval: &str, candle: Candle) {
         self.inner
             .write()

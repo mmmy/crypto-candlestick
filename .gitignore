@@ -5,3 +5,5 @@
 *.db-shm
 *.db-wal
 .env
+# Local signal configuration may contain enterprise WeChat webhook credentials.
+/signals.toml

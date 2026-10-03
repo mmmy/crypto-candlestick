@@ -1,0 +1,61 @@
+# 独立的实时信号配置。修改后 POST /api/signals/reload 原子重载。
+# 一个总开关控制信号计算及全部关联企业微信警报；查询接口始终可访问。
+enabled = true
+evaluation_interval_secs = 5
+
+# 必须是 config.toml 已配置的品种；[] 表示全部配置品种。
+# 周期沿用各品种的完整配置列表；trade 和 kline_1m 均支持动态快照。
+symbols = ["BTCUSDT", "XAUUSDT", "QQQUSDT", "SKHYNIXUSDT", "CLUSDT"]
+
+[indicator]
+ma_type = "EMA"
+ma_length = 20
+# 最多499根历史已收盘K + 1根当前动态K；不使用已收盘值替代当前动态值。
+calc_limit = 500
+# atr_len仅用于rank过滤；乖离分母仍为前一根ATR14。
+atr_len = 1
+atr_percent_len = 20
+max_atr_rank = 100.0
+slope_mul = 0.1
+use_slope = true
+
+[rules]
+# 阈值单位为整数value（原始guaili乘10向零截断），不是百分比。
+extreme_threshold = 10
+compression_band = 2
+minimum_levels = 5
+# 需连续已收盘历史，当前动态K不计入；默认EMA20至少60根。
+min_history_bars = 60
+
+[quality]
+# 行情事件时间与接收时间都要足够新，结果超时不显示为有效信号。
+max_market_age_secs = 30
+max_result_age_secs = 15
+
+# 默认只计算并提供查询接口，没有真实企业微信Webhook，也不会发送消息。
+# 按需取消以下配置段注释并替换Webhook；增加段即可配置多个群/订阅。
+# 最小发送级别按候选结构的最大周期筛选，不改变计算输入。
+# 例如最低15分钟可收到3–15分钟结构，收不到1–8分钟结构。
+# 同一事件命中相同Webhook只发送一次；Webhook不经查询接口回显。
+# 初次观察/重启/断流恢复建立基线，不立即发送已经存在的结构。
+
+# [[wecom_alerts]]
+# id = "btc-observation"
+# name = "BTC观察"
+# webhook_url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=REPLACE_WITH_KEY"
+# symbols = ["BTCUSDT"]
+# min_signal_interval = "15"
+# kinds = ["extreme", "compression", "conflict"]
+# cooldown_secs = 300
+
+# [[wecom_alerts]]
+# id = "gold-observation"
+# name = "黄金观察"
+# webhook_url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=REPLACE_WITH_ANOTHER_KEY"
+# symbols = ["XAUUSDT"]
+# min_signal_interval = "60"
+# kinds = ["extreme", "conflict"]
+# cooldown_secs = 300
+
+# cooldown_secs默认300，0关闭冷却；冷却内抑制的匹配不延后补发。
+# 真实Webhook含凭据，只应保存在服务器，勿提交到版本库。

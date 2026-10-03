@@ -1,15 +1,15 @@
 # HTTP API 接入契约
 
-本文描述当前代码提供的接口。服务用途和部署见 [README](../README.md)，指标计算规则见 [guaili 算法与业务语义](guaili.md)。路由以 [`src/http/routes.rs`](../src/http/routes.rs) 为准，参数和响应以 [`src/http/handlers.rs`](../src/http/handlers.rs) 为准。
+本文描述当前代码提供的接口。服务用途和部署见 [README](../README.md)，指标计算规则见 [guaili 算法与业务语义](guaili.md)。路由以 [`src/http/routes.rs`](../src/http/routes.rs) 为准；行情参数和响应见 [`src/http/handlers.rs`](../src/http/handlers.rs)，动态信号接口见 [`src/http/signals.rs`](../src/http/signals.rs)。
 
 ## 通用约定
 
 - 仓库当前 `config.toml` 的地址为 `http://127.0.0.1:3005`，部署时以 `server.bind_addr` 为准。
-- 成功响应为 JSON，字段采用 `camelCase`；删除成功为 HTTP 204，无响应体。POST/PATCH 请求使用 `Content-Type: application/json`。
+- 成功响应为 JSON，字段采用 `camelCase`；删除成功为 HTTP 204，无响应体。带 JSON 正文的 POST/PATCH 请求使用 `Content-Type: application/json`；信号重载无需请求体。
 - 当前未实现身份认证、API 版本前缀、CORS 中间件或面向调用方的 WebSocket/SSE 推送。普通行情与指标由调用方轮询 HTTP；价格警报触发后可投递 Webhook。
 - 交易对请统一使用大写且不带空格，例如 `BTCUSDT`。指标接口的 `symbols` 会去空格并转大写；K 线接口各数据源的大小写处理不完全一致，不应依赖小写输入。
-- 多值参数用逗号分隔。`intervals`、`symbols` 保留请求顺序，不排序、不去重；空元素（如 `1,,5`）返回 400。
-- 只公开配置中启用的交易对/周期。合法但未配置的组合返回空序列（HTTP 200），不会按请求创建订阅或从 Binance 现拉历史；非法周期返回 400。
+- 多值参数用逗号分隔。行情/指标的 `intervals`、`symbols` 保留请求顺序，不排序、不去重；空元素（如 `1,,5`）返回 400。动态信号接口的 `symbols` 去重并保留首次出现顺序。
+- 只公开配置中启用的交易对/周期。K 线与单周期指标的合法但未配置组合返回空序列（HTTP 200），不会按请求创建订阅或从 Binance 现拉历史；非法周期返回 400。动态信号查询未启用的品种返回 400。
 - K 线和指标的 `data` 按 `openTime` 升序排列；`limit` 是每条序列的上限，不是整个响应的总条数。无数据时 `count=0`、`startTime=endTime=null`、`data=[]`；指标另有 `latest=null`。
 - `startTime`、`endTime` 都筛选 **K 线开盘时间**，包含边界；不筛选收盘时间。响应中序列的同名字段表示实际返回首尾数据的开盘时间。
 
@@ -22,6 +22,7 @@
 | K 线 / 指标点 `openTime`、`closeTime` 和序列 `startTime`、`endTime` | RFC 3339 字符串，带毫秒与时区偏移 |
 | 健康摘要 `serverTime`、深度检查 `latestOpenTime`、`lastMessageAt` | 同上；后两者可能为 `null` |
 | 警报及事件的 `expiresAt`、`createdAt`、`updatedAt`、`triggeredAt` | Unix 毫秒整数；可空字段见下文 |
+| 动态信号接口的全部时间字段（含证据点 `openTime/closeTime`） | Unix 毫秒整数；不可用或尚未确认时为 `null` |
 
 **当前时间格式限制：** K 线和指标响应的 `timezone` 固定为 `Asia/Shanghai`，但时间字符串由服务进程的本地时区格式化。部署在其他时区时，该标签与字符串偏移可能不一致；调用方应解析字符串自带的偏移，不要再手动加 8 小时。希望统一为北京时间时，应将运行环境时区配置为 Asia/Shanghai。
 
@@ -47,6 +48,8 @@
 | GET | `/api/health/deep` | 查看 WebSocket 及各序列详情 |
 | GET | `/api/klines` | 一个交易对、多个周期的 OHLCV |
 | GET | `/api/indicators/guaili` | 多个交易对、多个周期的乖离与趋势状态 |
+| GET | `/api/signals` | 最近的动态多周期信号采样及数据质量 |
+| POST | `/api/signals/reload` | 原子重载独立 `signals.toml` 配置 |
 | POST | `/api/alerts` | 创建一次性价格穿越警报 |
 | GET | `/api/alerts` | 列出全部警报 |
 | GET | `/api/alerts/{id}` | 查询警报 |
@@ -305,6 +308,143 @@ GET /api/indicators/guaili?symbols=BTCUSDT,XAUUSDT&intervals=1,5,15&limit=1&calc
 - 序列无记录时 `reason="no closed candles"`；超出滞后阈值时为 `latest candle is stale`。当前实现扫描 SQLite/缓冲/秒级内存，不合并当前 K 线缓存，且没有再按 `isClosed` 过滤 SQLite 记录。
 - 健康判定只要求连续尾段非空且不陈旧。较早历史有缺口、EMA/ATR 预热不足时仍可能 `ok=true`，不能把健康检查作为历史完整性或指标稳定性的证明。
 
+## 动态信号与企业微信警报
+
+这是与原有一次性价格穿越警报独立的功能。引擎以 `signals.toml` 的频率（默认 5 秒）读取每个品种的当前动态 K 快照、复用连续已收盘历史计算指标，再识别多周期结构。HTTP 查询只读内存结果，不增加计算或数据库查询，也不改变监控品种。算法细节见 [动态多周期结构](guaili.md#动态多周期结构)。
+
+### 查询当前结果
+
+```http
+GET /api/signals
+GET /api/signals?symbols=BTCUSDT,XAUUSDT
+```
+
+仅支持可选 `symbols`。省略时返回信号配置中的全部品种；提供时按逗号拆分、去空格、转大写、去重并按首次出现顺序返回，正常计算状态按筛选后返回品种的数据质量汇总，其他未查询品种的预热不影响该响应状态。空元素、未知参数或未在信号计算配置中启用的品种返回 400。未启用或首轮采样尚未完成时 `results=[]`；HTTP 200 本身不代表信号有效。
+
+| 顶层字段 | 语义 |
+| --- | --- |
+| `enabled` / `status` | 是否启用及整体状态，见状态表 |
+| `configHash` | 当前计算参数指纹；修改企业微信配置不改变此值，不包含 Webhook |
+| `indicatorConfig` | 实际参与计算的 `maType` 与 `maLength`，用于显示服务器的均线名称；旧调用方可忽略此新增字段 |
+| `ruleVersion` | 当前为 `live-v1` |
+| `candleMode` / `evaluationMode` | 固定 `live` / `sampled_live`，表示定时采样动态 K |
+| `evaluationIntervalMs` | 配置的采样间隔，毫秒 |
+| `serverTime` | 此次 HTTP 响应时刻，Unix 毫秒 |
+| `runId` | 运行实例标识；重启后变化，客户端不能跨实例沿用旧信号 ID |
+| `snapshotVersion` | 同一实例内的发布版本，重载清空结果时也可增长 |
+| `evaluatedAt` / `computeDurationMs` | 最近采样时刻 / 该轮耗时；尚未采样时为 `null` / `0` |
+| `configError` | 初始配置错误的脱敏说明，正常为 `null` |
+| `delivery` | 内存投递统计、脱敏错误及最近最多 32 条结果 |
+| `results` | 各品种结构和逐周期数据质量 |
+
+| 整体 `status` | 语义 |
+| --- | --- |
+| `disabled` | 总开关关闭或可选配置文件缺失；计算和信号发送停止，结果为空 |
+| `warming_up` | 等待首次采样，或所有品种均在预热/恢复 |
+| `ready` | 所有配置周期数据可判断；仍可能没有信号，ATR rank 过滤不等于数据故障 |
+| `degraded` | 部分周期无法判断、行情陈旧，或采样结果已过期；其他有效区间可有信号 |
+| `config_error` | 启动时文件无效；信号关闭，行情采集继续运行 |
+
+每项 `results[]` 包含：
+
+| 字段 | 语义 |
+| --- | --- |
+| `symbol` | 品种 |
+| `dataStatus` | `ready/warming_up/recovering/stale/degraded`；逐周期原因见下方证据 |
+| `sampledAt` | 本轮采样时刻，Unix 毫秒 |
+| `marketSequence` / `generation` | 行情输入版本 / 恢复代次；不可用时为 `null` |
+| `lastMarketEventTime` | 此品种最后行情事件的 Unix 毫秒时间 |
+| `primarySignal` | 小组件可优先展示的结构 ID，无结构时 `null` |
+| `signals` | 全部满足规则的结构，企业微信会扫描全部结构 |
+| `perIntervalQuality` | 完整配置周期集合的证据，按真实时长排序 |
+| `missingIntervals` | 目前无法可靠判断的周期列表，包括预热、过期、缺口等 |
+
+`signals[]` 的结构字段：`id`、`kind`（`extreme/compression/conflict`）、`direction`（`positive/negative/neutral`）、`runs[]`、`levelCount`、`totalLevelCount`、`anchorInterval`、`firstObservedAt`、`formedAt`、`lastChangedAt`。`anchorInterval` 是结构最大周期；`levelCount` 是最长单段周期数，分歧的 `totalLevelCount` 为两段总数。分歧方向表示短周期段：`positive` 为短正长负，`negative` 为短负长正。
+
+`runs[]` 包含 `direction`、完整 `intervals`、`minAbsValue/maxAbsValue/meanAbsValue`，这些统计量单位为显示整数 `value` 的绝对值。另提供可选 `maxAbsGuaili/meanAbsGuaili`，单位为原始浮点 `guaili` 的绝对值，近均线段排序使用它们保留截断前精度；旧客户端可忽略，旧服务缺少时客户端回退整数统计。ID 随同向同类结构的周期重叠继承；`firstObservedAt` 是首次采样观察时间，`formedAt=null` 表示初次建立基线时已经存在，不能据此推断真实形成时间。`lastChangedAt` 只在周期覆盖形状变化时更新，不代表每次数值变化。
+
+每项 `perIntervalQuality[]` 返回 `interval`、`availability`、`reason`、`value`、原始 `guaili`、`ma`、当前根 `atr14`、`atrRank`、`longTrend/shortTrend`、`historyCount`、`openTime/closeTime`、`marketEventTime`、`isClosed`。这里时间为 Unix 毫秒，区别于旧指标接口的 RFC 3339。信号引擎使用当前动态 K，因此有效证据的 `isClosed=false`。
+
+| `availability` | 是否参与结构 / 含义 |
+| --- | --- |
+| `ready` | 参与；动态 K、连续历史、时效和指标有效，ATR rank 通过 |
+| `filtered` | 不参与；数据可判断，但 ATR rank 未通过 |
+| `warming_up` | 不参与；动态成交快照或连续历史尚不足 |
+| `missing` | 不参与；当前动态 K 缺失或时间桶不覆盖当前行情 |
+| `stale` | 不参与；行情或最近结果超时 |
+| `gap` | 不参与；历史尾部不能与动态 K 连续衔接 |
+| `recovering` | 不参与；上游断流或聚合状态正在恢复 |
+| `invalid` | 不参与；数据、时间、波动分母或取数无效 |
+
+所有不参与周期都会打断相邻区间，不能删掉后再拼接。未知数据不会被解释成信号结束。长周期预热不阻断短周期有效结构；某旧结构的参与周期未知时，运行状态保留其身份用于恢复去重，但查询只返回当前有效的结构。
+
+默认行情时效上限 30 秒、结果时效上限 15 秒。请求时发现最近采样超时会返回 `degraded`，清空 `signals/primarySignal` 并将证据标为 `stale`；不要以旧结果显示持续有效信号。`serverTime` 不等于行情时间，不同品种不保证同一行情事件时刻。成交稀疏品种也会在超过行情时效后暂时隐藏，不能把未更新的旧价格当成实时行情。
+
+最小关闭响应示例：
+
+```json
+{
+  "enabled": false,
+  "status": "disabled",
+  "configHash": "0000000000000000",
+  "ruleVersion": "live-v1",
+  "candleMode": "live",
+  "evaluationMode": "sampled_live",
+  "evaluationIntervalMs": 5000,
+  "serverTime": 1790000000000,
+  "runId": "1790000000000-1234-1",
+  "snapshotVersion": 1,
+  "evaluatedAt": null,
+  "computeDurationMs": 0,
+  "configError": null,
+  "delivery": {
+    "queued": 0,
+    "successful": 0,
+    "failed": 0,
+    "dropped": 0,
+    "lastError": null,
+    "lastAttemptAt": null,
+    "lastSuccessAt": null,
+    "recent": []
+  },
+  "results": []
+}
+```
+
+指纹、实例 ID 和时间是示意值。`delivery.queued` 是累计生成任务数，不是当前队列长度；`successful/failed` 统计完成的投递任务，`dropped` 统计超容量、重载失效或过期等丢弃任务。每项 `recent` 只含 `alertId`、脱敏 `targetId`、`symbol`、`attemptedAt`、`successful`、`error`，不返回 Webhook。
+
+### 重载配置
+
+```http
+POST /api/signals/reload
+```
+
+无需请求体，读取服务当前工作目录的 `signals.toml`。先完整解析、校验，再一次性替换运行配置；失败返回 400 脱敏纯文本，保留旧配置和结果。配置文件缺失按关闭配置处理。改动计算参数或开关会清空旧结果并重新采样，改变企业微信订阅会重建通知基线。重载成功不会补发旧信号；旧配置尚未发送的任务作废，发送中的请求取消后不继续重试。
+
+成功响应示例：
+
+```json
+{
+  "enabled": true,
+  "status": "warming_up",
+  "configHash": "0000000000000000",
+  "evaluationIntervalMs": 5000,
+  "alertCount": 0
+}
+```
+
+`status` 是重载后的当前结果状态，若只改订阅可以继续保持 `ready`。接口没有认证，部署层应管理重载入口的访问范围。
+
+### 企业微信订阅与投递
+
+每段 `[[wecom_alerts]]` 配置一个目标和订阅，字段见 [配置示例](../signals.example.toml)。品种和类型筛选应用于完整结构集合，最小级别按 `anchorInterval` 的真实时长判断，含相等：`3–15` 分钟结构满足最低 `15`，`1–8` 不满足；分歧按较长一段的最大周期判断。筛选不裁剪计算周期，也不限制 HTTP 结果。
+
+进程首次观察、订阅变化及断流恢复后建立通知基线，已有结构不立即发送。后续信号首次符合订阅（包括同一 ID 从 8 分钟扩展到 15 分钟并跨过订阅下限）才发送。持续符合的同轮信号不重复；同一事件被多条订阅选中且 Webhook 相同只生成一个任务，不同目标各生成任务。默认 300 秒冷却按目标/品种/信号类型与方向共享；冷却内新匹配被抑制，不会冷却结束后集中补发，需退出后再次符合。`cooldown_secs=0` 关闭冷却。
+
+发送在独立任务中进行，不阻塞采样；队列容量 256，每轮最多 256 个任务，超过容量或超过结果时效的旧任务丢弃。固定企业微信 `text` JSON 包含品种、类型、方向、完整周期、最大级别和北京时间采样时间，无可执行模板。每次超时 3 秒，最多总计 3 次尝试，重试间隔 250ms、500ms；HTTP 2xx 且响应 JSON `errcode=0` 才算成功。网络错误、HTTP 5xx/429、企业微信 `-1/45009` 可重试，其他返回错误直接记失败；响应错误正文不回显。
+
+结果、基线、冷却、队列和投递状态仅在内存保存，不增加 SQLite 表，不提供持久事件查询或退出后恢复发送。关闭总开关停止这套信号计算和发送；原有 `/api/alerts` 价格穿越功能仍按原配置运行。
+
 ## 价格警报与 Webhook
 
 价格警报监测某交易对是否穿过固定价位，与 guaili 指标相互独立。
@@ -426,10 +566,10 @@ PATCH 示例：`{"status":"disabled"}` 禁用；`{"status":"active"}` 重新启�
 
 | HTTP 状态 | 常见原因 / 响应文本 |
 | --- | --- |
-| 400 | 缺少参数、非法查询类型、`missing intervals`、`missing symbols`、`empty interval in intervals`、`invalid interval: ...`、`unsupported maType: ...`、警报字段校验失败 |
+| 400 | 缺少参数、非法查询类型、`missing intervals`、`missing symbols`、`empty interval in intervals`、`invalid interval: ...`、`unsupported maType: ...`、警报字段校验失败、信号查询品种/参数无效或重载配置校验失败 |
 | 404 | 警报不存在：`alert not found`；或请求路径不存在 |
 | 409 | 警报价位重复：`an alert already exists at this price line` |
 | 415 / 422 | JSON 请求 Content-Type 不正确，或 JSON 字段类型/必填字段不匹配等框架提取错误；JSON 语法错误也可能为 400 |
 | 500 | 数据库操作失败等内部错误 |
 
-非法列表元素或数据库失败会使整个请求失败，不返回部分成功的多周期结果。合法但未配置的组合仍返回 200 空序列；健康状态为 `false` 也不能仅靠状态码识别。
+非法列表元素或数据库失败会使整个请求失败，不返回部分成功的多周期结果。K 线与单周期指标的合法但未配置组合仍返回 200 空序列；信号查询未启用的品种返回 400。健康状态为 `false` 或信号质量异常也不能仅靠状态码识别。

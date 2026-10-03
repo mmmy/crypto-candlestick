@@ -1,4 +1,5 @@
 mod handlers;
 mod routes;
+mod signals;
 
-pub use routes::{router, AppState, HealthTarget};
+pub use routes::{router, router_with_signals, AppState, HealthTarget};

@@ -7,5 +7,6 @@ pub mod indicators;
 pub mod logging;
 pub mod memory;
 pub mod runtime_health;
+pub mod signals;
 pub mod storage;
 pub mod time_format;

@@ -3,7 +3,7 @@ use crypto_candlestick::binance::{
     worker::{flush_closed_buffer, BinanceWorker, FlushLock, SubscriptionPlan},
 };
 use crypto_candlestick::config::AppConfig;
-use crypto_candlestick::http::{router, AppState, HealthTarget};
+use crypto_candlestick::http::{router_with_signals, AppState, HealthTarget};
 use crypto_candlestick::logging;
 use crypto_candlestick::memory::{ClosedKlineBuffer, LatestCache, MemorySeriesStore};
 use crypto_candlestick::runtime_health::RuntimeHealth;
@@ -98,20 +98,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let app = router(AppState {
+    let state = AppState {
         store: store.clone(),
         latest,
         memory_series,
         closed_buffer: closed_buffer.clone(),
         health_targets,
         runtime_health,
-    });
+    };
+    let signals = crypto_candlestick::signals::service::SignalService::new(
+        state.clone(),
+        crypto_candlestick::signals::config::SIGNAL_CONFIG_FILE.into(),
+    );
+    signals.load_initial().await;
+    let signal_task = signals.start();
+    let app = router_with_signals(state, signals);
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
     tracing::info!("listening on {}", config.bind_addr);
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal(store, closed_buffer, flush_lock))
         .await?;
+
+    signal_task.abort();
 
     Ok(())
 }

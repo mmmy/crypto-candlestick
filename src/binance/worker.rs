@@ -1,8 +1,8 @@
 use super::types::{parse_combined_stream_message, MarketEvent};
 use crate::{
     binance::rest::{
-        fetch_aggregate_trade_gap, refresh_startup_kline_tail, sync_native_klines, AggregateTrade,
-        RestError,
+        fetch_aggregate_trade_gap, refresh_startup_kline_tail, refresh_trade_bootstrap_history,
+        sync_native_klines, AggregateTrade, RestError,
     },
     config::{RealtimeSource, SymbolSubscription},
     domain::{candle::Candle, interval::Interval},
@@ -23,6 +23,7 @@ use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 const BINANCE_USDM_MARKET_WS_BASE: &str = "wss://fstream.binance.com/market/stream";
+const BINANCE_USDM_REST_BASE: &str = "https://fapi.binance.com";
 
 #[derive(Debug, Clone)]
 pub struct KlineSource {
@@ -155,6 +156,38 @@ impl SubscriptionPlan {
                     }
                 }
             }
+
+            // Internal closed prefixes bootstrap Trade sources at an exact
+            // minute boundary. These sources are not publicly configured
+            // targets and must remain hidden by the HTTP handlers.
+            if subscription.resolved_source() == RealtimeSource::Trade
+                && subscription
+                    .intervals
+                    .iter()
+                    .any(|interval| interval.as_millis() >= 60_000)
+            {
+                for seed_interval in [Interval::Minutes(1), Interval::Days(1)] {
+                    if seed_interval == Interval::Days(1)
+                        && !subscription
+                            .intervals
+                            .iter()
+                            .any(|interval| interval.as_millis() > seed_interval.as_millis())
+                    {
+                        continue;
+                    }
+                    let key = (subscription.symbol.clone(), seed_interval.canonical());
+                    if seen.insert(key.clone()) {
+                        sources.push(KlineSource {
+                            symbol: key.0,
+                            canonical_interval: key.1,
+                            binance_interval: seed_interval
+                                .binance_interval()
+                                .expect("native seed interval"),
+                            interval: seed_interval,
+                        });
+                    }
+                }
+            }
         }
 
         sources
@@ -222,6 +255,12 @@ pub struct BinanceWorker {
     trade_aggregators: HashMap<(String, String), Aggregator>,
     trade_cursors: HashMap<String, AggregateTrade>,
     trade_recovery: HashMap<String, HashMap<(String, String), Aggregator>>,
+    trade_min_complete_open: HashMap<(String, String), i64>,
+    kline_initialized: BTreeSet<String>,
+    kline_cursors: HashMap<String, (i64, i64, bool)>,
+    // The permanent aggregators contain closed minutes only. Open-minute
+    // updates are cumulative replacements applied to a clone for each preview.
+    kline_prefix_next: HashMap<(String, String, String), i64>,
     alert_last_sides: HashMap<i64, i8>,
 }
 
@@ -270,6 +309,10 @@ impl BinanceWorker {
             trade_aggregators,
             trade_cursors: HashMap::new(),
             trade_recovery: HashMap::new(),
+            trade_min_complete_open: HashMap::new(),
+            kline_initialized: BTreeSet::new(),
+            kline_cursors: HashMap::new(),
+            kline_prefix_next: HashMap::new(),
             alert_last_sides: HashMap::new(),
         }
     }
@@ -343,11 +386,19 @@ impl BinanceWorker {
                                         if let MarketEvent::AggTrade { symbol, trade } = event {
                                             let result = match trade_id {
                                                 Some(id) if id >= 0 => {
-                                                    self.handle_aggregate_trade(
-                                                        &symbol,
-                                                        AggregateTrade { id, tick: trade },
-                                                    )
-                                                    .await
+                                                    let aggregate =
+                                                        AggregateTrade { id, tick: trade };
+                                                    if self.trade_cursors.contains_key(&symbol) {
+                                                        self.handle_aggregate_trade(
+                                                            &symbol, aggregate,
+                                                        )
+                                                        .await
+                                                    } else {
+                                                        self.bootstrap_trade_from_rest(
+                                                            &symbol, aggregate,
+                                                        )
+                                                        .await
+                                                    }
                                                 }
                                                 _ => Err(RestError::InvalidPayload),
                                             };
@@ -367,6 +418,34 @@ impl BinanceWorker {
                                                 backoff_secs = 1;
                                             }
                                         } else {
+                                            if let MarketEvent::OpenKline {
+                                                symbol, candle, ..
+                                            }
+                                            | MarketEvent::ClosedKline {
+                                                symbol, candle, ..
+                                            } = &event
+                                            {
+                                                if self
+                                                    .kline_needs_bootstrap(symbol, candle.open_time)
+                                                {
+                                                    if let Err(err) = self
+                                                        .bootstrap_kline_history(
+                                                            symbol,
+                                                            candle.open_time,
+                                                        )
+                                                        .await
+                                                    {
+                                                        tracing::warn!(
+                                                            symbol,
+                                                            "minute kline recovery failed: {err}"
+                                                        );
+                                                        self.runtime_health
+                                                            .mark_reconnecting(err.to_string())
+                                                            .await;
+                                                        break;
+                                                    }
+                                                }
+                                            }
                                             self.handle_event(event).await;
                                         }
                                     }
@@ -409,6 +488,11 @@ impl BinanceWorker {
     }
 
     async fn recover_on_connect(&mut self) -> Result<(), RestError> {
+        let market_lock = self.latest.market_update_lock();
+        let _market_guard = market_lock.write().await;
+        for (symbol, _) in self.plan.trade_targets() {
+            self.latest.mark_recovering(&symbol).await;
+        }
         flush_closed_buffer(&self.store, &self.closed_buffer, &self.flush_lock).await;
         refresh_startup_kline_tail(&self.store, &self.plan).await?;
         sync_native_klines(&self.store, &self.plan, self.sync_lookback_bars).await?;
@@ -431,10 +515,29 @@ impl BinanceWorker {
         for symbol in symbols {
             self.begin_trade_recovery(&symbol).await;
         }
+        let market_lock = self.latest.market_update_lock();
+        let _guard = market_lock.write().await;
+        for subscription in &self.plan.subscriptions {
+            if subscription.resolved_source() == RealtimeSource::Kline1m {
+                self.latest.mark_recovering(&subscription.symbol).await;
+                for interval in &subscription.intervals {
+                    self.latest
+                        .remove(&subscription.symbol, &interval.canonical())
+                        .await;
+                }
+            }
+        }
+        self.kline_initialized.clear();
+        self.kline_cursors.clear();
+        self.kline_prefix_next.clear();
+        self.reset_kline_aggregators();
         self.alert_last_sides.clear();
     }
 
     async fn begin_trade_recovery(&mut self, symbol: &str) {
+        let market_lock = self.latest.market_update_lock();
+        let _market_guard = market_lock.write().await;
+        self.latest.mark_recovering(symbol).await;
         if self.trade_cursors.contains_key(symbol) && !self.trade_recovery.contains_key(symbol) {
             let prefix = self
                 .trade_aggregators
@@ -446,6 +549,19 @@ impl BinanceWorker {
         }
         for (key, agg) in &mut self.trade_aggregators {
             if key.0 == symbol {
+                if let Ok(interval) = Interval::parse(&key.1) {
+                    if interval.as_millis() < 60_000 {
+                        // The open second bucket crossed a transport outage.
+                        // Do not publish or finalize its partial replacement.
+                        if let Some(previous) = self.trade_cursors.get(symbol) {
+                            self.trade_min_complete_open.insert(
+                                key.clone(),
+                                agg.bucket_start_ms(previous.tick.timestamp_ms)
+                                    + interval.as_millis() as i64,
+                            );
+                        }
+                    }
+                }
                 agg.reset();
                 self.latest.remove(symbol, &key.1).await;
                 if Interval::parse(&key.1)
@@ -463,9 +579,22 @@ impl BinanceWorker {
         symbol: &str,
         trade: AggregateTrade,
     ) -> Result<(), RestError> {
+        if trade.id < 0
+            || trade.tick.timestamp_ms < 0
+            || !trade.tick.price.is_finite()
+            || trade.tick.price <= 0.0
+            || !trade.tick.quantity.is_finite()
+            || trade.tick.quantity <= 0.0
+        {
+            return Err(RestError::InvalidPayload);
+        }
         if let Some(previous) = self.trade_cursors.get(symbol).copied() {
             if trade.id <= previous.id {
                 return Ok(()); // WebSocket messages may overlap already replayed trades.
+            }
+            if trade.tick.timestamp_ms < previous.tick.timestamp_ms {
+                self.begin_trade_recovery(symbol).await;
+                return Err(RestError::InvalidAggregateTradeGap(trade.id));
             }
             if trade.id != previous.id + 1 && !self.trade_recovery.contains_key(symbol) {
                 self.begin_trade_recovery(symbol).await;
@@ -488,6 +617,228 @@ impl BinanceWorker {
         .await;
         self.trade_cursors.insert(symbol.to_string(), trade);
         Ok(())
+    }
+
+    async fn bootstrap_trade_from_rest(
+        &mut self,
+        symbol: &str,
+        live: AggregateTrade,
+    ) -> Result<(), RestError> {
+        {
+            let market_lock = self.latest.market_update_lock();
+            let _guard = market_lock.write().await;
+            self.latest.mark_recovering(symbol).await;
+        }
+        let client = reqwest::Client::new();
+        {
+            let market_lock = self.latest.market_update_lock();
+            let _guard = market_lock.write().await;
+            refresh_trade_bootstrap_history(
+                &self.store,
+                &self.plan,
+                symbol,
+                Interval::Minutes(1).bucket_start_ms(live.tick.timestamp_ms),
+                self.sync_lookback_bars,
+            )
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    symbol,
+                    stage = "closed_history",
+                    market_event_time_ms = live.tick.timestamp_ms,
+                    "trade bootstrap stage failed: {error}"
+                );
+                error
+            })?;
+        }
+        let first_id = fetch_first_minute_trade_id(&client, BINANCE_USDM_REST_BASE, symbol, live)
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    symbol,
+                    stage = "minute_first_id",
+                    market_event_time_ms = live.tick.timestamp_ms,
+                    "trade bootstrap stage failed: {error}"
+                );
+                error
+            })?;
+        // One predecessor proves the minute boundary even if a server returns
+        // a truncated time-range response. The remaining range is the exact
+        // closed-prefix -> first WebSocket ID handoff.
+        let mut trades =
+            fetch_aggregate_trade_gap(symbol, first_id.saturating_sub(1), live.id - 1).await?;
+        let preceding = if first_id > 0 && !trades.is_empty() {
+            Some(trades.remove(0))
+        } else {
+            None
+        };
+        self.complete_trade_bootstrap(symbol, preceding, &trades, live)
+            .await
+    }
+
+    async fn complete_trade_bootstrap(
+        &mut self,
+        symbol: &str,
+        preceding: Option<AggregateTrade>,
+        missing: &[AggregateTrade],
+        live: AggregateTrade,
+    ) -> Result<(), RestError> {
+        let minute_start = Interval::Minutes(1).bucket_start_ms(live.tick.timestamp_ms);
+        let first_id = missing.first().map_or(live.id, |trade| trade.id);
+        if first_id < 0 || live.id < first_id || live.id - first_id != missing.len() as i64 {
+            return Err(RestError::InvalidAggregateTradeGap(first_id));
+        }
+        if first_id > 0
+            && !preceding.is_some_and(|trade| {
+                trade.id == first_id - 1 && trade.tick.timestamp_ms < minute_start
+            })
+        {
+            return Err(RestError::InvalidAggregateTradeGap(first_id));
+        }
+        let mut previous_time = minute_start;
+        for (expected_id, trade) in (first_id..).zip(missing.iter().chain(std::iter::once(&live))) {
+            if trade.id != expected_id
+                || trade.tick.timestamp_ms < previous_time
+                || trade.tick.timestamp_ms > live.tick.timestamp_ms
+                || !trade.tick.price.is_finite()
+                || trade.tick.price <= 0.0
+                || !trade.tick.quantity.is_finite()
+                || trade.tick.quantity <= 0.0
+            {
+                return Err(RestError::InvalidAggregateTradeGap(expected_id));
+            }
+            previous_time = trade.tick.timestamp_ms;
+        }
+
+        let market_lock = self.latest.market_update_lock();
+        let _guard = market_lock.write().await;
+        self.latest.mark_recovering(symbol).await;
+        let keys = self
+            .trade_aggregators
+            .keys()
+            .filter(|key| key.0 == symbol)
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in keys {
+            let interval = Interval::parse(&key.1).map_err(|_| RestError::InvalidPayload)?;
+            let bucket_start = self.trade_aggregators[&key].bucket_start_ms(live.tick.timestamp_ms);
+            let prefix = if interval.as_millis() >= 60_000 {
+                self.closed_trade_prefix(symbol, bucket_start, minute_start, interval)
+                    .await?
+            } else {
+                None
+            };
+            let agg = self
+                .trade_aggregators
+                .get_mut(&key)
+                .expect("configured aggregator");
+            agg.reset();
+            self.latest.remove(symbol, &key.1).await;
+            self.trade_min_complete_open.remove(&key);
+            if interval.as_millis() < 60_000 {
+                self.memory_series.clear(symbol, &key.1).await;
+            }
+            if let Some(prefix) = prefix {
+                for candle in prefix {
+                    agg.ingest_candle(candle)
+                        .map_err(|_| RestError::InvalidPayload)?;
+                }
+            } else {
+                // Unverified histories and the startup second bucket remain
+                // unavailable until an entirely observed new bucket begins.
+                self.trade_min_complete_open
+                    .insert(key, bucket_start + interval.as_millis() as i64);
+            }
+        }
+        for trade in missing.iter().chain(std::iter::once(&live)) {
+            self.apply_trade_inner(symbol, trade.tick, true).await;
+        }
+        self.trade_cursors.insert(symbol.to_string(), live);
+        self.publish_trade_snapshot(symbol, live.tick.timestamp_ms)
+            .await;
+        drop(_guard);
+        self.alert_last_sides.clear();
+        self.evaluate_price_alerts(symbol, live.tick.price, live.tick.timestamp_ms)
+            .await;
+        tracing::info!(
+            symbol,
+            replayed_trades = missing.len(),
+            "trade source bootstrapped at an exact ID boundary"
+        );
+        Ok(())
+    }
+
+    async fn closed_trade_prefix(
+        &self,
+        symbol: &str,
+        bucket_start: i64,
+        minute_start: i64,
+        interval: Interval,
+    ) -> Result<Option<Vec<Candle>>, sqlx::Error> {
+        let mut prefix = Vec::new();
+        let mut next_open = bucket_start;
+        if interval.as_millis() > Interval::Days(1).as_millis() {
+            let daily_end = Interval::Days(1).bucket_start_ms(minute_start);
+            let days = self
+                .closed_prefix_rows(symbol, "D", bucket_start, daily_end - 1, 32)
+                .await?;
+            for candle in days {
+                if !candle.is_closed
+                    || candle.open_time != next_open
+                    || candle.close_time != next_open + 86_400_000 - 1
+                {
+                    return Ok(None);
+                }
+                next_open += 86_400_000;
+                prefix.push(candle);
+            }
+            if next_open != daily_end {
+                return Ok(None);
+            }
+        }
+        let limit = ((minute_start - next_open).max(0) / 60_000) as u32;
+        if limit > 0 {
+            let rows = self
+                .closed_prefix_rows(symbol, "1", next_open, minute_start - 1, limit)
+                .await?;
+            for candle in rows {
+                if !candle.is_closed
+                    || candle.open_time != next_open
+                    || candle.close_time != next_open + 60_000 - 1
+                {
+                    return Ok(None);
+                }
+                next_open += 60_000;
+                prefix.push(candle);
+            }
+        }
+        Ok((next_open == minute_start).then_some(prefix))
+    }
+
+    async fn closed_prefix_rows(
+        &self,
+        symbol: &str,
+        interval: &str,
+        start: i64,
+        end: i64,
+        limit: u32,
+    ) -> Result<Vec<Candle>, sqlx::Error> {
+        if start > end {
+            return Ok(Vec::new());
+        }
+        let buffered = self
+            .closed_buffer
+            .query(symbol, interval, Some(start), Some(end), limit)
+            .await;
+        let stored = self
+            .store
+            .query_klines(symbol, interval, Some(start), Some(end), limit)
+            .await?;
+        let mut by_time = std::collections::BTreeMap::new();
+        for row in stored.into_iter().chain(buffered) {
+            by_time.insert(row.candle.open_time, row.candle);
+        }
+        Ok(by_time.into_values().collect())
     }
 
     async fn complete_trade_recovery(
@@ -514,16 +865,28 @@ impl BinanceWorker {
                 expected_id += 1;
             }
         }
+        let market_lock = self.latest.market_update_lock();
+        let _market_guard = market_lock.write().await;
         let prefix = self
             .trade_recovery
             .remove(symbol)
             .ok_or(RestError::InvalidPayload)?;
-        self.trade_aggregators.extend(prefix);
+        // Minute histories can be replayed exactly from the saved prefix.
+        // Seconds were explicitly invalidated and must warm up anew.
+        self.trade_aggregators
+            .extend(prefix.into_iter().filter(|(key, _)| {
+                Interval::parse(&key.1)
+                    .map(|interval| interval.as_millis() >= 60_000)
+                    .unwrap_or(false)
+            }));
         // Establish a fresh price-alert baseline instead of notifying on replay.
         for trade in missing.iter().chain(std::iter::once(&live)) {
-            self.apply_trade(symbol, trade.tick).await;
+            self.apply_trade_inner(symbol, trade.tick, true).await;
         }
         self.trade_cursors.insert(symbol.to_string(), live);
+        self.publish_trade_snapshot(symbol, live.tick.timestamp_ms)
+            .await;
+        drop(_market_guard);
         self.alert_last_sides.clear();
         self.evaluate_price_alerts(symbol, live.tick.price, live.tick.timestamp_ms)
             .await;
@@ -535,18 +898,186 @@ impl BinanceWorker {
         Ok(())
     }
 
+    fn kline_needs_bootstrap(&self, symbol: &str, minute_open: i64) -> bool {
+        if !self.kline_initialized.contains(symbol) {
+            return true;
+        }
+        self.kline_cursors
+            .get(symbol)
+            .is_some_and(|(previous_open, _, closed)| {
+                minute_open > *previous_open && (minute_open != previous_open + 60_000 || !closed)
+            })
+    }
+
+    async fn bootstrap_kline_history(
+        &mut self,
+        symbol: &str,
+        minute_open: i64,
+    ) -> Result<(), RestError> {
+        {
+            let market_lock = self.latest.market_update_lock();
+            let _guard = market_lock.write().await;
+            self.latest.mark_recovering(symbol).await;
+        }
+        // Startup REST synchronization can precede the first live event by
+        // minutes. Repair closed history at the incoming minute boundary;
+        // a REST open candle is never used as a current-minute replacement.
+        flush_closed_buffer(&self.store, &self.closed_buffer, &self.flush_lock).await;
+        refresh_trade_bootstrap_history(
+            &self.store,
+            &self.plan,
+            symbol,
+            minute_open,
+            self.sync_lookback_bars,
+        )
+        .await?;
+        let market_lock = self.latest.market_update_lock();
+        let _guard = market_lock.write().await;
+        self.load_symbol_bucket_anchors().await?;
+        self.seed_kline_symbol(symbol, minute_open).await?;
+        self.kline_cursors.remove(symbol);
+        self.kline_initialized.insert(symbol.to_string());
+        tracing::info!(
+            symbol,
+            "minute kline source bootstrapped at a closed-history boundary"
+        );
+        Ok(())
+    }
+
+    async fn seed_kline_symbol(
+        &mut self,
+        symbol: &str,
+        minute_open: i64,
+    ) -> Result<(), sqlx::Error> {
+        let keys = self
+            .kline_aggregators
+            .keys()
+            .filter(|key| key.0 == symbol)
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in keys {
+            let interval = Interval::parse(&key.2).expect("configured period");
+            let start = self.kline_aggregators[&key].bucket_start_ms(minute_open);
+            let prefix = self
+                .closed_trade_prefix(symbol, start, minute_open, interval)
+                .await?;
+            let agg = self
+                .kline_aggregators
+                .get_mut(&key)
+                .expect("configured aggregator");
+            agg.reset();
+            self.kline_prefix_next.remove(&key);
+            self.latest.remove(symbol, &key.2).await;
+            if let Some(prefix) = prefix {
+                for candle in prefix {
+                    let _ = agg.ingest_candle(candle);
+                }
+                self.kline_prefix_next.insert(key, minute_open);
+            }
+        }
+        Ok(())
+    }
+
+    fn accept_kline_event(&mut self, symbol: &str, candle: &Candle, event_time_ms: i64) -> bool {
+        if candle.open_time < 0
+            || candle.open_time % 60_000 != 0
+            || candle.close_time != candle.open_time + 59_999
+            || event_time_ms < candle.open_time
+        {
+            return false;
+        }
+        if self
+            .kline_cursors
+            .get(symbol)
+            .is_some_and(|(open, event, closed)| {
+                candle.open_time < *open
+                    || event_time_ms < *event
+                    || (candle.open_time == *open && *closed)
+            })
+        {
+            return false;
+        }
+        self.kline_cursors.insert(
+            symbol.to_string(),
+            (candle.open_time, event_time_ms, candle.is_closed),
+        );
+        true
+    }
+
+    async fn publish_kline_snapshot(
+        &self,
+        symbol: &str,
+        minute: Option<&Candle>,
+        event_time_ms: i64,
+    ) {
+        let mut candles = HashMap::new();
+        for (configured_symbol, target) in self.plan.configured_targets() {
+            if configured_symbol != symbol {
+                continue;
+            }
+            let current = if target == "1" {
+                minute.cloned()
+            } else {
+                let key = (symbol.to_string(), "1".to_string(), target.clone());
+                self.kline_aggregators.get(&key).and_then(|prefix| {
+                    let mut preview = prefix.clone();
+                    if let Some(minute) = minute {
+                        if self.kline_prefix_next.get(&key) != Some(&minute.open_time) {
+                            if prefix.bucket_start_ms(minute.open_time) != minute.open_time {
+                                return None;
+                            }
+                            preview.reset();
+                        }
+                        preview.ingest_candle(minute.clone()).ok()?;
+                    } else if !self.kline_prefix_next.contains_key(&key) {
+                        return None;
+                    }
+                    preview.current()
+                })
+            };
+            if let Some(mut current) = current {
+                current.is_closed = false;
+                self.latest.upsert(symbol, &target, current.clone()).await;
+                candles.insert(target, current);
+            } else {
+                self.latest.remove(symbol, &target).await;
+            }
+        }
+        // One accepted event, one atomic set of configured dynamic periods.
+        self.latest
+            .publish_live_symbol(
+                symbol,
+                candles,
+                event_time_ms,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await;
+    }
+
     async fn handle_event(&mut self, event: MarketEvent) {
+        let market_lock = self.latest.market_update_lock();
+        let _market_guard = market_lock.write().await;
         match event {
             MarketEvent::OpenKline {
-                symbol: _,
-                interval: _,
-                candle: _,
-            } => {}
+                symbol,
+                interval,
+                event_time_ms,
+                candle,
+            } => {
+                if interval == "1" && self.accept_kline_event(&symbol, &candle, event_time_ms) {
+                    self.publish_kline_snapshot(&symbol, Some(&candle), event_time_ms)
+                        .await;
+                }
+            }
             MarketEvent::ClosedKline {
                 symbol,
                 interval,
+                event_time_ms,
                 candle,
             } => {
+                if interval != "1" || !self.accept_kline_event(&symbol, &candle, event_time_ms) {
+                    return;
+                }
                 if let Ok(source_interval) = Interval::parse(&interval) {
                     let source = source_interval.canonical();
                     self.evaluate_price_alerts(
@@ -561,6 +1092,16 @@ impl BinanceWorker {
 
                     for (key, agg) in self.kline_aggregators.iter_mut() {
                         if key.0 == symbol && key.1 == source {
+                            let bucket_start = agg.bucket_start_ms(candle.open_time);
+                            if self.kline_prefix_next.get(key) != Some(&candle.open_time) {
+                                if bucket_start != candle.open_time {
+                                    self.kline_prefix_next.remove(key);
+                                    agg.reset();
+                                    self.latest.remove(&symbol, &key.2).await;
+                                    continue;
+                                }
+                                agg.reset();
+                            }
                             if let Ok(Some(closed)) = agg.ingest_candle(candle.clone()) {
                                 let rows = self.closed_buffer.upsert(&symbol, &key.2, closed).await;
                                 if rows >= self.flush_max_rows {
@@ -597,23 +1138,69 @@ impl BinanceWorker {
                                 }
                                 self.latest.upsert(&symbol, &key.2, current).await;
                             }
+                            self.kline_prefix_next
+                                .insert(key.clone(), candle.close_time + 1);
                         }
                     }
                 }
+                self.publish_kline_snapshot(&symbol, None, event_time_ms)
+                    .await;
             }
             MarketEvent::AggTrade { symbol, trade } => {
+                if self
+                    .latest
+                    .live_market_event_time_ms(&symbol)
+                    .await
+                    .is_some_and(|event_time_ms| trade.timestamp_ms < event_time_ms)
+                {
+                    return;
+                }
                 self.evaluate_price_alerts(&symbol, trade.price, trade.timestamp_ms)
                     .await;
                 self.apply_trade(&symbol, trade).await;
+                self.publish_trade_snapshot(&symbol, trade.timestamp_ms)
+                    .await;
             }
             MarketEvent::Ignored => {}
         }
     }
 
     async fn apply_trade(&mut self, symbol: &str, trade: TradeTick) {
+        self.apply_trade_inner(symbol, trade, false).await;
+    }
+
+    async fn publish_trade_snapshot(&self, symbol: &str, market_event_time_ms: i64) {
+        let candles = self
+            .trade_aggregators
+            .iter()
+            .filter(|(key, _)| key.0 == symbol)
+            .filter_map(|(key, aggregator)| {
+                aggregator.current().map(|candle| (key.1.clone(), candle))
+            })
+            .collect::<HashMap<_, _>>();
+        if !candles.is_empty() {
+            self.latest
+                .publish_live_symbol(
+                    symbol,
+                    candles,
+                    market_event_time_ms,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await;
+        }
+    }
+
+    async fn apply_trade_inner(&mut self, symbol: &str, trade: TradeTick, recovering: bool) {
         for (key, agg) in self.trade_aggregators.iter_mut() {
             if key.0 == symbol {
-                if let Ok(Some(closed)) = agg.ingest_trade(TradeTick {
+                if self
+                    .trade_min_complete_open
+                    .get(key)
+                    .is_some_and(|min_open| agg.bucket_start_ms(trade.timestamp_ms) < *min_open)
+                {
+                    continue;
+                }
+                if let Ok(Some(mut closed)) = agg.ingest_trade(TradeTick {
                     timestamp_ms: trade.timestamp_ms,
                     price: trade.price,
                     quantity: trade.quantity,
@@ -622,20 +1209,40 @@ impl BinanceWorker {
                         .map(|interval| interval.as_millis() < 60_000)
                         .unwrap_or(false)
                     {
-                        self.memory_series
-                            .push_closed(&symbol, &key.1, closed)
-                            .await;
+                        self.memory_series.push_closed(symbol, &key.1, closed).await;
                     } else {
-                        let rows = self.closed_buffer.upsert(&symbol, &key.1, closed).await;
+                        if recovering {
+                            // Replay may finalize an old, initially incomplete
+                            // prefix. A REST-repaired closed candle is complete
+                            // and must not be replaced with that partial bar.
+                            if let Ok(rows) = self
+                                .store
+                                .query_klines(
+                                    symbol,
+                                    &key.1,
+                                    Some(closed.open_time),
+                                    Some(closed.open_time),
+                                    1,
+                                )
+                                .await
+                            {
+                                if let Some(repaired) =
+                                    rows.into_iter().find(|row| row.candle.is_closed)
+                                {
+                                    closed = repaired.candle;
+                                }
+                            }
+                        }
+                        let rows = self.closed_buffer.upsert(symbol, &key.1, closed).await;
                         if rows >= self.flush_max_rows {
                             flush_closed_buffer(&self.store, &self.closed_buffer, &self.flush_lock)
                                 .await;
                         }
                     }
-                    self.latest.remove(&symbol, &key.1).await;
+                    self.latest.remove(symbol, &key.1).await;
                 }
                 if let Some(current) = agg.current() {
-                    self.latest.upsert(&symbol, &key.1, current).await;
+                    self.latest.upsert(symbol, &key.1, current).await;
                 }
             }
         }
@@ -738,47 +1345,18 @@ impl BinanceWorker {
     }
 
     async fn seed_kline_aggregators(&mut self) -> Result<(), sqlx::Error> {
-        for (key, agg) in self.kline_aggregators.iter_mut() {
-            self.latest.remove(&key.0, &key.2).await;
-            let Ok(target_interval) = Interval::parse(&key.2) else {
-                continue;
-            };
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            let start_time = agg.bucket_start_ms(now_ms);
-            let mut minute_start = start_time;
-
-            if target_interval.as_millis() > Interval::Days(1).as_millis() {
-                let daily_rows = self
-                    .store
-                    .query_klines(&key.0, "D", Some(start_time), None, 32)
-                    .await?;
-                for row in daily_rows {
-                    if row.candle.close_time < now_ms {
-                        minute_start = minute_start.max(row.candle.close_time + 1);
-                        let _ = agg.ingest_candle(row.candle);
-                    }
-                }
-            }
-
-            let seed_limit = ((now_ms - minute_start).max(0) / 60_000 + 1) as u32;
-            let minute_rows = self
-                .store
-                .query_klines(&key.0, &key.1, Some(minute_start), None, seed_limit.max(1))
-                .await?;
-            for row in minute_rows {
-                if row.candle.close_time < now_ms {
-                    let _ = agg.ingest_candle(row.candle);
-                }
-            }
-
-            if let Some(mut current) = agg.current() {
-                if chrono::Utc::now().timestamp_millis() <= current.close_time {
-                    current.is_closed = false;
-                }
-                self.latest.upsert(&key.0, &key.2, current).await;
-            }
+        let minute_open =
+            Interval::Minutes(1).bucket_start_ms(chrono::Utc::now().timestamp_millis());
+        let symbols = self
+            .plan
+            .subscriptions
+            .iter()
+            .filter(|subscription| subscription.resolved_source() == RealtimeSource::Kline1m)
+            .map(|subscription| subscription.symbol.clone())
+            .collect::<Vec<_>>();
+        for symbol in symbols {
+            self.seed_kline_symbol(&symbol, minute_open).await?;
         }
-
         Ok(())
     }
 
@@ -859,6 +1437,56 @@ impl BinanceWorker {
             aggregator.reset();
         }
     }
+}
+
+async fn fetch_first_minute_trade_id(
+    client: &reqwest::Client,
+    base_url: &str,
+    symbol: &str,
+    live: AggregateTrade,
+) -> Result<i64, RestError> {
+    let minute_start = Interval::Minutes(1).bucket_start_ms(live.tick.timestamp_ms);
+    let payload = client
+        .get(format!("{base_url}/fapi/v1/aggTrades"))
+        .query(&[
+            ("symbol", symbol.to_string()),
+            ("startTime", minute_start.to_string()),
+            ("endTime", live.tick.timestamp_ms.to_string()),
+            ("limit", "1".to_string()),
+        ])
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<serde_json::Value>()
+        .await?;
+    let first = payload
+        .as_array()
+        .and_then(|rows| rows.first())
+        .ok_or_else(|| {
+            tracing::warn!(
+                symbol,
+                minute_start,
+                end_time = live.tick.timestamp_ms,
+                "bootstrap first-trade lookup returned no array row"
+            );
+            RestError::InvalidPayload
+        })?;
+    let id = first["a"].as_i64().ok_or(RestError::InvalidPayload)?;
+    let time = first["T"].as_i64().ok_or(RestError::InvalidPayload)?;
+    if id < 0 || id > live.id || time < minute_start || time > live.tick.timestamp_ms {
+        tracing::warn!(
+            symbol,
+            minute_start,
+            end_time = live.tick.timestamp_ms,
+            first_id = id,
+            first_time = time,
+            live_id = live.id,
+            "bootstrap first trade lies outside the exact WebSocket boundary"
+        );
+        return Err(RestError::InvalidPayload);
+    }
+    Ok(id)
 }
 
 async fn stored_bucket_anchor(
@@ -955,6 +1583,241 @@ mod tests {
         }
     }
 
+    async fn bootstrap_worker(intervals: &[&str]) -> BinanceWorker {
+        BinanceWorker::new(
+            SqliteStore::connect("sqlite::memory:").await.unwrap(),
+            LatestCache::default(),
+            MemorySeriesStore::default(),
+            ClosedKlineBuffer::default(),
+            RuntimeHealth::default(),
+            SubscriptionPlan::from_subscriptions(vec![SymbolSubscription::new(
+                "BTCUSDT",
+                intervals
+                    .iter()
+                    .map(|value| Interval::parse(value).unwrap())
+                    .collect(),
+                RealtimeSource::Trade,
+            )]),
+            1_500,
+            false,
+            usize::MAX,
+            Arc::new(Mutex::new(())),
+        )
+    }
+
+    fn seed_candle(open: i64, interval: Interval, volume: f64, is_closed: bool) -> Candle {
+        Candle {
+            open_time: open,
+            close_time: open + interval.as_millis() as i64 - 1,
+            open: 100.0,
+            high: 110.0,
+            low: 90.0,
+            close: 100.0,
+            volume,
+            quote_volume: volume * 100.0,
+            trade_count: 5,
+            is_closed,
+        }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_uses_only_closed_prefix_and_exact_ids_for_day_and_seconds() {
+        let mut worker = bootstrap_worker(&["15S", "1", "5", "D", "2D"]).await;
+        let day = 86_400_000;
+        worker
+            .store
+            .upsert_candle(
+                "BTCUSDT",
+                "D",
+                &seed_candle(0, Interval::Days(1), 50.0, true),
+            )
+            .await
+            .unwrap();
+        worker
+            .store
+            .upsert_candle(
+                "BTCUSDT",
+                "1",
+                &seed_candle(day, Interval::Minutes(1), 10.0, true),
+            )
+            .await
+            .unwrap();
+        // REST dynamic buckets contain overlapping future trades and cannot
+        // provide the handoff point. They must be completely disregarded.
+        for (name, interval) in [
+            ("1", Interval::Minutes(1)),
+            ("5", Interval::Minutes(5)),
+            ("D", Interval::Days(1)),
+        ] {
+            let start = interval.bucket_start_ms(day + 61_000);
+            let mut dynamic = seed_candle(start, interval, 999.0, false);
+            dynamic.high = 999.0;
+            // Keep the genuinely closed minute prefix at the previous open.
+            worker
+                .store
+                .upsert_candle("BTCUSDT", name, &dynamic)
+                .await
+                .unwrap();
+        }
+        let preceding = aggregate_trade(10, day + 59_000, 100.0, 1.0);
+        let missing = [aggregate_trade(11, day + 60_100, 101.0, 1.0)];
+        let live = aggregate_trade(12, day + 61_000, 102.0, 2.0);
+        worker
+            .complete_trade_bootstrap("BTCUSDT", Some(preceding), &missing, live)
+            .await
+            .unwrap();
+        let snapshot = worker.latest.live_snapshot("BTCUSDT").await.unwrap();
+        assert!(!snapshot.recovering);
+        assert_eq!(snapshot.sequence, 1);
+        assert_eq!(snapshot.candles["1"].volume, 3.0);
+        assert_eq!(snapshot.candles["5"].volume, 13.0);
+        assert_eq!(snapshot.candles["D"].volume, 13.0);
+        assert_eq!(snapshot.candles["2D"].volume, 63.0);
+        assert_eq!(snapshot.candles["2D"].high, 110.0);
+        assert!(!snapshot.candles.contains_key("15S"));
+        worker
+            .handle_aggregate_trade("BTCUSDT", live)
+            .await
+            .unwrap();
+        assert_eq!(
+            worker
+                .latest
+                .live_snapshot("BTCUSDT")
+                .await
+                .unwrap()
+                .sequence,
+            1
+        );
+        worker
+            .handle_aggregate_trade("BTCUSDT", aggregate_trade(13, day + 75_000, 103.0, 1.0))
+            .await
+            .unwrap();
+        let next = worker.latest.live_snapshot("BTCUSDT").await.unwrap();
+        assert_eq!(next.candles["15S"].open_time, day + 75_000);
+        assert_eq!(next.candles["15S"].volume, 1.0);
+        assert!(worker
+            .memory_series
+            .query("BTCUSDT", "15S", None, None, 10)
+            .await
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_missing_closed_prefix_keeps_that_period_unknown() {
+        let mut worker = bootstrap_worker(&["1", "5"]).await;
+        // A missing initial minute makes the 5m prefix unverifiable.
+        worker
+            .store
+            .upsert_candle(
+                "BTCUSDT",
+                "1",
+                &seed_candle(60_000, Interval::Minutes(1), 10.0, true),
+            )
+            .await
+            .unwrap();
+        worker
+            .complete_trade_bootstrap(
+                "BTCUSDT",
+                Some(aggregate_trade(10, 119_000, 100.0, 1.0)),
+                &[aggregate_trade(11, 120_100, 101.0, 1.0)],
+                aggregate_trade(12, 121_000, 102.0, 2.0),
+            )
+            .await
+            .unwrap();
+        let snapshot = worker.latest.live_snapshot("BTCUSDT").await.unwrap();
+        assert!(snapshot.candles.contains_key("1"));
+        assert!(!snapshot.candles.contains_key("5"));
+        assert!(worker.latest.get("BTCUSDT", "5").await.is_none());
+        worker
+            .handle_aggregate_trade("BTCUSDT", aggregate_trade(13, 300_000, 103.0, 1.0))
+            .await
+            .unwrap();
+        assert_eq!(
+            worker
+                .latest
+                .live_snapshot("BTCUSDT")
+                .await
+                .unwrap()
+                .candles["5"]
+                .volume,
+            1.0
+        );
+        assert!(worker
+            .closed_buffer
+            .query("BTCUSDT", "5", None, None, 10)
+            .await
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_requires_a_proven_first_trade_boundary() {
+        let mut worker = bootstrap_worker(&["1", "5"]).await;
+        let missing = [aggregate_trade(11, 60_100, 101.0, 1.0)];
+        let live = aggregate_trade(12, 61_000, 102.0, 2.0);
+        // An earlier trade in the same minute reveals a truncated prefix.
+        assert!(worker
+            .complete_trade_bootstrap(
+                "BTCUSDT",
+                Some(aggregate_trade(10, 60_001, 100.0, 1.0)),
+                &missing,
+                live
+            )
+            .await
+            .is_err());
+        assert!(worker.latest.live_snapshot("BTCUSDT").await.is_none());
+        assert!(worker.trade_cursors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_boundary_request_is_bounded_and_rejects_wrong_time() {
+        use axum::{extract::Query, routing::get, Json, Router};
+        let router = Router::new().route(
+            "/fapi/v1/aggTrades",
+            get(|Query(query): Query<HashMap<String, String>>| async move {
+                assert_eq!(query["symbol"], "BTCUSDT");
+                assert_eq!(query["startTime"], "60000");
+                assert_eq!(query["endTime"], "61000");
+                assert_eq!(query["limit"], "1");
+                assert!(!query.contains_key("fromId"));
+                Json(serde_json::json!([{"a": 10, "T": 60001, "p": "100", "q": "1"}]))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let id = fetch_first_minute_trade_id(
+            &reqwest::Client::new(),
+            &format!("http://{address}"),
+            "BTCUSDT",
+            aggregate_trade(12, 61_000, 102.0, 2.0),
+        )
+        .await
+        .unwrap();
+        task.abort();
+        assert_eq!(id, 10);
+
+        let router = Router::new().route(
+            "/fapi/v1/aggTrades",
+            get(|| async { Json(serde_json::json!([{"a": 10, "T": 59999}])) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let result = fetch_first_minute_trade_id(
+            &reqwest::Client::new(),
+            &format!("http://{address}"),
+            "BTCUSDT",
+            aggregate_trade(12, 61_000, 102.0, 2.0),
+        )
+        .await;
+        task.abort();
+        assert!(matches!(result, Err(RestError::InvalidPayload)));
+    }
+
     #[tokio::test]
     async fn disconnect_removes_live_candles_and_seconds_history() {
         let mut worker = recovery_worker().await;
@@ -975,6 +1838,11 @@ mod tests {
             1
         );
         worker.invalidate_trade_aggregators().await;
+        let recovering = worker.latest.live_snapshot("BTCUSDT").await.unwrap();
+        assert!(recovering.recovering);
+        assert!(recovering.candles.is_empty());
+        assert_eq!(recovering.market_event_time_ms, 16_000);
+        assert_eq!(recovering.generation, 2);
         assert!(worker.latest.get("BTCUSDT", "1").await.is_none());
         assert!(worker.latest.get("BTCUSDT", "15S").await.is_none());
         assert!(worker
@@ -989,6 +1857,15 @@ mod tests {
         assert!(worker.trade_recovery.contains_key("BTCUSDT"));
         // Repeated failed connections must retain the original trusted prefix.
         worker.invalidate_trade_aggregators().await;
+        assert_eq!(
+            worker
+                .latest
+                .live_snapshot("BTCUSDT")
+                .await
+                .unwrap()
+                .generation,
+            2
+        );
         assert_eq!(
             worker.trade_recovery["BTCUSDT"][&("BTCUSDT".into(), "1".into())]
                 .current()
@@ -1033,6 +1910,13 @@ mod tests {
             .complete_trade_recovery("BTCUSDT", &missing, live)
             .await
             .unwrap();
+        let snapshot = worker.latest.live_snapshot("BTCUSDT").await.unwrap();
+        assert!(!snapshot.recovering);
+        assert_eq!(snapshot.sequence, 2); // Replay publishes exactly once.
+        assert_eq!(snapshot.generation, 2);
+        assert_eq!(snapshot.market_event_time_ms, 61_000);
+        assert_eq!(snapshot.candles["1"].close, 101.0);
+        assert_eq!(snapshot.candles["15S"].close, 101.0);
         let rows = worker
             .closed_buffer
             .query("BTCUSDT", "1", None, None, 10)
@@ -1043,6 +1927,15 @@ mod tests {
             .handle_aggregate_trade("BTCUSDT", live)
             .await
             .unwrap();
+        assert_eq!(
+            worker
+                .latest
+                .live_snapshot("BTCUSDT")
+                .await
+                .unwrap()
+                .sequence,
+            snapshot.sequence
+        );
         assert_eq!(worker.latest.get("BTCUSDT", "1").await.unwrap().volume, 5.0);
         flush_closed_buffer(&worker.store, &worker.closed_buffer, &worker.flush_lock).await;
         assert_eq!(
@@ -1103,6 +1996,109 @@ mod tests {
             (110.0, 90.0, 9.0)
         );
         assert_eq!(current.trade_count, 3);
+        assert!(worker.latest.get("BTCUSDT", "15S").await.is_none());
+        let snapshot = worker.latest.live_snapshot("BTCUSDT").await.unwrap();
+        assert!(!snapshot.candles.contains_key("15S"));
+        worker
+            .handle_aggregate_trade("BTCUSDT", aggregate_trade(13, 15_000, 105.0, 1.0))
+            .await
+            .unwrap();
+        assert_eq!(
+            worker.latest.get("BTCUSDT", "15S").await.unwrap().volume,
+            1.0
+        );
+        assert!(worker
+            .memory_series
+            .query("BTCUSDT", "15S", None, None, 10)
+            .await
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn dynamic_symbol_snapshot_contains_the_same_trade_in_every_interval() {
+        let mut worker = recovery_worker().await;
+        worker
+            .handle_aggregate_trade("BTCUSDT", aggregate_trade(10, 1_000, 100.0, 2.0))
+            .await
+            .unwrap();
+        let first = worker.latest.live_snapshot("BTCUSDT").await.unwrap();
+        assert_eq!(first.candles.len(), 2);
+        assert_eq!(first.sequence, 1);
+        assert_eq!(first.generation, 1);
+        for candle in first.candles.values() {
+            assert_eq!(candle.close, 100.0);
+            assert!(!candle.is_closed);
+            assert!(candle.close_time > first.market_event_time_ms);
+        }
+        worker
+            .handle_aggregate_trade("BTCUSDT", aggregate_trade(11, 1_000, 105.0, 3.0))
+            .await
+            .unwrap();
+        let second = worker.latest.live_snapshot("BTCUSDT").await.unwrap();
+        assert_eq!(second.sequence, 2);
+        for candle in second.candles.values() {
+            assert_eq!(candle.close, 105.0);
+            assert_eq!(candle.volume, 5.0);
+        }
+        assert!(first.candles.values().all(|candle| candle.close == 100.0));
+    }
+
+    #[tokio::test]
+    async fn forward_id_with_regressing_market_time_is_not_fresh_data() {
+        let mut worker = recovery_worker().await;
+        worker
+            .handle_aggregate_trade("BTCUSDT", aggregate_trade(10, 16_000, 100.0, 2.0))
+            .await
+            .unwrap();
+        assert!(worker
+            .handle_aggregate_trade("BTCUSDT", aggregate_trade(11, 15_000, 105.0, 3.0))
+            .await
+            .is_err());
+        let snapshot = worker.latest.live_snapshot("BTCUSDT").await.unwrap();
+        assert!(snapshot.recovering);
+        assert_eq!(snapshot.market_event_time_ms, 16_000);
+        assert_eq!(snapshot.sequence, 1);
+        assert_eq!(worker.trade_cursors["BTCUSDT"].id, 10);
+    }
+
+    #[tokio::test]
+    async fn replay_keeps_complete_rest_repair_over_partial_saved_prefix() {
+        let mut worker = recovery_worker().await;
+        worker
+            .handle_aggregate_trade("BTCUSDT", aggregate_trade(10, 30_000, 100.0, 2.0))
+            .await
+            .unwrap();
+        worker.invalidate_trade_aggregators().await;
+        let repaired = Candle {
+            open_time: 0,
+            close_time: 59_999,
+            open: 80.0,
+            high: 150.0,
+            low: 70.0,
+            close: 150.0,
+            volume: 50.0,
+            quote_volume: 5_000.0,
+            trade_count: 20,
+            is_closed: true,
+        };
+        worker
+            .store
+            .upsert_candle("BTCUSDT", "1", &repaired)
+            .await
+            .unwrap();
+        worker
+            .complete_trade_recovery(
+                "BTCUSDT",
+                &[aggregate_trade(11, 55_000, 150.0, 3.0)],
+                aggregate_trade(12, 61_000, 110.0, 4.0),
+            )
+            .await
+            .unwrap();
+        let closed = worker
+            .closed_buffer
+            .query("BTCUSDT", "1", None, None, 10)
+            .await;
+        assert_eq!(closed[0].candle, repaired);
     }
 
     #[tokio::test]
@@ -1141,7 +2137,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn closed_one_minute_klines_refresh_higher_interval_once_per_minute() {
+    async fn minute_klines_update_dynamic_preview_before_close() {
         let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
         let latest = LatestCache::default();
         let closed_buffer = ClosedKlineBuffer::default();
@@ -1167,6 +2163,7 @@ mod tests {
             .handle_event(MarketEvent::OpenKline {
                 symbol: "BTCUSDT".to_string(),
                 interval: "1".to_string(),
+                event_time_ms: 1_000,
                 candle: Candle {
                     open_time: 0,
                     close_time: 59_999,
@@ -1181,7 +2178,11 @@ mod tests {
                 },
             })
             .await;
-        assert!(latest.get("BTCUSDT", "5").await.is_none());
+        assert_eq!(latest.get("BTCUSDT", "5").await.unwrap().close, 999.0);
+        assert!(closed_buffer
+            .query("BTCUSDT", "5", None, None, 10)
+            .await
+            .is_empty());
 
         let bucket_start = Interval::parse("5")
             .unwrap()
@@ -1192,6 +2193,7 @@ mod tests {
                 .handle_event(MarketEvent::ClosedKline {
                     symbol: "BTCUSDT".to_string(),
                     interval: "1".to_string(),
+                    event_time_ms: open_time + 59_999,
                     candle: Candle {
                         open_time,
                         close_time: open_time + 59_999,
@@ -1232,6 +2234,263 @@ mod tests {
         assert_eq!(preview.quote_volume, 2_000.0);
         assert_eq!(preview.trade_count, 20);
         assert!(!preview.is_closed);
+    }
+
+    async fn minute_worker(intervals: &[&str]) -> BinanceWorker {
+        BinanceWorker::new(
+            SqliteStore::connect("sqlite::memory:").await.unwrap(),
+            LatestCache::default(),
+            MemorySeriesStore::default(),
+            ClosedKlineBuffer::default(),
+            RuntimeHealth::default(),
+            SubscriptionPlan::from_subscriptions(vec![SymbolSubscription::new(
+                "KORUUSDT",
+                intervals
+                    .iter()
+                    .map(|value| Interval::parse(value).unwrap())
+                    .collect(),
+                RealtimeSource::Kline1m,
+            )]),
+            1_500,
+            false,
+            usize::MAX,
+            Arc::new(Mutex::new(())),
+        )
+    }
+
+    fn minute_candle(open_time: i64, volume: f64, closed: bool) -> Candle {
+        Candle {
+            open_time,
+            close_time: open_time + 59_999,
+            open: 100.0,
+            high: 102.0,
+            low: 99.0,
+            close: 101.0,
+            volume,
+            quote_volume: volume * 101.0,
+            trade_count: volume as u64,
+            is_closed: closed,
+        }
+    }
+
+    async fn minute_event(worker: &mut BinanceWorker, candle: Candle, event_time_ms: i64) {
+        let event = if candle.is_closed {
+            MarketEvent::ClosedKline {
+                symbol: "KORUUSDT".into(),
+                interval: "1".into(),
+                event_time_ms,
+                candle,
+            }
+        } else {
+            MarketEvent::OpenKline {
+                symbol: "KORUUSDT".into(),
+                interval: "1".into(),
+                event_time_ms,
+                candle,
+            }
+        };
+        worker.handle_event(event).await;
+    }
+
+    #[tokio::test]
+    async fn cumulative_open_minutes_replace_preview_and_closed_minutes_are_deduplicated() {
+        let mut worker = minute_worker(&["1", "5", "15"]).await;
+        worker
+            .store
+            .upsert_candle("KORUUSDT", "1", &minute_candle(0, 10.0, true))
+            .await
+            .unwrap();
+        worker
+            .closed_buffer
+            .upsert("KORUUSDT", "1", minute_candle(60_000, 10.0, true))
+            .await;
+        worker.seed_kline_symbol("KORUUSDT", 120_000).await.unwrap();
+        minute_event(&mut worker, minute_candle(120_000, 10.0, false), 121_000).await;
+        minute_event(&mut worker, minute_candle(120_000, 15.0, false), 122_000).await;
+        let snapshot = worker.latest.live_snapshot("KORUUSDT").await.unwrap();
+        assert_eq!(snapshot.market_event_time_ms, 122_000);
+        assert_eq!(snapshot.candles.len(), 3);
+        assert_eq!(snapshot.candles["1"].volume, 15.0);
+        for period in ["5", "15"] {
+            assert_eq!(snapshot.candles[period].volume, 35.0);
+            assert_eq!(snapshot.candles[period].quote_volume, 35.0 * 101.0);
+            assert_eq!(snapshot.candles[period].trade_count, 35);
+            assert!(!snapshot.candles[period].is_closed);
+        }
+        // A delayed older update cannot replace the new cumulative minute.
+        minute_event(&mut worker, minute_candle(120_000, 11.0, false), 121_500).await;
+        assert_eq!(
+            worker
+                .latest
+                .live_snapshot("KORUUSDT")
+                .await
+                .unwrap()
+                .sequence,
+            snapshot.sequence
+        );
+        minute_event(&mut worker, minute_candle(120_000, 18.0, true), 179_999).await;
+        let closed = worker.latest.live_snapshot("KORUUSDT").await.unwrap();
+        assert!(!closed.candles.contains_key("1"));
+        assert_eq!(closed.candles["5"].volume, 38.0);
+        minute_event(&mut worker, minute_candle(120_000, 18.0, true), 180_001).await;
+        minute_event(&mut worker, minute_candle(120_000, 99.0, false), 180_002).await;
+        assert_eq!(
+            worker
+                .latest
+                .live_snapshot("KORUUSDT")
+                .await
+                .unwrap()
+                .sequence,
+            closed.sequence
+        );
+        minute_event(&mut worker, minute_candle(180_000, 7.0, false), 181_000).await;
+        assert_eq!(
+            worker
+                .latest
+                .live_snapshot("KORUUSDT")
+                .await
+                .unwrap()
+                .candles["5"]
+                .volume,
+            45.0
+        );
+    }
+
+    #[tokio::test]
+    async fn minute_source_finalizes_target_at_its_last_minute_and_starts_next_dynamic_bucket() {
+        let mut worker = minute_worker(&["1", "5"]).await;
+        for index in 0..5 {
+            let candle = minute_candle(index * 60_000, 10.0, true);
+            let event_time = candle.close_time;
+            minute_event(&mut worker, candle, event_time).await;
+        }
+        let rows = worker
+            .closed_buffer
+            .query("KORUUSDT", "5", None, None, 10)
+            .await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].candle.volume, 50.0);
+        assert_eq!(rows[0].candle.close_time, 299_999);
+        assert!(rows[0].candle.is_closed);
+        assert!(!worker
+            .latest
+            .live_snapshot("KORUUSDT")
+            .await
+            .unwrap()
+            .candles
+            .contains_key("5"));
+        minute_event(&mut worker, minute_candle(300_000, 2.0, false), 301_000).await;
+        let current = worker.latest.live_snapshot("KORUUSDT").await.unwrap();
+        assert_eq!(current.candles["5"].open_time, 300_000);
+        assert_eq!(current.candles["5"].volume, 2.0);
+    }
+
+    #[tokio::test]
+    async fn missing_or_partial_minute_prefix_cannot_publish_a_partial_long_candle() {
+        let mut worker = minute_worker(&["1", "5"]).await;
+        worker
+            .store
+            .upsert_candle("KORUUSDT", "1", &minute_candle(0, 10.0, true))
+            .await
+            .unwrap();
+        worker
+            .store
+            .upsert_candle("KORUUSDT", "1", &minute_candle(60_000, 99.0, false))
+            .await
+            .unwrap();
+        worker.seed_kline_symbol("KORUUSDT", 120_000).await.unwrap();
+        minute_event(&mut worker, minute_candle(120_000, 1.0, false), 121_000).await;
+        let snapshot = worker.latest.live_snapshot("KORUUSDT").await.unwrap();
+        assert!(snapshot.candles.contains_key("1"));
+        assert!(!snapshot.candles.contains_key("5"));
+        assert!(worker
+            .closed_buffer
+            .query("KORUUSDT", "5", None, None, 10)
+            .await
+            .is_empty());
+        minute_event(&mut worker, minute_candle(300_000, 2.0, false), 301_000).await;
+        assert_eq!(
+            worker
+                .latest
+                .live_snapshot("KORUUSDT")
+                .await
+                .unwrap()
+                .candles["5"]
+                .volume,
+            2.0
+        );
+    }
+
+    #[tokio::test]
+    async fn minute_source_multiday_prefix_uses_daily_then_buffered_minutes() {
+        let mut worker = minute_worker(&["1", "10D"]).await;
+        let target = Interval::Days(10);
+        let bucket = target.bucket_start_ms(chrono::Utc::now().timestamp_millis());
+        let day = 86_400_000;
+        for index in 0..3 {
+            let mut candle = minute_candle(bucket + index * day, 100.0, true);
+            candle.close_time = candle.open_time + day - 1;
+            worker
+                .store
+                .upsert_candle("KORUUSDT", "D", &candle)
+                .await
+                .unwrap();
+        }
+        let minute_open = bucket + 3 * day + 120_000;
+        for index in 0..2 {
+            worker
+                .closed_buffer
+                .upsert(
+                    "KORUUSDT",
+                    "1",
+                    minute_candle(bucket + 3 * day + index * 60_000, 10.0, true),
+                )
+                .await;
+        }
+        worker
+            .seed_kline_symbol("KORUUSDT", minute_open)
+            .await
+            .unwrap();
+        minute_event(
+            &mut worker,
+            minute_candle(minute_open, 5.0, false),
+            minute_open + 1_000,
+        )
+        .await;
+        let current = worker.latest.live_snapshot("KORUUSDT").await.unwrap();
+        assert_eq!(current.candles["10D"].open_time, bucket);
+        assert_eq!(current.candles["10D"].volume, 325.0);
+    }
+
+    #[tokio::test]
+    async fn minute_source_disconnect_invalidates_generation_and_requires_history_bootstrap() {
+        let mut worker = minute_worker(&["1", "5"]).await;
+        minute_event(&mut worker, minute_candle(0, 10.0, false), 1_000).await;
+        worker.kline_initialized.insert("KORUUSDT".into());
+        let before = worker.latest.live_snapshot("KORUUSDT").await.unwrap();
+        worker.invalidate_trade_aggregators().await;
+        let recovering = worker.latest.live_snapshot("KORUUSDT").await.unwrap();
+        assert!(recovering.recovering);
+        assert!(recovering.candles.is_empty());
+        assert_eq!(recovering.generation, before.generation + 1);
+        assert!(worker.kline_needs_bootstrap("KORUUSDT", 0));
+        assert!(worker.latest.get("KORUUSDT", "5").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn minute_source_missing_final_or_whole_minutes_requires_history_repair() {
+        let mut worker = minute_worker(&["1", "5"]).await;
+        worker.kline_initialized.insert("KORUUSDT".into());
+        worker
+            .kline_cursors
+            .insert("KORUUSDT".into(), (0, 1_000, false));
+        assert!(!worker.kline_needs_bootstrap("KORUUSDT", 0));
+        assert!(worker.kline_needs_bootstrap("KORUUSDT", 60_000));
+        worker
+            .kline_cursors
+            .insert("KORUUSDT".into(), (0, 59_999, true));
+        assert!(!worker.kline_needs_bootstrap("KORUUSDT", 60_000));
+        assert!(worker.kline_needs_bootstrap("KORUUSDT", 120_000));
     }
 
     #[tokio::test]
@@ -1486,9 +2745,10 @@ mod tests {
             .handle_event(MarketEvent::ClosedKline {
                 symbol: "QQQUSDT".to_string(),
                 interval: "1".to_string(),
+                event_time_ms: current_open + 59_999,
                 candle: Candle {
-                    open_time: now_ms.div_euclid(60_000) * 60_000,
-                    close_time: now_ms.div_euclid(60_000) * 60_000 + 59_999,
+                    open_time: current_open,
+                    close_time: current_open + 59_999,
                     open: 106.0,
                     high: 107.0,
                     low: 105.0,

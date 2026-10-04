@@ -1,3 +1,4 @@
+mod charts;
 mod handlers;
 mod routes;
 mod signals;

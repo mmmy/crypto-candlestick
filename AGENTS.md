@@ -34,3 +34,4 @@ Rust 代码修改按影响范围运行测试，必要时运行 `cargo test`；�
 
 # 远程部署
 ssh -p 22 root@139.180.203.107
+windows使用用wsl构建, 服务器用nohup部署启动的

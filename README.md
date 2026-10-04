@@ -211,6 +211,7 @@ Invoke-RestMethod "http://127.0.0.1:3005/api/signals?symbols=BTCUSDT,XAUUSDT"
 | GET | `/api/health/deep` | 各交易对/周期的最新数据、滞后与连续尾段详情 |
 | GET | `/api/klines` | 一个交易对、多个周期的 K 线 |
 | GET | `/api/indicators/guaili` | 多个交易对、多个周期的乖离、趋势和波动过滤状态 |
+| GET | `/api/charts/guaili` | 单次冻结输入的 OHLC、Android 通道/波幅与矩阵指标；见 API 契约 |
 | GET | `/api/signals` | 读取最近动态信号采样、全部结构和逐周期数据质量 |
 | POST | `/api/signals/reload` | 校验并原子重载独立信号配置 |
 | POST / GET | `/api/alerts` | 创建一次性价格警报 / 列出警报 |

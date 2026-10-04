@@ -48,6 +48,7 @@
 | GET | `/api/health/deep` | 查看 WebSocket 及各序列详情 |
 | GET | `/api/klines` | 一个交易对、多个周期的 OHLCV |
 | GET | `/api/indicators/guaili` | 多个交易对、多个周期的乖离与趋势状态 |
+| GET | `/api/charts/guaili` | 同一输入的 OHLC、Android 图表指标与矩阵指标快照 |
 | GET | `/api/signals` | 最近的动态多周期信号采样及数据质量 |
 | POST | `/api/signals/reload` | 原子重载独立 `signals.toml` 配置 |
 | POST | `/api/alerts` | 创建一次性价格穿越警报 |
@@ -588,3 +589,32 @@ PATCH 示例：`{"status":"disabled"}` 禁用；`{"status":"active"}` 重新启�
 | 500 | 数据库操作失败等内部错误 |
 
 非法列表元素或数据库失败会使整个请求失败，不返回部分成功的多周期结果。K 线与单周期指标的合法但未配置组合仍返回 200 空序列；信号查询未启用的品种返回 400。健康状态为 `false` 或信号质量异常也不能仅靠状态码识别。
+
+## 同源图表快照
+
+`GET /api/charts/guaili?symbol=BTCUSDT&interval=1&limit=300&calcLimit=500&closedOnly=false`
+
+这是新增代码接口，部署包含该版本的服务后可用；旧 K 线与指标接口保持原契约。图表调用方使用这一条请求读取 OHLC 与指标，不能将 `/api/klines` 和 `/api/indicators/guaili` 两次请求当作同一采样。
+
+| 参数 | 说明 |
+| --- | --- |
+| symbol / interval | 必填单品种、单周期；只接受后端配置组合，未配置返回400 |
+| limit | 输出最多多少根，默认300，范围1–2000 |
+| calcLimit | 计算输入最多多少根，默认500，实际至少limit和20，最多2000 |
+| closedOnly | 默认false，允许动态末根；true只读取已收盘点 |
+
+矩阵计算固定复用当前 `GuailiConfig::default()`，`matrixConfig`回显配置；本接口不接受自定义MA参数。Android图表口径固定EMA20、SMA(TR,14)初始化的ATR14、波幅20根90% nearest-rank。指标区别详见 guaili.md。
+
+响应包括 `symbol`、规范化`interval`、`candleMode`、`snapshotId`、`serverTime/capturedAt`（Unix毫秒）、`source`、`indicatorContracts`、`matrixConfig`、`calcLimit`、`actualCalcBars/actualCalcStartTimeMs`、`indicatorCoverageStartTimeMs/indicatorCoverageEndTimeMs`、`dataQuality/reasons`、`nextBefore`及`bars`。
+
+`bars[]`按开盘时间升序，每根包含数字毫秒的`openTimeMs/closeTimeMs`、OHLCV、quoteVolume、tradeCount、isClosed，以及以下具名组：
+
+- `androidChannel`：ema20、atr14、上下轨、`closeDeviation`和当前通道趋势；ATR前13根为空。
+- `amplitude`：normalizedRange、threshold、`edgeDistance`、weakTop/weakBottom；阈值前19根为空。
+- `matrix`：ma、当前及前atr14、`rawGuaili/value`、atrRank/rankFilter、当前及前根趋势。矩阵仍使用前ATR分母，未改变原算法。
+
+两套指标都由响应OHLC所属同一冻结计算输入生成。actualCalcStartTime可能早于输出首根，不能拿输出300根重新计算就声称与500根计算结果一致。source若存在，提供运行标识、行情sequence/generation、事件时间和接收时间；它描述捕获的动态输入，不代表整个数据库历史的事务版本。历史本身没有版本来源时source可为空。
+
+复制内存后进行数据库读取，转储前缓冲副本用于合并。若动态桶或恢复代次改变，有限重试；恢复中返回503，不能输出混合来源。无效OHLC或缺口裁剪到有效连续尾段并在reasons中说明。算术溢出返回422。dataQuality可为ready、warming_up、missing、stale、degraded或unverified；HTTP200不等于所有指标已预热或源行情持续更新。
+
+nextBefore为输出首根openTimeMs−1，可供旧 `/api/klines` 的endTime向过去分页；本图表接口暂不接受历史游标，也不承诺无限秒级历史。客户端只替换当前响应的指标覆盖，历史OHLC页不得拼接不同计算窗口的旧指标线。

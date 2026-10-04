@@ -44,6 +44,7 @@ pub fn router_with_signals(
         .route("/api/health/deep", get(deep_health))
         .route("/api/klines", get(klines))
         .route("/api/indicators/guaili", get(guaili))
+        .route("/api/charts/guaili", get(super::charts::chart))
         .route("/api/alerts", get(alerts).post(create_alert))
         .route(
             "/api/alerts/:id",

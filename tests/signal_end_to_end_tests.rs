@@ -23,6 +23,7 @@ struct Fixture {
     service: SignalService,
     path: PathBuf,
     calls: Arc<AtomicUsize>,
+    messages: Arc<tokio::sync::Mutex<Vec<String>>>,
     mock: tokio::task::JoinHandle<()>,
 }
 
@@ -30,16 +31,23 @@ impl Fixture {
     async fn new(slow: bool) -> Self {
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_clone = calls.clone();
+        let messages = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let messages_clone = messages.clone();
         let app = Router::new().route(
             "/hook",
             post(move |Json(body): Json<serde_json::Value>| {
                 let calls = calls_clone.clone();
+                let messages = messages_clone.clone();
                 async move {
                     assert_eq!(body["msgtype"], "text");
                     assert!(body["text"]["content"]
                         .as_str()
                         .unwrap()
                         .contains("BTCUSDT"));
+                    messages
+                        .lock()
+                        .await
+                        .push(body["text"]["content"].as_str().unwrap().to_owned());
                     calls.fetch_add(1, Ordering::SeqCst);
                     if slow {
                         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -101,6 +109,7 @@ impl Fixture {
             service,
             path,
             calls,
+            messages,
             mock,
         }
     }
@@ -130,9 +139,9 @@ impl Fixture {
             .await;
     }
 
-    async fn wait_for_call(&self) {
+    async fn wait_for_calls(&self, count: usize) {
         tokio::time::timeout(Duration::from_secs(3), async {
-            while self.calls.load(Ordering::SeqCst) == 0 {
+            while self.calls.load(Ordering::SeqCst) < count {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -171,7 +180,7 @@ async fn background_sampler_sends_new_dynamic_signal_once_without_http_queries()
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
     fixture.publish(120.0).await;
     let sampler = fixture.service.start();
-    fixture.wait_for_call().await;
+    fixture.wait_for_calls(1).await;
     tokio::time::sleep(Duration::from_millis(1100)).await;
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
     assert_eq!(
@@ -193,7 +202,7 @@ async fn disabling_cancels_an_inflight_request_without_retries() {
     fixture.service.sample_once_at(now_ms()).await;
     fixture.publish(120.0).await;
     let sampler = fixture.service.start();
-    fixture.wait_for_call().await;
+    fixture.wait_for_calls(1).await;
     fs::write(&fixture.path, "enabled=false\n").unwrap();
     fixture.service.reload().await.unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -212,7 +221,7 @@ async fn market_recovery_cancels_an_inflight_old_generation_request() {
     fixture.service.sample_once_at(now_ms()).await;
     fixture.publish(120.0).await;
     let sampler = fixture.service.start();
-    fixture.wait_for_call().await;
+    fixture.wait_for_calls(1).await;
     let lock = fixture.data.latest.market_update_lock();
     {
         let _write = lock.write().await;
@@ -223,5 +232,44 @@ async fn market_recovery_cancels_an_inflight_old_generation_request() {
     assert_eq!(snapshot.delivery.failed, 0);
     assert_eq!(snapshot.delivery.successful, 0);
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    sampler.abort();
+}
+
+#[tokio::test]
+async fn format_reload_keeps_calculation_and_sends_next_event_as_compact_text() {
+    let fixture = Fixture::new(false).await;
+    fixture.publish(100.0).await;
+    fixture.service.sample_once_at(now_ms()).await;
+    fixture.publish(120.0).await;
+    fixture.service.sample_once_at(now_ms()).await;
+    let sampler = fixture.service.start();
+    fixture.wait_for_calls(1).await;
+    assert!(fixture.messages.lock().await[0].contains("\n动态K采样时间："));
+
+    let original = fixture.service.snapshot_at(now_ms()).await;
+    let raw = fs::read_to_string(&fixture.path).unwrap();
+    fs::write(&fixture.path, format!("{raw}message_format='compact'\n")).unwrap();
+    let reloaded = fixture.service.reload().await.unwrap();
+    assert_eq!(reloaded.config_hash, original.config_hash);
+    let unchanged = fixture.service.snapshot_at(now_ms()).await;
+    assert_eq!(
+        unchanged.results[0].signals[0].id,
+        original.results[0].signals[0].id
+    );
+    // Reload establishes a notification baseline without resending the active structure.
+    fixture.service.sample_once_at(now_ms()).await;
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+
+    fixture.publish(100.0).await;
+    fixture.service.sample_once_at(now_ms()).await;
+    fixture.publish(120.0).await;
+    fixture.service.sample_once_at(now_ms()).await;
+    fixture.wait_for_calls(2).await;
+    let messages = fixture.messages.lock().await;
+    assert_eq!(messages.len(), 2);
+    assert!(messages[1].starts_with("BTCUSDT 上方乖离共振｜1d–1w·5级｜"));
+    assert!(!messages[1].contains(['\n', '\r']));
+    chrono::NaiveTime::parse_from_str(messages[1].rsplit('｜').next().unwrap(), "%H:%M:%S")
+        .unwrap();
     sampler.abort();
 }

@@ -1,6 +1,6 @@
 use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
 use crypto_candlestick::signals::{
-    config::{SignalConfig, WecomAlertConfig},
+    config::{SignalConfig, WecomAlertConfig, WecomMessageFormat},
     delivery::{send, DeliveryJob, DeliveryManager},
     model::{
         Availability, IntervalEvidence, SignalDirection, SignalKind, SignalRun, SignalStructure,
@@ -24,6 +24,7 @@ fn alert(id: &str, url: &str) -> WecomAlertConfig {
             SignalKind::Conflict,
         ],
         cooldown_secs: 300,
+        message_format: WecomMessageFormat::Detailed,
     }
 }
 
@@ -91,6 +92,125 @@ fn evidence(missing: Option<&str>) -> Vec<IntervalEvidence> {
         ..IntervalEvidence::default()
     });
     points
+}
+
+fn sampled_at() -> i64 {
+    chrono::DateTime::parse_from_rfc3339("2026-10-04T15:58:05+08:00")
+        .unwrap()
+        .timestamp_millis()
+}
+
+fn message(config: &SignalConfig, structure: SignalStructure) -> String {
+    let mut manager = DeliveryManager::new();
+    manager.prepare(config, &results(vec![], true), sampled_at() - 5_000);
+    manager
+        .prepare(config, &results(vec![structure], true), sampled_at())
+        .remove(0)
+        .message
+}
+
+#[test]
+fn detailed_message_preserves_existing_content_and_full_sampling_date() {
+    assert_eq!(
+        message(&config(), signal("one", "15", SignalKind::Extreme)),
+        "btc\nBTCUSDT · 乖离共振 · 上方\n周期：3、5、8、10、15\n最大级别：15；覆盖：5级\n动态K采样时间：2026-10-04 15:58:05 +08:00\n仅表示指标状态，供观察。"
+    );
+}
+
+#[test]
+fn compact_extreme_messages_include_direction_mixed_units_and_level_count() {
+    let mut config = config();
+    config.wecom_alerts[0].message_format = WecomMessageFormat::Compact;
+    config.wecom_alerts[0].min_signal_interval = "1".into();
+    for (direction, label) in [
+        (SignalDirection::Positive, "上方"),
+        (SignalDirection::Negative, "下方"),
+    ] {
+        let mut structure = signal("one", "2", SignalKind::Extreme);
+        structure.direction = direction;
+        structure.runs[0].direction = direction;
+        structure.runs[0].intervals = ["10S", "15S", "30S", "45S", "1", "2"]
+            .map(str::to_owned)
+            .to_vec();
+        structure.level_count = 6;
+        structure.total_level_count = 6;
+        assert_eq!(
+            message(&config, structure),
+            format!("BTCUSDT {label}乖离共振｜10s–2m·6级｜15:58:05")
+        );
+    }
+}
+
+#[test]
+fn compact_compression_message_does_not_repeat_near_ma_direction() {
+    let mut config = config();
+    config.wecom_alerts[0].message_format = WecomMessageFormat::Compact;
+    let mut structure = signal("one", "15", SignalKind::Compression);
+    structure.direction = SignalDirection::Neutral;
+    structure.runs[0].direction = SignalDirection::Neutral;
+    structure.runs[0].intervals[0] = "1".into();
+    assert_eq!(
+        message(&config, structure),
+        "BTCUSDT 多周期近均线｜1m–15m·5级｜15:58:05"
+    );
+}
+
+#[test]
+fn compact_conflict_messages_keep_both_ranges_and_short_long_directions() {
+    let mut config = config();
+    config.wecom_alerts[0].message_format = WecomMessageFormat::Compact;
+    for (short, long, label) in [
+        (
+            SignalDirection::Positive,
+            SignalDirection::Negative,
+            "短正长负",
+        ),
+        (
+            SignalDirection::Negative,
+            SignalDirection::Positive,
+            "短负长正",
+        ),
+    ] {
+        let mut structure = signal("one", "30", SignalKind::Conflict);
+        structure.direction = short;
+        structure.runs[0].direction = short;
+        structure.runs[0].intervals = ["10S", "15S", "30S", "45S", "1", "2"]
+            .map(str::to_owned)
+            .to_vec();
+        let mut long_run = structure.runs[0].clone();
+        long_run.direction = long;
+        long_run.intervals = ["5", "8", "10", "15", "30"].map(str::to_owned).to_vec();
+        structure.runs.push(long_run);
+        structure.level_count = 6;
+        structure.total_level_count = 11;
+        assert_eq!(
+            message(&config, structure),
+            format!("BTCUSDT 长短周期分歧·{label}｜10s–2m / 5m–30m｜15:58:05")
+        );
+    }
+}
+
+#[test]
+fn compact_ranges_support_long_periods_and_single_level_structures() {
+    let mut config = config();
+    config.wecom_alerts[0].message_format = WecomMessageFormat::Compact;
+    config.wecom_alerts[0].min_signal_interval = "10S".into();
+    for (periods, expected) in [
+        (vec!["60", "90", "120", "240", "720"], "60m–720m·5级"),
+        (vec!["D", "2D", "3D", "4D", "W"], "1d–1w·5级"),
+        (vec!["10S"], "10s·1级"),
+        (vec!["D"], "1d·1级"),
+        (vec!["W"], "1w·1级"),
+    ] {
+        let mut structure = signal("one", periods.last().unwrap(), SignalKind::Extreme);
+        structure.level_count = periods.len();
+        structure.total_level_count = periods.len();
+        structure.runs[0].intervals = periods.into_iter().map(str::to_owned).collect();
+        assert_eq!(
+            message(&config, structure),
+            format!("BTCUSDT 上方乖离共振｜{expected}｜15:58:05")
+        );
+    }
 }
 
 #[test]
@@ -237,6 +357,28 @@ fn scans_all_candidates_and_deduplicates_same_target() {
     assert_eq!(jobs.len(), 1);
     assert!(jobs[0].message.contains("多周期近均线"));
     assert!(!format!("{:?}", jobs[0]).contains("TEST_SECRET"));
+}
+
+#[test]
+fn overlapping_formats_send_once_using_first_matching_subscription() {
+    let mut config = config();
+    config.wecom_alerts[0].message_format = WecomMessageFormat::Compact;
+    config
+        .wecom_alerts
+        .push(alert("detailed", &config.wecom_alerts[0].webhook_url));
+    let mut manager = DeliveryManager::new();
+    manager.prepare(&config, &results(vec![], true), sampled_at() - 5_000);
+    let jobs = manager.prepare(
+        &config,
+        &results(vec![signal("one", "15", SignalKind::Extreme)], true),
+        sampled_at(),
+    );
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].alert_id, "btc");
+    assert_eq!(
+        jobs[0].message,
+        "BTCUSDT 上方乖离共振｜3m–15m·5级｜15:58:05"
+    );
 }
 
 #[test]

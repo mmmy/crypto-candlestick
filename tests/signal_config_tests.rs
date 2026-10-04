@@ -1,4 +1,4 @@
-use crypto_candlestick::signals::config::SignalConfig;
+use crypto_candlestick::signals::config::{SignalConfig, WecomMessageFormat};
 use std::path::Path;
 
 fn targets() -> Vec<(String, String)> {
@@ -36,7 +36,47 @@ fn config_normalizes_and_defaults_without_database() {
     assert_eq!(config.wecom_alerts[0].name, "btc");
     assert_eq!(config.wecom_alerts[0].symbols, ["BTCUSDT"]);
     assert_eq!(config.wecom_alerts[0].cooldown_secs, 300);
+    assert_eq!(
+        config.wecom_alerts[0].message_format,
+        WecomMessageFormat::Detailed
+    );
     assert!(!format!("{config:?}").contains("TEST_SECRET"));
+}
+
+#[test]
+fn message_format_is_selected_per_subscription_and_only_changes_delivery_hash() {
+    let mut config = SignalConfig::from_toml(valid_raw()).unwrap();
+    config.normalize_and_validate(&targets()).unwrap();
+    let calculation_hash = config.calculation_hash();
+    let delivery_hash = config.delivery_hash();
+    let raw = format!(
+        "{}\nmessage_format = \"compact\"\n\n[[wecom_alerts]]\nid = \"detailed\"\nwebhook_url = \"http://127.0.0.1:12345/mock\"\nmessage_format = \"detailed\"\n",
+        valid_raw()
+    );
+    let mut updated = SignalConfig::from_toml(&raw).unwrap();
+    updated.normalize_and_validate(&targets()).unwrap();
+    assert_eq!(
+        updated.wecom_alerts[0].message_format,
+        WecomMessageFormat::Compact
+    );
+    assert_eq!(
+        updated.wecom_alerts[1].message_format,
+        WecomMessageFormat::Detailed
+    );
+    // Isolate the format change from adding the second subscription.
+    updated.wecom_alerts.pop();
+    assert_eq!(updated.calculation_hash(), calculation_hash);
+    assert_ne!(updated.delivery_hash(), delivery_hash);
+}
+
+#[test]
+fn rejects_unknown_message_formats_and_wrong_types_without_echoing_credentials() {
+    for value in ["\"brief\"", "\"COMPACT\"", "\"\"", "true", "123", "[]"] {
+        let raw = format!("{}\nmessage_format = {value}\n", valid_raw());
+        let error = SignalConfig::from_toml(&raw).unwrap_err();
+        assert!(!error.contains("TEST_SECRET"));
+        assert!(!error.contains("qyapi.weixin.qq.com"));
+    }
 }
 
 #[test]

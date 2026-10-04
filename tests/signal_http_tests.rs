@@ -225,3 +225,31 @@ async fn invalid_startup_config_reports_config_error_but_health_is_available() {
     assert_eq!(body["status"], "config_error");
     assert_eq!(body["enabled"], false);
 }
+
+#[tokio::test]
+async fn invalid_message_format_reload_returns_400_and_keeps_previous_configuration() {
+    let raw = "enabled=true\nsymbols=['BTCUSDT']\n[[wecom_alerts]]\nid='test'\nwebhook_url='http://127.0.0.1:12345/mock?key=TEST_SECRET'\nmessage_format='compact'\n";
+    let fixture = Fixture::new(Some(raw)).await;
+    fixture.service.sample_once_at(now_ms()).await;
+    let original: serde_json::Value = fixture.get("").await.json().await.unwrap();
+    fs::write(
+        &fixture.path,
+        raw.replace("enabled=true", "enabled=false")
+            .replace("message_format='compact'", "message_format='brief'"),
+    )
+    .unwrap();
+    let response = reqwest::Client::new()
+        .post(format!("{}/api/signals/reload", fixture.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error = response.text().await.unwrap();
+    assert!(!error.contains("TEST_SECRET"));
+    assert!(!error.contains("webhook_url"));
+    let unchanged: serde_json::Value = fixture.get("").await.json().await.unwrap();
+    assert_eq!(unchanged["enabled"], true);
+    assert_eq!(unchanged["configHash"], original["configHash"]);
+    assert_eq!(unchanged["snapshotVersion"], original["snapshotVersion"]);
+    assert_eq!(unchanged["results"], original["results"]);
+}

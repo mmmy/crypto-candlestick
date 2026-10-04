@@ -136,6 +136,14 @@ impl Default for QualityConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WecomMessageFormat {
+    #[default]
+    Detailed,
+    Compact,
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WecomAlertConfig {
@@ -151,6 +159,8 @@ pub struct WecomAlertConfig {
     pub kinds: Vec<SignalKind>,
     #[serde(default = "default_cooldown_secs")]
     pub cooldown_secs: u64,
+    #[serde(default)]
+    pub message_format: WecomMessageFormat,
 }
 
 impl fmt::Debug for WecomAlertConfig {
@@ -163,6 +173,7 @@ impl fmt::Debug for WecomAlertConfig {
             .field("min_signal_interval", &self.min_signal_interval)
             .field("kinds", &self.kinds)
             .field("cooldown_secs", &self.cooldown_secs)
+            .field("message_format", &self.message_format)
             .finish()
     }
 }

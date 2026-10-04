@@ -1,4 +1,4 @@
-use super::config::{stable_hash, SignalConfig, WecomAlertConfig};
+use super::config::{stable_hash, SignalConfig, WecomAlertConfig, WecomMessageFormat};
 use super::model::{IntervalEvidence, SignalDirection, SignalKind, SignalStructure};
 use crate::domain::interval::Interval;
 use serde::Serialize;
@@ -363,19 +363,51 @@ fn format_message(
         (_, SignalDirection::Negative) => "下方",
         (_, SignalDirection::Neutral) => "近均线",
     };
+    let time_format = match alert.message_format {
+        WecomMessageFormat::Detailed => "%Y-%m-%d %H:%M:%S +08:00",
+        WecomMessageFormat::Compact => "%H:%M:%S",
+    };
+    let observed = chrono::DateTime::from_timestamp_millis(now_ms)
+        .map(|time| {
+            time.with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap())
+                .format(time_format)
+                .to_string()
+        })
+        .unwrap_or_else(|| now_ms.to_string());
+    if alert.message_format == WecomMessageFormat::Compact {
+        let label = match signal.kind {
+            SignalKind::Extreme => format!("{direction}{kind}"),
+            SignalKind::Compression => kind.to_owned(),
+            SignalKind::Conflict => format!("{kind}·{direction}"),
+        };
+        let ranges = signal
+            .runs
+            .iter()
+            .filter_map(|run| {
+                let first = run.intervals.first()?;
+                let last = run.intervals.last()?;
+                let start = compact_interval(first);
+                Some(if first == last {
+                    start
+                } else {
+                    format!("{start}–{}", compact_interval(last))
+                })
+            })
+            .collect::<Vec<_>>()
+            .join(" / ");
+        let coverage = if signal.kind == SignalKind::Conflict {
+            ranges
+        } else {
+            format!("{ranges}·{}级", signal.total_level_count)
+        };
+        return format!("{symbol} {label}｜{coverage}｜{observed}");
+    }
     let ranges = signal
         .runs
         .iter()
         .map(|run| run.intervals.join("、"))
         .collect::<Vec<_>>()
         .join(" / ");
-    let observed = chrono::DateTime::from_timestamp_millis(now_ms)
-        .map(|time| {
-            time.with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap())
-                .format("%Y-%m-%d %H:%M:%S +08:00")
-                .to_string()
-        })
-        .unwrap_or_else(|| now_ms.to_string());
     format!(
         "{}\n{} · {} · {}\n周期：{}\n最大级别：{}；覆盖：{}级\n动态K采样时间：{}\n仅表示指标状态，供观察。",
         alert.name,
@@ -387,6 +419,16 @@ fn format_message(
         signal.total_level_count,
         observed
     )
+}
+
+fn compact_interval(interval: &str) -> String {
+    match Interval::parse(interval) {
+        Ok(Interval::Seconds(value)) => format!("{value}s"),
+        Ok(Interval::Minutes(value)) => format!("{value}m"),
+        Ok(Interval::Days(value)) => format!("{value}d"),
+        Ok(Interval::Weeks(value)) => format!("{value}w"),
+        Err(_) => interval.to_owned(),
+    }
 }
 
 /// Send one fixed text message. All retries are bounded and response text stays private.

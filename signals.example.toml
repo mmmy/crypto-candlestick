@@ -47,6 +47,7 @@ max_result_age_secs = 15
 # min_signal_interval = "15"
 # kinds = ["extreme", "compression", "conflict"]
 # cooldown_secs = 300
+# message_format = "compact" # compact：简要单行；detailed：详细（默认）
 
 # [[wecom_alerts]]
 # id = "gold-observation"
@@ -56,6 +57,9 @@ max_result_age_secs = 15
 # min_signal_interval = "60"
 # kinds = ["extreme", "conflict"]
 # cooldown_secs = 300
+# message_format = "detailed"
 
 # cooldown_secs默认300，0关闭冷却；冷却内抑制的匹配不延后补发。
+# message_format仅接受compact/detailed，省略时默认detailed；修改后重载不补发已有信号。
+# compact示例：BTCUSDT 上方乖离共振｜10s–2m·6级｜15:58:05（北京时间采样时刻）。
 # 真实Webhook含凭据，只应保存在服务器，勿提交到版本库。

@@ -122,9 +122,9 @@ fn compact_extreme_messages_include_direction_mixed_units_and_level_count() {
     let mut config = config();
     config.wecom_alerts[0].message_format = WecomMessageFormat::Compact;
     config.wecom_alerts[0].min_signal_interval = "1".into();
-    for (direction, label) in [
-        (SignalDirection::Positive, "上方"),
-        (SignalDirection::Negative, "下方"),
+    for (direction, marker, label) in [
+        (SignalDirection::Positive, "🔴⬆️", "上方"),
+        (SignalDirection::Negative, "🟢⬇️", "下方"),
     ] {
         let mut structure = signal("one", "2", SignalKind::Extreme);
         structure.direction = direction;
@@ -136,7 +136,7 @@ fn compact_extreme_messages_include_direction_mixed_units_and_level_count() {
         structure.total_level_count = 6;
         assert_eq!(
             message(&config, structure),
-            format!("BTCUSDT {label}乖离共振｜10s–2m·6级｜15:58:05")
+            format!("{marker} BTCUSDT {label}乖离共振｜⏱️10s–2m·6级｜15:58:05")
         );
     }
 }
@@ -151,7 +151,7 @@ fn compact_compression_message_does_not_repeat_near_ma_direction() {
     structure.runs[0].intervals[0] = "1".into();
     assert_eq!(
         message(&config, structure),
-        "BTCUSDT 多周期近均线｜1m–15m·5级｜15:58:05"
+        "🟡 BTCUSDT 多周期近均线｜⏱️1m–15m·5级｜15:58:05"
     );
 }
 
@@ -185,7 +185,7 @@ fn compact_conflict_messages_keep_both_ranges_and_short_long_directions() {
         structure.total_level_count = 11;
         assert_eq!(
             message(&config, structure),
-            format!("BTCUSDT 长短周期分歧·{label}｜10s–2m / 5m–30m｜15:58:05")
+            format!("🔀 BTCUSDT 长短周期分歧·{label}｜⏱️10s–2m / 5m–30m｜15:58:05")
         );
     }
 }
@@ -208,7 +208,7 @@ fn compact_ranges_support_long_periods_and_single_level_structures() {
         structure.runs[0].intervals = periods.into_iter().map(str::to_owned).collect();
         assert_eq!(
             message(&config, structure),
-            format!("BTCUSDT 上方乖离共振｜{expected}｜15:58:05")
+            format!("🔴⬆️ BTCUSDT 上方乖离共振｜⏱️{expected}｜15:58:05")
         );
     }
 }
@@ -377,7 +377,7 @@ fn overlapping_formats_send_once_using_first_matching_subscription() {
     assert_eq!(jobs[0].alert_id, "btc");
     assert_eq!(
         jobs[0].message,
-        "BTCUSDT 上方乖离共振｜3m–15m·5级｜15:58:05"
+        "🔴⬆️ BTCUSDT 上方乖离共振｜⏱️3m–15m·5级｜15:58:05"
     );
 }
 

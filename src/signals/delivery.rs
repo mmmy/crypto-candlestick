@@ -375,6 +375,13 @@ fn format_message(
         })
         .unwrap_or_else(|| now_ms.to_string());
     if alert.message_format == WecomMessageFormat::Compact {
+        let marker = match (signal.kind, signal.direction) {
+            (SignalKind::Extreme, SignalDirection::Positive) => "🔴⬆️",
+            (SignalKind::Extreme, SignalDirection::Negative) => "🟢⬇️",
+            (SignalKind::Extreme, SignalDirection::Neutral) => "⚪",
+            (SignalKind::Compression, _) => "🟡",
+            (SignalKind::Conflict, _) => "🔀",
+        };
         let label = match signal.kind {
             SignalKind::Extreme => format!("{direction}{kind}"),
             SignalKind::Compression => kind.to_owned(),
@@ -400,7 +407,7 @@ fn format_message(
         } else {
             format!("{ranges}·{}级", signal.total_level_count)
         };
-        return format!("{symbol} {label}｜{coverage}｜{observed}");
+        return format!("{marker} {symbol} {label}｜⏱️{coverage}｜{observed}");
     }
     let ranges = signal
         .runs

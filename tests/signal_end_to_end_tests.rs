@@ -267,7 +267,7 @@ async fn format_reload_keeps_calculation_and_sends_next_event_as_compact_text() 
     fixture.wait_for_calls(2).await;
     let messages = fixture.messages.lock().await;
     assert_eq!(messages.len(), 2);
-    assert!(messages[1].starts_with("BTCUSDT 上方乖离共振｜1d–1w·5级｜"));
+    assert!(messages[1].starts_with("🔴⬆️ BTCUSDT 上方乖离共振｜⏱️1d–1w·5级｜"));
     assert!(!messages[1].contains(['\n', '\r']));
     chrono::NaiveTime::parse_from_str(messages[1].rsplit('｜').next().unwrap(), "%H:%M:%S")
         .unwrap();

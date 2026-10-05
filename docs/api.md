@@ -105,11 +105,7 @@ GET /api/klines?symbol=BTCUSDT&intervals=1,5,15&limit=200&closedOnly=true
             "volume": 12.5,
             "quoteVolume": 1250.0,
             "tradeCount": 42,
-            "isClosed": true,
-            "availability": "ready",
-            "reasonCode": null,
-            "reason": null,
-            "historyCount": 20
+            "isClosed": true
           }
         }
       ]
@@ -207,7 +203,11 @@ GET /api/indicators/guaili?symbols=BTCUSDT,XAUUSDT&intervals=1,5,15&limit=1&calc
             "value": 12,
             "longTrend": true,
             "shortTrend": false,
-            "isClosed": true
+            "isClosed": true,
+            "availability": "ready",
+            "reasonCode": null,
+            "reason": null,
+            "historyCount": 20
           },
           "data": [
             {

@@ -297,12 +297,17 @@ impl SignalService {
                     evidence.availability = Availability::Stale;
                     evidence.reason = Some("signal sampling result is stale".into());
                     evidence.reason_code = Some(EvidenceReasonCode::SamplingStale);
+                    evidence.clear_values();
                 }
             }
         }
         if control.config.enabled {
             for symbol in &mut result.results {
-                if symbol.signals.is_empty() {
+                if !symbol
+                    .per_interval_quality
+                    .iter()
+                    .any(|e| e.value.is_some())
+                {
                     continue;
                 }
                 let live = self.inner.data.latest.live_snapshot(&symbol.symbol).await;
@@ -332,6 +337,7 @@ impl SignalService {
                         } else {
                             EvidenceReasonCode::MarketStale
                         });
+                        evidence.clear_values();
                     }
                     result.status = "degraded".into();
                 }
@@ -890,18 +896,6 @@ fn evaluate_series(
             "insufficient contiguous closed history",
         );
     }
-    if !candles
-        .iter()
-        .chain(std::iter::once(&current))
-        .all(valid_candle)
-    {
-        return unavailable(
-            result,
-            Availability::Invalid,
-            EvidenceReasonCode::InvalidData,
-            "invalid candle prices or volume",
-        );
-    }
     candles.push(current);
     let points = compute_guaili(&candles, config.indicator.to_guaili_config());
     let Some(point) = points.last() else {
@@ -912,6 +906,25 @@ fn evaluate_series(
             "indicator result is missing",
         );
     };
+    if !point.has_value() {
+        let code = match point.quality.reason_code() {
+            Some("invalid_data") => EvidenceReasonCode::InvalidData,
+            Some("insufficient_history") => EvidenceReasonCode::InsufficientHistory,
+            Some("indicator_warming_up") => EvidenceReasonCode::IndicatorWarmingUp,
+            _ => EvidenceReasonCode::IndicatorInvalid,
+        };
+        let availability = if point.quality.availability() == "warming_up" {
+            Availability::WarmingUp
+        } else {
+            Availability::Invalid
+        };
+        return unavailable(
+            result,
+            availability,
+            code,
+            point.quality.reason().unwrap_or("indicator is unavailable"),
+        );
+    }
     let previous_atr = points
         .get(points.len().saturating_sub(2))
         .map(|point| point.atr14)
@@ -944,33 +957,12 @@ fn evaluate_series(
     result.atr_rank = Some(rank);
     result.long_trend = Some(point.long_trend);
     result.short_trend = Some(point.short_trend);
-    result.availability = if point.rank_filter {
+    result.availability = if point.rank_filter() {
         Availability::Ready
     } else {
         Availability::Filtered
     };
     result
-}
-
-fn valid_candle(candle: &Candle) -> bool {
-    [
-        candle.open,
-        candle.high,
-        candle.low,
-        candle.close,
-        candle.volume,
-        candle.quote_volume,
-    ]
-    .iter()
-    .all(|value| value.is_finite())
-        && candle.low > 0.0
-        && candle.high >= candle.low
-        && candle.open >= candle.low
-        && candle.open <= candle.high
-        && candle.close >= candle.low
-        && candle.close <= candle.high
-        && candle.volume >= 0.0
-        && candle.quote_volume >= 0.0
 }
 
 fn data_status(evidence: &[IntervalEvidence]) -> String {

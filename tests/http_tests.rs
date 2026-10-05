@@ -640,7 +640,7 @@ async fn guaili_endpoint_returns_latest_indicator_values_for_each_symbol() {
     });
 
     let response = reqwest::get(format!(
-        "http://{addr}/api/indicators/guaili?symbols=BTCUSDT,ETHUSDT&intervals=1&limit=20&maLength=3"
+        "http://{addr}/api/indicators/guaili?symbols=BTCUSDT,ETHUSDT&intervals=1&limit=20&maLength=3&closedOnly=true"
     ))
     .await
     .unwrap();
@@ -713,7 +713,7 @@ async fn guaili_endpoint_uses_history_even_when_response_limit_is_one() {
     });
 
     let response = reqwest::get(format!(
-        "http://{addr}/api/indicators/guaili?symbols=BTCUSDT&intervals=1&limit=1&maLength=3"
+        "http://{addr}/api/indicators/guaili?symbols=BTCUSDT&intervals=1&limit=1&maLength=3&closedOnly=true"
     ))
     .await
     .unwrap();

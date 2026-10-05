@@ -10,7 +10,7 @@
 | --- | --- | --- |
 | `guaili > 0` | 整根 K 线在当前均线上方，值越大，最近边缘距均线越远 | 不自动表示买入或即将下跌 |
 | `guaili < 0` | 整根 K 线在当前均线下方 | 不自动表示卖出或即将上涨 |
-| `guaili = 0` | 高低区间触碰/跨越均线，或计算分母为零 | 不等于收盘价等于均线，也不保证低波动 |
+| `guaili = 0` | 有效 K 线高低区间触碰/跨越均线 | 不等于收盘价等于均线，也不保证低波动；无效分母返回空值 |
 | `value` | `guaili × 10` 的整数显示值 | 不是百分比，也不保留全部精度 |
 | `longTrend/shortTrend` | 均线连续同向变化且通过可选强度检查 | 是持续状态，不是一次性的进场事件 |
 | `rankFilter` | 相对波动排名是否低于或等于阈值 | 不是自动应用到所有输出上的总开关 |
@@ -29,7 +29,9 @@
 | WMA | 最近最多 L 个收盘价按从旧到新 `1,2,...,窗口实际长度` 加权平均 |
 | VWMA | 最近最多 L 根的 `sum(close*volume)/sum(volume)`；总量为 0 时退回该窗口的算术平均 |
 
-**初始化：** EMA/RMA 都以本次计算输入的第一个值作为种子；SMA/WMA/VWMA 在历史少于 L 根时使用已有数据，不等待完整窗口。因此第一根就能返回 `ma`，并不代表均线已经预热稳定。
+**初始化：** EMA/RMA 都以本次计算输入的第一个值作为种子；SMA/WMA/VWMA 内部在历史少于 L 根时使用已有数据。公开矩阵指标不会把这些初始化点作为有效数值返回：未完成指标预热时 `ma/atr14/atrRank/guaili/value/rankFilter/longTrend/shortTrend` 为 `null`，时间字段保留。
+
+矩阵指标最低输入数量为 `max(maLength, atrLen + atrPercentLen - 1, 15)`，默认为 20 根连续输入 K，允许包含当前动态 K。信号的 `minHistoryBars=60` 是另一个条件，要求连续已收盘历史，不能用来替代矩阵指标预热规则。有效的 0 与无效的 `null` 必须区分，客户端只展示后端数值和状态。
 
 ## 2. TR 与两种用途的 ATR
 
@@ -51,8 +53,8 @@ RMA 从首值递推的初始化方式不等同于先等待 n 根、以 SMA 为�
 设 `Aprev=ATR14[t-1]`；输入第一根没有前值时，以当前 `ATR14[0]` 代替。
 
 ```text
-如果 Aprev == 0：
-    guaili[t] = 0
+如果 Aprev <= 0 或指标非有限数：
+    公开 guaili/value = null，availability = invalid
 否则，如果 low[t] > MA[t] 且 high[t] > MA[t]：
     guaili[t] = (low[t] - MA[t]) / Aprev
 否则，如果 high[t] < MA[t] 且 low[t] < MA[t]：
@@ -91,7 +93,7 @@ atrRank[t] = (K - 1) / (N - 1) * 100
 rankFilter[t] = atrRank[t] 存在 且 atrRank[t] <= maxAtrRank
 ```
 
-不足 N 根时 `atrRank=null`、`rankFilter=false`；该点的其他指标仍照常返回。排名包含当前值，使用 `<=` 计数，相同值会提高排名：窗口内全部相等时排名为 100，不是 0。
+排名未预热或完整指标输入不足时，公开指标为空，并携带 `availability/reasonCode/reason/historyCount`。完成预热后，排名包含当前值，使用 `<=` 计数，相同值会提高排名：窗口内全部相等时排名为 100，不是 0。
 
 默认 `maxAtrRank=100`，完整窗口正常计算出的排名都会通过。将阈值调低可选出相对波动排名较低的点，但服务不会因此删除数据点或更改其 `guaili`。
 
@@ -121,6 +123,7 @@ shortTrend[t] = down3 且 slopeFilter
 - `trade` 模式随 aggTrade 更新；`kline_1m` 模式随未收盘分钟消息更新动态 K，同一分钟的累计 OHLCV 替换预览，已收盘分钟才写入历史。
 - 历史回放截至时刻 T 时，必须保证参与策略的数据 `closeTime <= T`。查询的 `endTime` 只限制开盘时间；`closedOnly=true` 表示相对当前已收盘，不能单独防止回放时误用当时尚未收盘的大周期数据。
 - `/api/indicators/guaili` 多周期响应依次读取各序列，没有跨周期原子快照保证；顶层 `serverTime` 不是所有指标的共同信号时间。独立的 `/api/signals` 使用同一品种已发布的一致动态快照，见下节。
+- 无 `endTime` 且 `closedOnly=false` 的请求要求有效实时来源：尚未收到行情、恢复中、行情过期、时间无效或当前动态桶缺失时，最新点指标置空；历史点保留。`closedOnly=true` 或指定 `endTime` 的历史查询不受当前实时连接状态影响。
 - 跨周期顺序按真实时长排序（`W=7D`，应在 `4D` 与 `10D` 之间），不能按字符串或接口数组顺序推断大小。
 
 ## 动态多周期结构
@@ -157,10 +160,16 @@ shortTrend[t] = down3 且 slopeFilter
 
 ## 图表口径与矩阵口径
 
-新增图表快照明确返回两个版本：`android-chart-v1`和`matrix-v1`，并共用同一输入。
+图表快照明确返回两个版本：`android-chart-v1`和`matrix-v2`，并共用同一输入。`matrix-v2` 保留原矩阵公式，乖离和值允许为空，并返回可用性与原因。
 
 Android图表通道采用首close初始化EMA20，前14根TR均值初始化ATR14，前13根ATR为空；上下轨为EMA±当前ATR。`closeDeviation=(close−EMA)/当前ATR`是有符号收盘偏离，不是矩阵guaili。
 
 波幅指标的`edgeDistance`是整根K最近边缘到EMA的无符号距离，分母为当前Android ATR；跨EMA为0。它在[1,10]含边界时通过距离条件。normalizedRange是`2*TR/(high+low)`，阈值取包含当前根的20根第18小，严格大于。弱顶底窗口包含强信号本根和随后3根。移植保留原Android文件中的gouge99及MPL-2.0来源标识。
 
 矩阵组直接使用原compute_guaili，包括首TR初始化的RMA、前ATR分母、乘10向零截断，以及当前和前根趋势。没有将图表ATR的初始化替换到矩阵中；有相同名称的字段也必须按所属组理解。
+
+## 空值契约验证（2026-10-05）
+
+后端测试覆盖 46/27/18 根历史、有效零、小幅非零截断为零、无效分母、过滤未通过、未收到行情、恢复和过期，以及无活动结构时证据也必须失效的场景。回归测试还验证实时计算使用质量校验所属的已发布动态 K，而不是另一份 latest 缓存，并确认图表已收盘历史不会因实时行情过期而置空。
+
+当前接口直接使用空值与质量原因契约，不提供旧客户端兼容解码。此仓库的验证范围为后端；客户端测试和独立性能基准不作为这里的验证结论。

@@ -417,11 +417,51 @@ async fn query_hides_expired_results_without_recomputing_the_snapshot() {
     assert_eq!(expired.evaluated_at, initial.evaluated_at);
     assert_eq!(expired.snapshot_version, initial.snapshot_version);
     assert!(expired.results[0].signals.is_empty());
+    assert!(initial.results[0]
+        .per_interval_quality
+        .iter()
+        .all(|e| e.value.is_some()));
+    assert!(expired.results[0]
+        .per_interval_quality
+        .iter()
+        .all(|e| e.value.is_none() && e.guaili.is_none() && e.ma.is_none() && e.atr14.is_none()));
+    // Expiry only changes the response copy, not the retained sampling evidence.
+    let retained = fixture.service.snapshot_at(NOW).await;
+    assert!(retained.results[0]
+        .per_interval_quality
+        .iter()
+        .all(|e| e.value.is_some()));
     assert!(expired.results[0]
         .per_interval_quality
         .iter()
         .all(|item| item.availability == Availability::Stale
             && item.reason_code == Some(EvidenceReasonCode::SamplingStale)));
+}
+
+#[tokio::test]
+async fn query_clears_stale_numeric_evidence_even_without_an_active_structure() {
+    let fixture = Fixture::new(60).await;
+    fixture.config.write(
+        &CONFIG
+            .replace("minimum_levels = 5", "minimum_levels = 6")
+            .replace("max_result_age_secs = 15", "max_result_age_secs = 120"),
+    );
+    fixture.service.reload().await.unwrap();
+    fixture.publish(120.0, NOW).await;
+    fixture.service.sample_once_at(NOW).await;
+    let initial = fixture.service.snapshot_at(NOW).await;
+    assert!(initial.results[0].signals.is_empty());
+    assert!(initial.results[0]
+        .per_interval_quality
+        .iter()
+        .all(|e| e.value.is_some()));
+    let expired = fixture.service.snapshot_at(NOW + 31_000).await;
+    assert!(expired.results[0]
+        .per_interval_quality
+        .iter()
+        .all(|e| e.value.is_none()
+            && e.guaili.is_none()
+            && e.reason_code == Some(EvidenceReasonCode::MarketStale)));
 }
 
 #[tokio::test]

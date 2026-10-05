@@ -139,7 +139,7 @@ level = "info"
 
 `signals.toml` 与行情配置分开维护，可参考 [signals.example.toml](signals.example.toml)。只有一个总开关 `enabled`，关闭后同时停止信号计算及关联企业微信警报，查询返回 `disabled`、空结果；行情采集及原有价格警报继续运行。
 
-`GET /api/signals` 返回当前实际生效的 `indicatorConfig`、`ruleConfig` 和 `qualityConfig`，包括规则整数阈值、最少级数、连续历史要求以及毫秒质量时限。逐周期证据新增可选 `reasonCode`，用于稳定识别预热、过期、缺口、恢复等原因，原 `reason` 文案仍保留。字段均为兼容扩展，Android 旧调用方可忽略。客户端应根据实际时限判断有效性，并处理同一 `snapshotVersion` 下质量失效及结构清除，不能只用采样版本去重。详见 [信号 HTTP 契约](docs/api.md#查询当前结果)。
+`GET /api/signals` 返回当前实际生效的 `indicatorConfig`、`ruleConfig` 和 `qualityConfig`，包括规则整数阈值、最少级数、连续历史要求以及毫秒质量时限。逐周期证据返回可为空的 `reasonCode`，用于稳定识别预热、过期、缺口、恢复等原因，并提供 `reason` 文案。客户端应根据实际时限判断有效性，并处理同一 `snapshotVersion` 下质量失效及结构清除，不能只用采样版本去重。详见 [信号 HTTP 契约](docs/api.md#查询当前结果)。
 
 | 配置 | 默认 / 语义 |
 | --- | --- |
@@ -261,7 +261,7 @@ curl "http://127.0.0.1:3005/api/health/summary"
 
 ### guaili 信号的业务含义
 
-默认使用收盘价 EMA20。整根 K 线位于均线上方时，`guaili=(low-MA)/前一根ATR14`；整根位于下方时，`guaili=(high-MA)/前一根ATR14`；触碰或跨越均线，或分母为零时为 0。`value` 是 `guaili*10` 向零截断后的整数，**不是百分比乖离率**。
+默认使用收盘价 EMA20。整根 K 线位于均线上方时，`guaili=(low-MA)/前一根ATR14`；整根位于下方时，`guaili=(high-MA)/前一根ATR14`；有效 K 线触碰或跨越均线时为 0。历史预热不足、分母无效或实时行情失效时公开指标为 `null`，状态和原因由后端返回。`value` 是 `guaili*10` 向零截断后的整数，**不是百分比乖离率**。
 
 例如均线 100、前一根 ATR14 为 10、当前 low 为 112，则 `guaili=1.2`、`value=12`。`value=0` 也可能是微小非零乖离被截断，不能直接等同于“K 线穿过均线”或“低波动”。
 

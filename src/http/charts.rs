@@ -86,14 +86,17 @@ pub struct MatrixIndicators {
     pub ma: f64,
     pub atr14: f64,
     pub previous_atr14: f64,
-    pub raw_guaili: f64,
-    pub value: i32,
+    pub raw_guaili: Option<f64>,
+    pub value: Option<i32>,
     pub atr_rank: Option<f64>,
     pub rank_filter: bool,
     pub current_long_trend: bool,
     pub current_short_trend: bool,
     pub previous_long_trend: Option<bool>,
     pub previous_short_trend: Option<bool>,
+    pub availability: &'static str,
+    pub reason_code: Option<&'static str>,
+    pub reason: Option<&'static str>,
 }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -354,26 +357,37 @@ fn build_snapshot(
                 ma: m.ma,
                 atr14: m.atr14,
                 previous_atr14: previous.map_or(m.atr14, |p| p.atr14),
-                raw_guaili: m.guaili,
-                value: m.value,
+                raw_guaili: m.has_value().then_some(m.guaili),
+                value: m.has_value().then_some(m.value),
                 atr_rank: m.atr_rank,
-                rank_filter: m.rank_filter,
+                rank_filter: m.rank_filter(),
                 current_long_trend: m.long_trend,
                 current_short_trend: m.short_trend,
                 previous_long_trend: previous.map(|p| p.long_trend),
                 previous_short_trend: previous.map(|p| p.short_trend),
+                availability: m.quality.availability(),
+                reason_code: m.quality.reason_code(),
+                reason: m.quality.reason(),
             },
         });
     }
     let now = Utc::now().timestamp_millis();
-    let stale = live.as_ref().is_some_and(|s| {
-        now.saturating_sub(s.market_event_time_ms) > 30_000
-            || now.saturating_sub(s.received_at_ms) > 30_000
-            || s.market_event_time_ms > now + 2000
-            || s.received_at_ms > now + 2000
-    });
+    let stale = !closed_only
+        && live.as_ref().is_some_and(|s| {
+            now.saturating_sub(s.market_event_time_ms) > 30_000
+                || now.saturating_sub(s.received_at_ms) > 30_000
+                || s.market_event_time_ms > now + 2000
+                || s.received_at_ms > now + 2000
+        });
     if stale {
         reasons.push("market input is stale or has invalid future timestamps".into());
+        if let Some(last) = bars.last_mut() {
+            last.matrix.raw_guaili = None;
+            last.matrix.value = None;
+            last.matrix.availability = "stale";
+            last.matrix.reason_code = Some("market_stale");
+            last.matrix.reason = Some("实时行情已过期或时间无效");
+        }
     }
     let data_quality = if bars.is_empty() {
         "missing"
@@ -408,7 +422,7 @@ fn build_snapshot(
         }),
         indicator_contracts: IndicatorContracts {
             android_chart: "android-chart-v1",
-            matrix: "matrix-v1",
+            matrix: "matrix-v2",
         },
         matrix_config: config.into(),
         calc_limit,

@@ -58,9 +58,6 @@ pub enum EvidenceReasonCode {
     IndicatorMissing,
     IndicatorInvalid,
     IndicatorWarmingUp,
-    /// Forward-compatible decoding for evidence in imported fixtures.
-    #[serde(other)]
-    Unknown,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -69,7 +66,6 @@ pub struct IntervalEvidence {
     pub interval: String,
     pub availability: Availability,
     pub reason: Option<String>,
-    #[serde(default)]
     pub reason_code: Option<EvidenceReasonCode>,
     pub value: Option<i32>,
     pub guaili: Option<f64>,
@@ -85,6 +81,19 @@ pub struct IntervalEvidence {
     pub is_closed: Option<bool>,
 }
 
+impl IntervalEvidence {
+    /// Keep identity, timestamps and quality for diagnostics, never a live value.
+    pub fn clear_values(&mut self) {
+        self.value = None;
+        self.guaili = None;
+        self.ma = None;
+        self.atr14 = None;
+        self.atr_rank = None;
+        self.long_trend = None;
+        self.short_trend = None;
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SignalRun {
@@ -93,10 +102,8 @@ pub struct SignalRun {
     pub min_abs_value: i32,
     pub max_abs_value: i32,
     pub mean_abs_value: f64,
-    /// Unrounded guaili statistics preserve the legacy compression tie-breaks.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Unrounded guaili statistics preserve compression tie-break precision.
     pub max_abs_guaili: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mean_abs_guaili: Option<f64>,
 }
 
@@ -123,14 +130,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn evidence_accepts_legacy_missing_and_future_unknown_reason_codes() {
-        let mut legacy = serde_json::to_value(IntervalEvidence::default()).unwrap();
-        legacy.as_object_mut().unwrap().remove("reasonCode");
-        let old: IntervalEvidence = serde_json::from_value(legacy.clone()).unwrap();
-        assert!(old.reason_code.is_none());
-        legacy["reasonCode"] = serde_json::json!("future_quality_cause");
-        let future: IntervalEvidence = serde_json::from_value(legacy).unwrap();
-        assert_eq!(future.reason_code, Some(EvidenceReasonCode::Unknown));
-        assert!(future.availability.is_unknown());
+    fn evidence_rejects_unknown_reason_codes() {
+        let mut evidence = serde_json::to_value(IntervalEvidence::default()).unwrap();
+        evidence["reasonCode"] = serde_json::json!("unknown_quality_cause");
+        assert!(serde_json::from_value::<IntervalEvidence>(evidence).is_err());
     }
 }

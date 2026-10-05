@@ -2425,7 +2425,10 @@ mod tests {
     async fn minute_source_multiday_prefix_uses_daily_then_buffered_minutes() {
         let mut worker = minute_worker(&["1", "10D"]).await;
         let target = Interval::Days(10);
-        let bucket = target.bucket_start_ms(chrono::Utc::now().timestamp_millis());
+        // The three fixture days must already be closed on every day of a 10D
+        // bucket; SQLite correctly rejects future rows as closed history.
+        let bucket = target.bucket_start_ms(chrono::Utc::now().timestamp_millis())
+            - target.as_millis() as i64;
         let day = 86_400_000;
         for index in 0..3 {
             let mut candle = minute_candle(bucket + index * day, 100.0, true);

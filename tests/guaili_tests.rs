@@ -43,7 +43,7 @@ fn computes_positive_guaili_from_distance_above_ema() {
     assert!((latest.atr14 - 8.798_424_795_031_17).abs() < 0.000_001);
     assert!((latest.guaili - 1.042_983_536_760_88).abs() < 0.000_001);
     assert_eq!(latest.value, 10);
-    assert!(latest.rank_filter);
+    assert!(latest.rank_filter());
     assert!(latest.long_trend);
     assert!(!latest.short_trend);
 }

@@ -41,12 +41,78 @@ pub struct GuailiPoint {
     pub ma: f64,
     pub atr14: f64,
     pub atr_rank: Option<f64>,
-    pub rank_filter: bool,
     pub guaili: f64,
     pub value: i32,
     pub long_trend: bool,
     pub short_trend: bool,
     pub is_closed: bool,
+    /// Raw arithmetic remains available internally; public numeric fields are
+    /// nullable unless the backend has validated this point.
+    pub quality: GuailiQuality,
+}
+
+impl GuailiPoint {
+    pub fn rank_filter(&self) -> bool {
+        self.quality == GuailiQuality::Ready
+    }
+    pub fn has_value(&self) -> bool {
+        matches!(self.quality, GuailiQuality::Ready | GuailiQuality::Filtered)
+    }
+}
+
+/// Compact metadata; expand wording only at the API boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum GuailiQuality {
+    Ready,
+    Filtered,
+    InsufficientHistory,
+    InvalidData,
+    IndicatorInvalid,
+    IndicatorWarmingUp,
+}
+impl GuailiQuality {
+    pub fn availability(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Filtered => "filtered",
+            Self::InsufficientHistory | Self::IndicatorWarmingUp => "warming_up",
+            Self::InvalidData | Self::IndicatorInvalid => "invalid",
+        }
+    }
+    pub fn reason_code(self) -> Option<&'static str> {
+        match self {
+            Self::Ready | Self::Filtered => None,
+            Self::InsufficientHistory => Some("insufficient_history"),
+            Self::InvalidData => Some("invalid_data"),
+            Self::IndicatorInvalid => Some("indicator_invalid"),
+            Self::IndicatorWarmingUp => Some("indicator_warming_up"),
+        }
+    }
+    pub fn reason(self) -> Option<&'static str> {
+        match self {
+            Self::Ready | Self::Filtered => None,
+            Self::InsufficientHistory => Some("指标连续历史不足"),
+            Self::InvalidData => Some("行情数据无效"),
+            Self::IndicatorInvalid => Some("指标或前一根 ATR14 分母无效"),
+            Self::IndicatorWarmingUp => Some("波动排名尚未完成预热"),
+        }
+    }
+}
+
+/// Indicator readiness is distinct from the signal engine's extra history rule.
+pub fn minimum_indicator_bars(config: GuailiConfig) -> usize {
+    config
+        .ma_length
+        .max(1)
+        .max(
+            config
+                .atr_len
+                .max(1)
+                .saturating_add(config.atr_percent_len.max(2))
+                .saturating_sub(1),
+        )
+        .max(15) // A fully initialized preceding ATR14.
 }
 
 pub fn compute_guaili(candles: &[Candle], config: GuailiConfig) -> Vec<GuailiPoint> {
@@ -66,8 +132,26 @@ pub fn compute_guaili(candles: &[Candle], config: GuailiConfig) -> Vec<GuailiPoi
     let atr_ranks = percent_ranks(&atrma_values, config.atr_percent_len.max(1));
 
     let mut points = Vec::with_capacity(candles.len());
+    let minimum_bars = minimum_indicator_bars(config);
+    let mut valid_input = true;
     for index in 0..candles.len() {
         let candle = &candles[index];
+        valid_input &= [
+            candle.open,
+            candle.high,
+            candle.low,
+            candle.close,
+            candle.volume,
+            candle.quote_volume,
+        ]
+        .iter()
+        .all(|value| value.is_finite())
+            && candle.low > 0.0
+            && candle.high >= candle.open.max(candle.close)
+            && candle.low <= candle.open.min(candle.close)
+            && candle.volume >= 0.0
+            && candle.quote_volume >= 0.0
+            && candle.close_time >= candle.open_time;
         let ma = ma_values[index];
         let atr14 = atr14_values[index];
         let prev_atr14 = index
@@ -94,6 +178,23 @@ pub fn compute_guaili(candles: &[Candle], config: GuailiConfig) -> Vec<GuailiPoi
             .unwrap_or(0.0);
         let trend_strength_ok = slope > atr14 * config.slope_mul;
         let slope_filter = !config.use_slope || trend_strength_ok;
+        let quality = if !valid_input {
+            GuailiQuality::InvalidData
+        } else if index + 1 < minimum_bars {
+            GuailiQuality::InsufficientHistory
+        } else if prev_atr14 <= 0.0
+            || ![ma, atr14, prev_atr14, guaili]
+                .iter()
+                .all(|v| v.is_finite())
+        {
+            GuailiQuality::IndicatorInvalid
+        } else if atr_ranks[index].is_none_or(|value| !value.is_finite()) {
+            GuailiQuality::IndicatorWarmingUp
+        } else if atr_ranks[index].is_some_and(|rank| rank > config.max_atr_rank) {
+            GuailiQuality::Filtered
+        } else {
+            GuailiQuality::Ready
+        };
 
         points.push(GuailiPoint {
             open_time: candle.open_time,
@@ -101,14 +202,12 @@ pub fn compute_guaili(candles: &[Candle], config: GuailiConfig) -> Vec<GuailiPoi
             ma,
             atr14,
             atr_rank: atr_ranks[index],
-            rank_filter: atr_ranks[index]
-                .map(|rank| rank <= config.max_atr_rank)
-                .unwrap_or(false),
             guaili,
             value: (guaili * 10.0) as i32,
             long_trend: is_up && previous_up && previous2_up && slope_filter,
             short_trend: is_down && previous_down && previous2_down && slope_filter,
             is_closed: candle.is_closed,
+            quality,
         });
     }
 

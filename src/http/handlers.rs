@@ -3,6 +3,7 @@ use crate::{
     domain::{candle::Candle, interval::Interval},
     http::routes::AppState,
     indicators::guaili::{compute_guaili, GuailiConfig, GuailiPoint, MaType},
+    memory::LiveSymbolSnapshot,
     runtime_health::WebSocketHealth,
     storage::sqlite::StoredKline,
     time_format::format_timestamp_ms,
@@ -34,7 +35,6 @@ pub struct AlertRequest {
     pub direction: String,
     pub expires_at: Option<i64>,
     pub webhook_url: String,
-    #[serde(alias = "message")]
     pub message_template: String,
     pub status: Option<String>,
 }
@@ -48,7 +48,6 @@ pub struct AlertPatch {
     pub direction: Option<String>,
     pub expires_at: Option<Option<i64>>,
     pub webhook_url: Option<String>,
-    #[serde(alias = "message")]
     pub message_template: Option<String>,
     pub status: Option<String>,
 }
@@ -744,6 +743,7 @@ async fn query_kline_series(
         end_time,
         limit,
         closed_only,
+        None,
     )
     .await?;
 
@@ -772,6 +772,7 @@ fn is_configured_series(state: &AppState, symbol: &str, interval: &str) -> bool 
         .any(|target| target.symbol == normalized_symbol && target.interval == interval)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn query_kline_rows(
     state: &AppState,
     symbol: &str,
@@ -780,6 +781,7 @@ async fn query_kline_rows(
     end_time: Option<i64>,
     limit: u32,
     closed_only: bool,
+    live: Option<&LiveSymbolSnapshot>,
 ) -> Result<Vec<StoredKline>, (axum::http::StatusCode, String)> {
     let canonical_interval = interval.canonical();
     let query_limit = if closed_only {
@@ -829,17 +831,16 @@ async fn query_kline_rows(
     };
 
     if !closed_only {
-        if let Some(latest) = state
-            .latest
-            .get(symbol, &canonical_interval)
-            .await
-            .filter(|candle| {
-                start_time
-                    .map(|start| candle.open_time >= start)
-                    .unwrap_or(true)
-                    && end_time.map(|end| candle.open_time <= end).unwrap_or(true)
-            })
-        {
+        let current = match live {
+            Some(snapshot) => snapshot.candles.get(&canonical_interval).cloned(),
+            None => state.latest.get(symbol, &canonical_interval).await,
+        };
+        if let Some(latest) = current.filter(|candle| {
+            start_time
+                .map(|start| candle.open_time >= start)
+                .unwrap_or(true)
+                && end_time.map(|end| candle.open_time <= end).unwrap_or(true)
+        }) {
             let latest_row = StoredKline {
                 symbol: symbol.to_uppercase(),
                 interval: canonical_interval.clone(),
@@ -958,6 +959,9 @@ pub struct GuailiSeries {
     pub count: usize,
     pub latest: Option<ApiGuailiPoint>,
     pub data: Vec<ApiGuailiPoint>,
+    pub availability: &'static str,
+    pub reason_code: Option<&'static str>,
+    pub reason: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -965,32 +969,57 @@ pub struct GuailiSeries {
 pub struct ApiGuailiPoint {
     pub open_time: String,
     pub close_time: String,
-    pub ma: f64,
-    pub atr14: f64,
+    pub ma: Option<f64>,
+    pub atr14: Option<f64>,
     pub atr_rank: Option<f64>,
-    pub rank_filter: bool,
-    pub guaili: f64,
-    pub value: i32,
-    pub long_trend: bool,
-    pub short_trend: bool,
+    pub rank_filter: Option<bool>,
+    pub guaili: Option<f64>,
+    pub value: Option<i32>,
+    pub long_trend: Option<bool>,
+    pub short_trend: Option<bool>,
     pub is_closed: bool,
+    pub availability: &'static str,
+    pub reason_code: Option<&'static str>,
+    pub reason: Option<&'static str>,
+    pub history_count: u32,
 }
 
-impl From<GuailiPoint> for ApiGuailiPoint {
-    fn from(point: GuailiPoint) -> Self {
+impl ApiGuailiPoint {
+    fn from_point(point: GuailiPoint, history_count: u32) -> Self {
+        let valid = point.has_value();
         Self {
             open_time: format_timestamp_ms(point.open_time),
             close_time: format_timestamp_ms(point.close_time),
-            ma: point.ma,
-            atr14: point.atr14,
-            atr_rank: point.atr_rank,
-            rank_filter: point.rank_filter,
-            guaili: point.guaili,
-            value: point.value,
-            long_trend: point.long_trend,
-            short_trend: point.short_trend,
+            ma: valid.then_some(point.ma),
+            atr14: valid.then_some(point.atr14),
+            atr_rank: if valid { point.atr_rank } else { None },
+            rank_filter: valid.then_some(point.rank_filter()),
+            guaili: valid.then_some(point.guaili),
+            value: valid.then_some(point.value),
+            long_trend: valid.then_some(point.long_trend),
+            short_trend: valid.then_some(point.short_trend),
             is_closed: point.is_closed,
+            availability: point.quality.availability(),
+            reason_code: point.quality.reason_code(),
+            reason: point.quality.reason(),
+            history_count,
         }
+    }
+}
+
+impl ApiGuailiPoint {
+    fn invalidate(&mut self, availability: &'static str, code: &'static str, reason: &'static str) {
+        self.availability = availability;
+        self.reason_code = Some(code);
+        self.reason = Some(reason);
+        self.ma = None;
+        self.atr14 = None;
+        self.atr_rank = None;
+        self.rank_filter = None;
+        self.guaili = None;
+        self.value = None;
+        self.long_trend = None;
+        self.short_trend = None;
     }
 }
 
@@ -1022,10 +1051,26 @@ pub async fn guaili(
                     count: 0,
                     latest: None,
                     data: Vec::new(),
+                    availability: "not_configured",
+                    reason_code: Some("not_configured"),
+                    reason: Some("后端未配置此组合"),
                 });
                 continue;
             }
 
+            // Freeze each interval's history and live quality together. Writers
+            // hold the write guard while changing buckets or recovery state.
+            let market_lock = state.latest.market_update_lock();
+            let market_guard = if !closed_only && query.end_time.is_none() {
+                Some(market_lock.read().await)
+            } else {
+                None
+            };
+            let live = if market_guard.is_some() {
+                state.latest.live_snapshot(symbol).await
+            } else {
+                None
+            };
             let rows = query_kline_rows(
                 &state,
                 symbol,
@@ -1034,31 +1079,66 @@ pub async fn guaili(
                 query.end_time,
                 calc_limit,
                 closed_only,
+                live.as_ref(),
             )
             .await?;
+            drop(market_guard);
             let candles = rows
                 .iter()
                 .map(|row| row.candle.clone())
                 .collect::<Vec<_>>();
-            let response_points = compute_guaili(&candles, config)
-                .into_iter()
-                .rev()
-                .take(limit as usize)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect::<Vec<_>>();
-            let start_time = response_points
-                .first()
-                .map(|point| format_timestamp_ms(point.open_time));
-            let end_time = response_points
-                .last()
-                .map(|point| format_timestamp_ms(point.open_time));
-            let data = response_points
-                .into_iter()
-                .map(ApiGuailiPoint::from)
-                .collect::<Vec<_>>();
+            let points = compute_guaili(&candles, config);
+            let start = points.len().saturating_sub(limit as usize);
+            let mut history_count = 0_u32;
+            let mut data = Vec::with_capacity(points.len() - start);
+            for (index, point) in points.into_iter().enumerate() {
+                history_count = history_count.saturating_add(u32::from(point.is_closed));
+                if index >= start {
+                    data.push(ApiGuailiPoint::from_point(point, history_count));
+                }
+            }
+            let start_time = data.first().map(|point| point.open_time.clone());
+            let end_time = data.last().map(|point| point.open_time.clone());
+            if !closed_only && query.end_time.is_none() && live.is_none() {
+                if let Some(point) = data.last_mut() {
+                    point.invalidate("warming_up", "waiting_market", "尚未收到实时行情");
+                }
+            }
+            if let (Some(point), Some(live)) = (data.last_mut(), live.as_ref()) {
+                let now = Local::now().timestamp_millis();
+                if live.recovering {
+                    point.invalidate("recovering", "market_recovering", "行情连接恢复中");
+                } else if live.market_event_time_ms > now + 2000 || live.received_at_ms > now + 2000
+                {
+                    point.invalidate("invalid", "market_time_invalid", "行情时间无效");
+                } else if now.saturating_sub(live.market_event_time_ms) > 30_000
+                    || now.saturating_sub(live.received_at_ms) > 30_000
+                {
+                    point.invalidate("stale", "market_stale", "实时行情已过期");
+                } else if !live.candles.contains_key(&canonical_interval) {
+                    point.invalidate("missing", "dynamic_missing", "当前动态 K 缺失");
+                } else if live.candles.get(&canonical_interval).is_some_and(|c| {
+                    c.open_time > live.market_event_time_ms
+                        || c.close_time < live.market_event_time_ms
+                        || c.close_time < now
+                }) {
+                    point.invalidate(
+                        "missing",
+                        "dynamic_time_mismatch",
+                        "动态 K 尚未覆盖最新行情时间",
+                    );
+                }
+            }
             let latest = data.last().cloned();
+            let availability = latest
+                .as_ref()
+                .map_or("missing", |point| point.availability);
+            let reason_code = latest
+                .as_ref()
+                .map_or(Some("dynamic_missing"), |point| point.reason_code);
+            let reason = latest
+                .as_ref()
+                .map_or(Some("暂无 K 线数据"), |point| point.reason);
 
             series.push(GuailiSeries {
                 interval: canonical_interval,
@@ -1067,6 +1147,9 @@ pub async fn guaili(
                 count: data.len(),
                 latest,
                 data,
+                availability,
+                reason_code,
+                reason,
             });
         }
 

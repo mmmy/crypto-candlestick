@@ -106,7 +106,7 @@ async fn ohlc_and_both_indicator_profiles_use_one_input_and_full_calculation_pre
         body["indicatorContracts"]["androidChart"],
         "android-chart-v1"
     );
-    assert_eq!(body["indicatorContracts"]["matrix"], "matrix-v1");
+    assert_eq!(body["indicatorContracts"]["matrix"], "matrix-v2");
     let matrix = compute_guaili(&input, GuailiConfig::default());
     let channel = compute_android_chart(&input);
     for (i, row) in body["bars"].as_array().unwrap().iter().enumerate() {
@@ -157,7 +157,7 @@ async fn same_open_time_revision_changes_ohlc_and_its_indicators_together() {
     server.abort();
 }
 #[tokio::test]
-async fn closed_mode_and_buffered_prefix_remain_compatible_with_old_endpoints() {
+async fn closed_mode_includes_buffered_prefix() {
     let (state, input) = fixture("1", 60_000).await;
     state
         .closed_buffer
@@ -193,6 +193,42 @@ async fn closed_mode_and_buffered_prefix_remain_compatible_with_old_endpoints() 
     .unwrap()
     .status()
     .is_success());
+    server.abort();
+}
+
+#[tokio::test]
+async fn stale_market_clears_live_matrix_but_preserves_closed_history() {
+    let (state, input) = fixture("1", 60_000).await;
+    let old = chrono::Utc::now().timestamp_millis() - 31_000;
+    state
+        .latest
+        .publish_live_symbol(
+            "BTCUSDT",
+            HashMap::from([("1".into(), input[30].clone())]),
+            old,
+            old,
+        )
+        .await;
+    let (base, server) = serve(state).await;
+    let url = format!("{base}/api/charts/guaili?symbol=BTCUSDT&interval=1&limit=1");
+    let live: Value = reqwest::get(&url).await.unwrap().json().await.unwrap();
+    assert_eq!(live["bars"][0]["matrix"]["reasonCode"], "market_stale");
+    assert!(live["bars"][0]["matrix"]["value"].is_null());
+    let closed: Value = reqwest::get(format!("{url}&closedOnly=true"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let expected = compute_guaili(&input[..30], GuailiConfig::default());
+    assert_eq!(closed["bars"][0]["openTimeMs"], input[29].open_time);
+    assert_eq!(closed["bars"][0]["matrix"]["availability"], "ready");
+    assert_eq!(closed["bars"][0]["matrix"]["value"], expected[29].value);
+    assert_eq!(
+        closed["bars"][0]["matrix"]["rawGuaili"],
+        expected[29].guaili
+    );
+    assert_eq!(closed["dataQuality"], "ready");
     server.abort();
 }
 #[tokio::test]

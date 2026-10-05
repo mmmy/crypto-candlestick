@@ -105,7 +105,11 @@ GET /api/klines?symbol=BTCUSDT&intervals=1,5,15&limit=200&closedOnly=true
             "volume": 12.5,
             "quoteVolume": 1250.0,
             "tradeCount": 42,
-            "isClosed": true
+            "isClosed": true,
+            "availability": "ready",
+            "reasonCode": null,
+            "reason": null,
+            "historyCount": 20
           }
         }
       ]
@@ -217,9 +221,16 @@ GET /api/indicators/guaili?symbols=BTCUSDT,XAUUSDT&intervals=1,5,15&limit=1&calc
               "value": 12,
               "longTrend": true,
               "shortTrend": false,
-              "isClosed": true
+              "isClosed": true,
+              "availability": "ready",
+              "reasonCode": null,
+              "reason": null,
+              "historyCount": 20
             }
-          ]
+          ],
+          "availability": "ready",
+          "reasonCode": null,
+          "reason": null
         }
       ]
     }
@@ -229,6 +240,12 @@ GET /api/indicators/guaili?symbols=BTCUSDT,XAUUSDT&intervals=1,5,15&limit=1&calc
 
 `latest` 始终等于 `data` 最后一项；它是请求范围内最新点，不一定是当前市场最新点。`count` 为返回点数，不能据此判断 `limit=1` 的请求是否用了足够的预热数据。
 
+矩阵指标由后端判定可用性。每个点新增 `availability`（`ready/filtered/warming_up/invalid/missing/stale/recovering`）、`reasonCode`、`reason` 和 `historyCount`；序列级同样返回状态与原因，未配置为 `not_configured`。`historyCount` 是该点计算输入中的已收盘根数，不是响应 `count`。
+
+公开数值及趋势/过滤字段均可为 `null`：历史未完成指标预热、分母无效或其他计算异常时不能用 0 占位。默认矩阵要求至少 20 根连续输入 K，与信号所需 60 根已收盘历史独立。`ready/filtered` 返回有效数值，真实 0 和小数向零截断形成的 0 保留；`filtered` 不清空数值。客户端将 `null` 显示为 `—`，不重复判断历史根数、EMA/ATR 预热或分母。
+
+当前实时请求（`closedOnly=false` 且无 `endTime`）的最新点还检查实时行情：未收到行情、恢复中、过期、时间无效或动态桶缺失时，`latest` 与 `data` 最后一项同时置空指标并说明原因。单周期计算输入与质量校验使用同一份已发布动态快照，并在读取历史期间阻止行情写入，避免混用重连代次或动态桶；多周期之间仍不保证原子快照。历史查询使用 `closedOnly=true` 或明确的 `endTime`。网络/数据库等整体请求错误继续返回 HTTP 错误，不伪造一批数值 0。
+
 | 字段 | 业务含义 |
 | --- | --- |
 | `ma` | 当前 K 线的收盘价均线 |
@@ -236,11 +253,11 @@ GET /api/indicators/guaili?symbols=BTCUSDT,XAUUSDT&intervals=1,5,15&limit=1&calc
 | `guaili` | 整根 K 线与均线的有符号距离，以前一根 ATR14 归一化 |
 | `value` | `guaili × 10` 向零截断后的整数；不是百分比 |
 | `atrRank` | 相对波动在窗口中的百分位排名；历史不足时为 `null` |
-| `rankFilter` | 排名存在且不大于 `maxAtrRank` |
+| `rankFilter` | 有效点排名不大于 `maxAtrRank`；不可用点为 `null` |
 | `longTrend/shortTrend` | 均线连续三次上升/下降，并满足可选斜率过滤 |
 | `isClosed` | 该点对应 K 线是否已收盘 |
 
-**这些字段独立返回。** `rankFilter=false` 不会将 `guaili/value` 清零，也不会强制趋势字段变成 `false`。正乖离只说明 K 线位于均线上方，负乖离只说明位于下方；自动交易或多周期策略须由调用方定义。完整公式、初始化和边界示例见 [算法说明](guaili.md)。
+**有效点的这些字段独立返回。** `rankFilter=false` 不会将 `guaili/value` 清零，也不会强制趋势字段变成 `false`。正乖离只说明 K 线位于均线上方，负乖离只说明位于下方；自动交易或多周期策略须由调用方定义。完整公式、初始化和边界示例见 [算法说明](guaili.md)。
 
 ## 健康检查
 
@@ -326,9 +343,9 @@ GET /api/signals?symbols=BTCUSDT,XAUUSDT
 | --- | --- |
 | `enabled` / `status` | 是否启用及整体状态，见状态表 |
 | `configHash` | 当前计算参数指纹；修改企业微信配置不改变此值，不包含 Webhook |
-| `indicatorConfig` | 实际参与计算的 `maType` 与 `maLength`，用于显示服务器的均线名称；旧调用方可忽略此新增字段 |
-| `ruleConfig` | 当前生效规则：`extremeThreshold`、`compressionBand`、`minimumLevels`、`minHistoryBars`，含义见下文；旧调用方可忽略 |
-| `qualityConfig` | 当前生效质量时限：`maxMarketAgeMs` 与 `maxResultAgeMs`，均为毫秒；旧调用方可忽略 |
+| `indicatorConfig` | 实际参与计算的 `maType` 与 `maLength`，用于显示服务器的均线名称 |
+| `ruleConfig` | 当前生效规则：`extremeThreshold`、`compressionBand`、`minimumLevels`、`minHistoryBars`，含义见下文 |
+| `qualityConfig` | 当前生效质量时限：`maxMarketAgeMs` 与 `maxResultAgeMs`，均为毫秒 |
 | `ruleVersion` | 当前为 `live-v1` |
 | `candleMode` / `evaluationMode` | 固定 `live` / `sampled_live`，表示定时采样动态 K |
 | `evaluationIntervalMs` | 配置的采样间隔，毫秒 |
@@ -368,7 +385,7 @@ GET /api/signals?symbols=BTCUSDT,XAUUSDT
 
 `signals[]` 的结构字段：`id`、`kind`（`extreme/compression/conflict`）、`direction`（`positive/negative/neutral`）、`runs[]`、`levelCount`、`totalLevelCount`、`anchorInterval`、`firstObservedAt`、`formedAt`、`lastChangedAt`。`anchorInterval` 是结构最大周期；`levelCount` 是最长单段周期数，分歧的 `totalLevelCount` 为两段总数。分歧方向表示短周期段：`positive` 为短正长负，`negative` 为短负长正。
 
-`runs[]` 包含 `direction`、完整 `intervals`、`minAbsValue/maxAbsValue/meanAbsValue`，这些统计量单位为显示整数 `value` 的绝对值。另提供可选 `maxAbsGuaili/meanAbsGuaili`，单位为原始浮点 `guaili` 的绝对值，近均线段排序使用它们保留截断前精度；旧客户端可忽略，旧服务缺少时客户端回退整数统计。ID 随同向同类结构的周期重叠继承；`firstObservedAt` 是首次采样观察时间，`formedAt=null` 表示初次建立基线时已经存在，不能据此推断真实形成时间。`lastChangedAt` 只在周期覆盖形状变化时更新，不代表每次数值变化。
+`runs[]` 包含 `direction`、完整 `intervals`、`minAbsValue/maxAbsValue/meanAbsValue`，这些统计量单位为显示整数 `value` 的绝对值。另返回可为空的 `maxAbsGuaili/meanAbsGuaili`，单位为原始浮点 `guaili` 的绝对值，近均线段排序使用它们保留截断前精度。ID 随同向同类结构的周期重叠继承；`firstObservedAt` 是首次采样观察时间，`formedAt=null` 表示初次建立基线时已经存在，不能据此推断真实形成时间。`lastChangedAt` 只在周期覆盖形状变化时更新，不代表每次数值变化。
 
 每项 `perIntervalQuality[]` 返回 `interval`、`availability`、`reason`、可选的 `reasonCode`、`value`、原始 `guaili`、`ma`、当前根 `atr14`、`atrRank`、`longTrend/shortTrend`、`historyCount`、`openTime/closeTime`、`marketEventTime`、`isClosed`。这里时间为 Unix 毫秒，区别于旧指标接口的 RFC 3339。信号引擎使用当前动态 K，因此有效证据的 `isClosed=false`。
 
@@ -383,7 +400,7 @@ GET /api/signals?symbols=BTCUSDT,XAUUSDT
 | `recovering` | 不参与；上游断流或聚合状态正在恢复 |
 | `invalid` | 不参与；数据、时间、波动分母或取数无效 |
 
-`reason` 保留面向人的说明，客户端不应解析该英文句子的字面内容。`reasonCode` 是稳定机器原因；当前有效或 ATR 过滤证据通常为 `null`，旧服务可能省略字段。客户端需接受缺失、`null` 和未来未知码，并回退到 `availability` 对应的通用质量说明，未知原因不等于有效数据。
+`reason` 保留面向人的说明，客户端不应解析该英文句子的字面内容。`reasonCode` 是稳定机器原因，响应始终包含该字段；当前有效或 ATR 过滤证据通常为 `null`。按当前契约解析原因码，不提供旧响应缺字段或未知码的兼容解码。
 
 | `reasonCode` | 含义 |
 | --- | --- |
@@ -401,9 +418,9 @@ GET /api/signals?symbols=BTCUSDT,XAUUSDT
 
 所有不参与周期都会打断相邻区间，不能删掉后再拼接。未知数据不会被解释成信号结束。长周期预热不阻断短周期有效结构；某旧结构的参与周期未知时，运行状态保留其身份用于恢复去重，但查询只返回当前有效的结构。
 
-默认行情时效上限 30 秒、结果时效上限 15 秒。请求时发现最近采样超时会返回 `degraded`，清空 `signals/primarySignal` 并将证据标为 `stale`；不要以旧结果显示持续有效信号。`serverTime` 不等于行情时间，不同品种不保证同一行情事件时刻。成交稀疏品种也会在超过行情时效后暂时隐藏，不能把未更新的旧价格当成实时行情。
+默认行情时效上限 30 秒、结果时效上限 15 秒。请求时发现最近采样超时会返回 `degraded`，清空 `signals/primarySignal`，将证据标为 `stale` 并将数值/趋势字段置空；恢复或行情过期的查询失效也同样置空，保留原因与时间。处理只作用于响应副本，已固定的历史采样证据保持不变。`serverTime` 不等于行情时间，不同品种不保证同一行情事件时刻。成交稀疏品种也会在超过行情时效后暂时隐藏，不能把未更新的旧价格当成实时行情。
 
-GET 对采样时效、包含有效信号品种的当前行情恢复/时效再次校验；这些质量变化及结构清除不发布新的 `snapshotVersion`。因此同一 `runId + snapshotVersion` 的两次响应可能拥有不同的 `status`、`dataStatus`、`signals`、`availability` 和 `reasonCode`。客户端不能仅因版本相同跳过响应，离线后还须按服务器时间及实际质量时限停止把旧结构展示为当前有效信号。无结构的缓存证据也不能当作持续实时更新的行情值。
+GET 对采样时效、包含有效数值证据品种的当前行情恢复/时效再次校验，即使没有活动信号结构也会清空失效数值；这些质量变化及结构清除不发布新的 `snapshotVersion`。因此同一 `runId + snapshotVersion` 的两次响应可能拥有不同的 `status`、`dataStatus`、`signals`、`availability` 和 `reasonCode`。客户端不能仅因版本相同跳过响应，离线后还须按服务器时间及实际质量时限停止把旧结构展示为当前有效信号。无结构的缓存证据也不能当作持续实时更新的行情值。
 
 最小关闭响应示例：
 
@@ -512,7 +529,7 @@ Content-Type: application/json
 }
 ```
 
-`symbol/interval/price/direction/webhookUrl/messageTemplate` 必填；`expiresAt` 可省略或为 `null`（不过期），`status` 默认 `active`，也可设 `disabled`。`message` 是 `messageTemplate` 的输入别名。
+`symbol/interval/price/direction/webhookUrl/messageTemplate` 必填；`expiresAt` 可省略或为 `null`（不过期），`status` 默认 `active`，也可设 `disabled`。消息模板只接受 `messageTemplate` 字段。
 
 - 组合必须已配置；`price` 必须为正有限数值；方向仅支持 `cross_up`、`cross_down`、`cross_any`。
 - `webhookUrl` 必须以 `http://` 或 `https://` 开头。
@@ -638,7 +655,7 @@ PATCH 示例：`{"status":"disabled"}` 禁用；`{"status":"active"}` 重新启�
 
 - `androidChannel`：ema20、atr14、上下轨、`closeDeviation`和当前通道趋势；ATR前13根为空。
 - `amplitude`：normalizedRange、threshold、`edgeDistance`、weakTop/weakBottom；阈值前19根为空。
-- `matrix`：ma、当前及前atr14、`rawGuaili/value`、atrRank/rankFilter、当前及前根趋势。矩阵仍使用前ATR分母，未改变原算法。
+- `matrix`（`indicatorContracts.matrix=matrix-v2`）：ma、当前及前atr14、`rawGuaili/value`、atrRank/rankFilter、当前及前根趋势，以及 `availability/reasonCode/reason`。`rawGuaili/value` 在未预热、分母无效或最新实时行情过期时为空，诊断用均线/ATR 字段保留；有效的 0 保留。`closedOnly=true` 的已收盘历史指标不因实时行情过期而置空。矩阵仍使用前ATR分母，未改变原算法。仅提供 `matrix-v2` 契约。
 
 两套指标都由响应OHLC所属同一冻结计算输入生成。actualCalcStartTime可能早于输出首根，不能拿输出300根重新计算就声称与500根计算结果一致。source若存在，提供运行标识、行情sequence/generation、事件时间和接收时间；它描述捕获的动态输入，不代表整个数据库历史的事务版本。历史本身没有版本来源时source可为空。
 

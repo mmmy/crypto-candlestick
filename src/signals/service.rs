@@ -2,7 +2,7 @@
 use super::config::SignalConfig;
 use super::delivery::{self, DeliveryHealth, DeliveryJob, DeliveryManager};
 use super::detector::{detect_structures, primary_signal, same_coverage};
-use super::model::{Availability, IntervalEvidence, SignalStructure};
+use super::model::{Availability, EvidenceReasonCode, IntervalEvidence, SignalStructure};
 use crate::domain::{candle::Candle, interval::Interval};
 use crate::http::AppState;
 use crate::indicators::guaili::compute_guaili;
@@ -25,6 +25,8 @@ pub struct SignalEnvelope {
     pub status: String,
     pub config_hash: String,
     pub indicator_config: SignalIndicatorSummary,
+    pub rule_config: SignalRuleSummary,
+    pub quality_config: SignalQualitySummary,
     pub rule_version: &'static str,
     pub candle_mode: &'static str,
     pub evaluation_mode: &'static str,
@@ -44,6 +46,23 @@ pub struct SignalEnvelope {
 pub struct SignalIndicatorSummary {
     pub ma_type: String,
     pub ma_length: usize,
+}
+
+/// Only public calculation metadata; notification credentials are excluded.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignalRuleSummary {
+    pub extreme_threshold: i32,
+    pub compression_band: i32,
+    pub minimum_levels: usize,
+    pub min_history_bars: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignalQualitySummary {
+    pub max_market_age_ms: u64,
+    pub max_result_age_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -277,6 +296,7 @@ impl SignalService {
                 for evidence in &mut symbol.per_interval_quality {
                     evidence.availability = Availability::Stale;
                     evidence.reason = Some("signal sampling result is stale".into());
+                    evidence.reason_code = Some(EvidenceReasonCode::SamplingStale);
                 }
             }
         }
@@ -307,6 +327,11 @@ impl SignalService {
                         evidence.reason = Some(
                             "current market state no longer validates the sampled result".into(),
                         );
+                        evidence.reason_code = Some(if unavailable {
+                            EvidenceReasonCode::MarketRecovering
+                        } else {
+                            EvidenceReasonCode::MarketStale
+                        });
                     }
                     result.status = "degraded".into();
                 }
@@ -497,6 +522,7 @@ impl SignalService {
                 for evidence in &mut result.per_interval_quality {
                     evidence.availability = Availability::Recovering;
                     evidence.reason = Some("market generation changed during evaluation".into());
+                    evidence.reason_code = Some(EvidenceReasonCode::MarketRecovering);
                 }
                 result.missing_intervals = result
                     .per_interval_quality
@@ -728,6 +754,16 @@ fn blank_envelope(
             ma_type: config.indicator.ma_type.clone(),
             ma_length: config.indicator.ma_length,
         },
+        rule_config: SignalRuleSummary {
+            extreme_threshold: config.rules.extreme_threshold,
+            compression_band: config.rules.compression_band,
+            minimum_levels: config.rules.minimum_levels,
+            min_history_bars: config.rules.min_history_bars,
+        },
+        quality_config: SignalQualitySummary {
+            max_market_age_ms: config.quality.max_market_age_secs * 1000,
+            max_result_age_ms: config.quality.max_result_age_secs * 1000,
+        },
         rule_version: "live-v1",
         candle_mode: "live",
         evaluation_mode: "sampled_live",
@@ -755,15 +791,20 @@ fn evaluate_series(
         interval: interval.into(),
         ..Default::default()
     };
-    let unavailable = |mut result: IntervalEvidence, availability: Availability, reason: &str| {
+    let unavailable = |mut result: IntervalEvidence,
+                       availability: Availability,
+                       reason_code: EvidenceReasonCode,
+                       reason: &str| {
         result.availability = availability;
         result.reason = Some(reason.into());
+        result.reason_code = Some(reason_code);
         result
     };
     let Some(live) = live else {
         return unavailable(
             result,
             Availability::WarmingUp,
+            EvidenceReasonCode::WaitingMarket,
             "waiting for a live trade snapshot",
         );
     };
@@ -772,6 +813,7 @@ fn evaluate_series(
         return unavailable(
             result,
             Availability::Recovering,
+            EvidenceReasonCode::MarketRecovering,
             "market stream is recovering",
         );
     }
@@ -779,6 +821,7 @@ fn evaluate_series(
         return unavailable(
             result,
             Availability::Invalid,
+            EvidenceReasonCode::MarketTimeInvalid,
             "market update time is in the future",
         );
     }
@@ -786,12 +829,18 @@ fn evaluate_series(
     if time_ms.saturating_sub(live.market_event_time_ms) > maximum_age
         || time_ms.saturating_sub(live.received_at_ms) > maximum_age
     {
-        return unavailable(result, Availability::Stale, "live market updates are stale");
+        return unavailable(
+            result,
+            Availability::Stale,
+            EvidenceReasonCode::MarketStale,
+            "live market updates are stale",
+        );
     }
     let Some(mut current) = current else {
         return unavailable(
             result,
             Availability::Missing,
+            EvidenceReasonCode::DynamicMissing,
             "current dynamic candle is unavailable",
         );
     };
@@ -805,6 +854,7 @@ fn evaluate_series(
         return unavailable(
             result,
             Availability::Missing,
+            EvidenceReasonCode::DynamicTimeMismatch,
             "current candle does not cover this market time",
         );
     }
@@ -813,6 +863,7 @@ fn evaluate_series(
         return unavailable(
             result,
             Availability::Invalid,
+            EvidenceReasonCode::HistoryUnavailable,
             "unable to read candle history",
         );
     };
@@ -827,6 +878,7 @@ fn evaluate_series(
         return unavailable(
             result,
             Availability::Gap,
+            EvidenceReasonCode::HistoryGap,
             "history is not adjacent to the current candle",
         );
     }
@@ -834,6 +886,7 @@ fn evaluate_series(
         return unavailable(
             result,
             Availability::WarmingUp,
+            EvidenceReasonCode::InsufficientHistory,
             "insufficient contiguous closed history",
         );
     }
@@ -845,13 +898,19 @@ fn evaluate_series(
         return unavailable(
             result,
             Availability::Invalid,
+            EvidenceReasonCode::InvalidData,
             "invalid candle prices or volume",
         );
     }
     candles.push(current);
     let points = compute_guaili(&candles, config.indicator.to_guaili_config());
     let Some(point) = points.last() else {
-        return unavailable(result, Availability::Invalid, "indicator result is missing");
+        return unavailable(
+            result,
+            Availability::Invalid,
+            EvidenceReasonCode::IndicatorMissing,
+            "indicator result is missing",
+        );
     };
     let previous_atr = points
         .get(points.len().saturating_sub(2))
@@ -866,6 +925,7 @@ fn evaluate_series(
         return unavailable(
             result,
             Availability::Invalid,
+            EvidenceReasonCode::IndicatorInvalid,
             "indicator volatility denominator is invalid",
         );
     }
@@ -873,6 +933,7 @@ fn evaluate_series(
         return unavailable(
             result,
             Availability::WarmingUp,
+            EvidenceReasonCode::IndicatorWarmingUp,
             "volatility rank is unavailable",
         );
     };
@@ -1021,4 +1082,77 @@ fn assign_occurrences(
 
 pub fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quality_causes_are_explicit_for_invalid_time_history_gap_and_data() {
+        let now = 1_760_000_010_000;
+        let current_open = now - now % 60_000;
+        let candle = |open_time, is_closed| Candle {
+            open_time,
+            close_time: open_time + 59_999,
+            open: 100.0,
+            high: 101.0,
+            low: 99.0,
+            close: 100.0,
+            volume: 10.0,
+            quote_volume: 1000.0,
+            trade_count: 1,
+            is_closed,
+        };
+        let current = candle(current_open, false);
+        let history = (1..=60)
+            .rev()
+            .map(|index| candle(current_open - index * 60_000, true))
+            .collect::<Vec<_>>();
+        let config = SignalConfig::default();
+        let live = crate::memory::LiveSymbolSnapshot {
+            candles: HashMap::new(),
+            market_event_time_ms: now,
+            received_at_ms: now,
+            sequence: 1,
+            generation: 1,
+            recovering: false,
+        };
+        let evaluate = |current: Candle, history: Result<Vec<Candle>, String>, live| {
+            evaluate_series(&config, "1", Some(current), history, Some(live), now)
+        };
+        assert_eq!(
+            evaluate(current.clone(), Err("private storage error".into()), &live).reason_code,
+            Some(EvidenceReasonCode::HistoryUnavailable)
+        );
+        let mut gap = history.clone();
+        gap.pop();
+        assert_eq!(
+            evaluate(current.clone(), Ok(gap), &live).reason_code,
+            Some(EvidenceReasonCode::HistoryGap)
+        );
+        let mut invalid = current.clone();
+        invalid.close = f64::NAN;
+        let invalid_result = evaluate(invalid, Ok(history.clone()), &live);
+        assert_eq!(
+            invalid_result.reason_code,
+            Some(EvidenceReasonCode::InvalidData)
+        );
+        assert_eq!(invalid_result.availability, Availability::Invalid);
+        assert!(invalid_result.value.is_none());
+        let mut wrong_bucket = current.clone();
+        wrong_bucket.close_time = now - 1;
+        assert_eq!(
+            evaluate(wrong_bucket, Ok(history.clone()), &live).reason_code,
+            Some(EvidenceReasonCode::DynamicTimeMismatch)
+        );
+        let future_live = crate::memory::LiveSymbolSnapshot {
+            received_at_ms: now + 2001,
+            ..live.clone()
+        };
+        assert_eq!(
+            evaluate(current, Ok(history), &future_live).reason_code,
+            Some(EvidenceReasonCode::MarketTimeInvalid)
+        );
+    }
 }

@@ -39,12 +39,38 @@ impl Availability {
     }
 }
 
+/// Stable machine-readable causes. Human-facing `reason` may change wording;
+/// clients should use these codes together with `availability` instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceReasonCode {
+    SamplingStale,
+    MarketStale,
+    MarketRecovering,
+    WaitingMarket,
+    DynamicMissing,
+    DynamicTimeMismatch,
+    InsufficientHistory,
+    HistoryGap,
+    HistoryUnavailable,
+    MarketTimeInvalid,
+    InvalidData,
+    IndicatorMissing,
+    IndicatorInvalid,
+    IndicatorWarmingUp,
+    /// Forward-compatible decoding for evidence in imported fixtures.
+    #[serde(other)]
+    Unknown,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IntervalEvidence {
     pub interval: String,
     pub availability: Availability,
     pub reason: Option<String>,
+    #[serde(default)]
+    pub reason_code: Option<EvidenceReasonCode>,
     pub value: Option<i32>,
     pub guaili: Option<f64>,
     pub ma: Option<f64>,
@@ -90,4 +116,21 @@ pub struct SignalStructure {
     pub first_observed_at: Option<i64>,
     pub formed_at: Option<i64>,
     pub last_changed_at: Option<i64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn evidence_accepts_legacy_missing_and_future_unknown_reason_codes() {
+        let mut legacy = serde_json::to_value(IntervalEvidence::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("reasonCode");
+        let old: IntervalEvidence = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(old.reason_code.is_none());
+        legacy["reasonCode"] = serde_json::json!("future_quality_cause");
+        let future: IntervalEvidence = serde_json::from_value(legacy).unwrap();
+        assert_eq!(future.reason_code, Some(EvidenceReasonCode::Unknown));
+        assert!(future.availability.is_unknown());
+    }
 }

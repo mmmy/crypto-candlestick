@@ -90,6 +90,12 @@ async fn absent_config_returns_disabled_without_stopping_other_routes() {
     assert_eq!(body["status"], "disabled");
     assert_eq!(body["candleMode"], "live");
     assert_eq!(body["evaluationIntervalMs"], 5000);
+    assert_eq!(body["ruleConfig"]["extremeThreshold"], 10);
+    assert_eq!(body["ruleConfig"]["compressionBand"], 2);
+    assert_eq!(body["ruleConfig"]["minimumLevels"], 5);
+    assert_eq!(body["ruleConfig"]["minHistoryBars"], 60);
+    assert_eq!(body["qualityConfig"]["maxMarketAgeMs"], 30_000);
+    assert_eq!(body["qualityConfig"]["maxResultAgeMs"], 15_000);
     assert!(body["serverTime"].is_i64());
     assert!(body["results"].as_array().unwrap().is_empty());
     assert!(reqwest::get(format!("{}/api/health", fixture.url))
@@ -113,6 +119,10 @@ async fn symbol_filter_retains_request_order_and_never_calculates_on_query() {
     assert_eq!(first["results"][0]["symbol"], "XAUUSDT");
     assert_eq!(first["results"][1]["symbol"], "BTCUSDT");
     assert_eq!(first["status"], "warming_up");
+    assert_eq!(
+        first["results"][0]["perIntervalQuality"][0]["reasonCode"],
+        "waiting_market"
+    );
     let second: serde_json::Value = fixture.get("?symbols=BTCUSDT").await.json().await.unwrap();
     assert_eq!(second["snapshotVersion"], first["snapshotVersion"]);
     assert_eq!(second["results"].as_array().unwrap().len(), 1);
@@ -169,6 +179,19 @@ async fn healthy_symbol_query_is_not_degraded_by_an_excluded_warming_symbol() {
     assert_eq!(selected["snapshotVersion"], all["snapshotVersion"]);
     assert_eq!(selected["indicatorConfig"]["maType"], "EMA");
     assert_eq!(selected["indicatorConfig"]["maLength"], 20);
+    assert!(selected["results"][0]["perIntervalQuality"][0]["reasonCode"].is_null());
+
+    // GET rechecks the current stream state without publishing a new sampling
+    // version. Clients must not skip this changed quality based on that version.
+    fixture.data.latest.mark_recovering("BTCUSDT").await;
+    let recovering: serde_json::Value = fixture.get("?symbols=BTCUSDT").await.json().await.unwrap();
+    assert_eq!(recovering["snapshotVersion"], selected["snapshotVersion"]);
+    assert_eq!(recovering["results"][0]["dataStatus"], "recovering");
+    assert_eq!(recovering["results"][0]["signals"], serde_json::json!([]));
+    assert_eq!(
+        recovering["results"][0]["perIntervalQuality"][0]["reasonCode"],
+        "market_recovering"
+    );
 }
 
 #[tokio::test]
@@ -224,6 +247,75 @@ async fn invalid_startup_config_reports_config_error_but_health_is_available() {
     let body: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(body["status"], "config_error");
     assert_eq!(body["enabled"], false);
+    assert_eq!(body["ruleConfig"]["extremeThreshold"], 10);
+    assert_eq!(body["qualityConfig"]["maxResultAgeMs"], 15_000);
+}
+
+#[tokio::test]
+async fn public_rule_and_quality_metadata_follow_atomic_reload_and_disabled_state() {
+    let raw = "enabled=true\nsymbols=['BTCUSDT']\n[rules]\nextreme_threshold=17\ncompression_band=3\nminimum_levels=4\nmin_history_bars=72\n[quality]\nmax_market_age_secs=9\nmax_result_age_secs=12\n";
+    let fixture = Fixture::new(Some(raw)).await;
+    let initial: serde_json::Value = fixture.get("").await.json().await.unwrap();
+    assert_eq!(
+        initial["ruleConfig"],
+        serde_json::json!({"extremeThreshold":17,"compressionBand":3,"minimumLevels":4,"minHistoryBars":72})
+    );
+    assert_eq!(
+        initial["qualityConfig"],
+        serde_json::json!({"maxMarketAgeMs":9000,"maxResultAgeMs":12000})
+    );
+    let changed = raw
+        .replace("extreme_threshold=17", "extreme_threshold=25")
+        .replace("max_market_age_secs=9", "max_market_age_secs=7")
+        .replace("max_result_age_secs=12", "max_result_age_secs=11");
+    fs::write(&fixture.path, &changed).unwrap();
+    fixture.service.reload().await.unwrap();
+    let reloaded: serde_json::Value = fixture.get("").await.json().await.unwrap();
+    assert_eq!(reloaded["ruleConfig"]["extremeThreshold"], 25);
+    assert_eq!(reloaded["qualityConfig"]["maxMarketAgeMs"], 7000);
+    assert_eq!(reloaded["qualityConfig"]["maxResultAgeMs"], 11000);
+    assert_ne!(reloaded["configHash"], initial["configHash"]);
+    assert!(reloaded["snapshotVersion"].as_u64() > initial["snapshotVersion"].as_u64());
+
+    // Invalid reload neither publishes invalid values nor erases the active
+    // metadata. Successful disabling still exposes the accepted rule settings.
+    fs::write(
+        &fixture.path,
+        changed.replace("max_result_age_secs=11", "max_result_age_secs=1"),
+    )
+    .unwrap();
+    assert!(fixture.service.reload().await.is_err());
+    let unchanged: serde_json::Value = fixture.get("").await.json().await.unwrap();
+    assert_eq!(unchanged["ruleConfig"], reloaded["ruleConfig"]);
+    assert_eq!(unchanged["qualityConfig"], reloaded["qualityConfig"]);
+    assert_eq!(unchanged["snapshotVersion"], reloaded["snapshotVersion"]);
+    fs::write(
+        &fixture.path,
+        changed.replace("enabled=true", "enabled=false"),
+    )
+    .unwrap();
+    fixture.service.reload().await.unwrap();
+    let disabled: serde_json::Value = fixture.get("").await.json().await.unwrap();
+    assert_eq!(disabled["status"], "disabled");
+    assert_eq!(disabled["ruleConfig"], reloaded["ruleConfig"]);
+    assert_eq!(disabled["qualityConfig"], reloaded["qualityConfig"]);
+}
+
+#[tokio::test]
+async fn get_expires_sampling_evidence_with_same_snapshot_version() {
+    let fixture = Fixture::new(Some("enabled=true\n")).await;
+    let sampled_at = now_ms() - 16_000;
+    fixture.service.sample_once_at(sampled_at).await;
+    let sampled = fixture.service.snapshot_at(sampled_at).await;
+    assert_eq!(sampled.results[0].data_status, "warming_up");
+    let expired: serde_json::Value = fixture.get("").await.json().await.unwrap();
+    assert_eq!(expired["snapshotVersion"], sampled.snapshot_version);
+    assert_eq!(expired["status"], "degraded");
+    assert_eq!(expired["results"][0]["dataStatus"], "stale");
+    assert_eq!(
+        expired["results"][0]["perIntervalQuality"][0]["reasonCode"],
+        "sampling_stale"
+    );
 }
 
 #[tokio::test]

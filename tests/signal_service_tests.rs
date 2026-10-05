@@ -2,7 +2,9 @@ use crypto_candlestick::domain::{candle::Candle, interval::Interval};
 use crypto_candlestick::http::{AppState, HealthTarget};
 use crypto_candlestick::memory::{ClosedKlineBuffer, LatestCache, MemorySeriesStore};
 use crypto_candlestick::runtime_health::RuntimeHealth;
-use crypto_candlestick::signals::model::{Availability, SignalDirection, SignalKind};
+use crypto_candlestick::signals::model::{
+    Availability, EvidenceReasonCode, SignalDirection, SignalKind,
+};
 use crypto_candlestick::signals::service::SignalService;
 use crypto_candlestick::storage::sqlite::SqliteStore;
 use std::{
@@ -218,6 +220,10 @@ async fn recovery_hides_cached_signals_before_the_next_sampling_round() {
     assert_eq!(snapshot.status, "degraded");
     assert_eq!(snapshot.results[0].data_status, "recovering");
     assert!(snapshot.results[0].signals.is_empty());
+    assert!(snapshot.results[0]
+        .per_interval_quality
+        .iter()
+        .all(|evidence| { evidence.reason_code == Some(EvidenceReasonCode::MarketRecovering) }));
 }
 
 #[tokio::test]
@@ -287,6 +293,7 @@ async fn evaluates_dynamic_kline_with_future_close_time_and_full_history() {
         assert!(item.close_time.unwrap() > NOW);
         assert!(item.value.unwrap() >= 10);
         assert!(item.guaili.unwrap() > 0.0);
+        assert!(item.reason_code.is_none());
     }
 }
 
@@ -358,6 +365,10 @@ async fn missing_dynamic_kline_does_not_fall_back_to_a_closed_kline() {
         .unwrap();
     assert_eq!(missing.availability, Availability::Missing);
     assert!(missing.value.is_none());
+    assert_eq!(
+        missing.reason_code,
+        Some(EvidenceReasonCode::DynamicMissing)
+    );
 }
 
 #[tokio::test]
@@ -367,10 +378,11 @@ async fn minimum_history_requirement_excludes_the_dynamic_candle() {
     fixture.service.sample_once_at(NOW).await;
     let snapshot = fixture.service.snapshot_at(NOW).await;
     assert!(snapshot.results[0].signals.is_empty());
-    assert!(snapshot.results[0]
-        .per_interval_quality
-        .iter()
-        .all(|item| { item.availability == Availability::WarmingUp && item.history_count == 59 }));
+    assert!(snapshot.results[0].per_interval_quality.iter().all(|item| {
+        item.availability == Availability::WarmingUp
+            && item.history_count == 59
+            && item.reason_code == Some(EvidenceReasonCode::InsufficientHistory)
+    }));
 }
 
 #[tokio::test]
@@ -386,7 +398,8 @@ async fn old_market_snapshot_becomes_stale_even_when_no_new_trade_arrives() {
     assert!(stale.results[0]
         .per_interval_quality
         .iter()
-        .all(|item| item.availability == Availability::Stale));
+        .all(|item| item.availability == Availability::Stale
+            && item.reason_code == Some(EvidenceReasonCode::MarketStale)));
     fixture.publish(120.0, NOW + 32_000).await;
     fixture.service.sample_once_at(NOW + 32_000).await;
     let recovered = fixture.service.snapshot_at(NOW + 32_000).await;
@@ -407,7 +420,72 @@ async fn query_hides_expired_results_without_recomputing_the_snapshot() {
     assert!(expired.results[0]
         .per_interval_quality
         .iter()
-        .all(|item| item.availability == Availability::Stale));
+        .all(|item| item.availability == Availability::Stale
+            && item.reason_code == Some(EvidenceReasonCode::SamplingStale)));
+}
+
+#[tokio::test]
+async fn reloaded_quality_metadata_matches_exact_market_and_sampling_expiry() {
+    let fixture = Fixture::new(60).await;
+    fixture.config.write(
+        &CONFIG
+            .replace("max_market_age_secs = 30", "max_market_age_secs = 7")
+            .replace("max_result_age_secs = 15", "max_result_age_secs = 11"),
+    );
+    fixture.service.reload().await.unwrap();
+    fixture.publish(120.0, NOW).await;
+    fixture.service.sample_once_at(NOW).await;
+    let valid = fixture.service.snapshot_at(NOW + 7000).await;
+    assert_eq!(valid.quality_config.max_market_age_ms, 7000);
+    assert_eq!(valid.quality_config.max_result_age_ms, 11000);
+    assert!(!valid.results[0].signals.is_empty());
+    let market_expired = fixture.service.snapshot_at(NOW + 7001).await;
+    assert_eq!(market_expired.snapshot_version, valid.snapshot_version);
+    assert!(market_expired.results[0].signals.is_empty());
+    assert!(market_expired.results[0]
+        .per_interval_quality
+        .iter()
+        .all(|evidence| { evidence.reason_code == Some(EvidenceReasonCode::MarketStale) }));
+    let sample_expired = fixture.service.snapshot_at(NOW + 11001).await;
+    assert_eq!(sample_expired.snapshot_version, valid.snapshot_version);
+    assert!(sample_expired.results[0]
+        .per_interval_quality
+        .iter()
+        .all(|evidence| { evidence.reason_code == Some(EvidenceReasonCode::SamplingStale) }));
+}
+
+#[tokio::test]
+async fn reloaded_rule_metadata_describes_the_rules_that_actually_evaluate() {
+    let fixture = Fixture::new(60).await;
+    fixture.publish(120.0, NOW).await;
+    fixture.service.sample_once_at(NOW).await;
+    assert!(!fixture.service.snapshot_at(NOW).await.results[0]
+        .signals
+        .is_empty());
+    fixture
+        .config
+        .write(&CONFIG.replace("extreme_threshold = 10", "extreme_threshold = 1000"));
+    fixture.service.reload().await.unwrap();
+    fixture.service.sample_once_at(NOW).await;
+    let higher_threshold = fixture.service.snapshot_at(NOW).await;
+    assert_eq!(higher_threshold.rule_config.extreme_threshold, 1000);
+    assert!(higher_threshold.results[0].signals.is_empty());
+    assert_eq!(higher_threshold.results[0].data_status, "ready");
+    fixture
+        .config
+        .write(&CONFIG.replace("min_history_bars = 60", "min_history_bars = 70"));
+    fixture.service.reload().await.unwrap();
+    fixture.service.sample_once_at(NOW).await;
+    let more_history = fixture.service.snapshot_at(NOW).await;
+    assert_eq!(more_history.rule_config.min_history_bars, 70);
+    assert!(more_history.results[0].signals.is_empty());
+    assert!(more_history.results[0]
+        .per_interval_quality
+        .iter()
+        .all(|evidence| {
+            evidence.history_count == 60
+                && evidence.reason_code == Some(EvidenceReasonCode::InsufficientHistory)
+        }));
 }
 
 #[tokio::test]

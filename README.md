@@ -139,6 +139,8 @@ level = "info"
 
 `signals.toml` 与行情配置分开维护，可参考 [signals.example.toml](signals.example.toml)。只有一个总开关 `enabled`，关闭后同时停止信号计算及关联企业微信警报，查询返回 `disabled`、空结果；行情采集及原有价格警报继续运行。
 
+`GET /api/signals` 返回当前实际生效的 `indicatorConfig`、`ruleConfig` 和 `qualityConfig`，包括规则整数阈值、最少级数、连续历史要求以及毫秒质量时限。逐周期证据新增可选 `reasonCode`，用于稳定识别预热、过期、缺口、恢复等原因，原 `reason` 文案仍保留。字段均为兼容扩展，Android 旧调用方可忽略。客户端应根据实际时限判断有效性，并处理同一 `snapshotVersion` 下质量失效及结构清除，不能只用采样版本去重。详见 [信号 HTTP 契约](docs/api.md#查询当前结果)。
+
 | 配置 | 默认 / 语义 |
 | --- | --- |
 | `enabled` | 缺省为 `false`；示例配置为 `true` |

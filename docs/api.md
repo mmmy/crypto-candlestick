@@ -327,16 +327,22 @@ GET /api/signals?symbols=BTCUSDT,XAUUSDT
 | `enabled` / `status` | 是否启用及整体状态，见状态表 |
 | `configHash` | 当前计算参数指纹；修改企业微信配置不改变此值，不包含 Webhook |
 | `indicatorConfig` | 实际参与计算的 `maType` 与 `maLength`，用于显示服务器的均线名称；旧调用方可忽略此新增字段 |
+| `ruleConfig` | 当前生效规则：`extremeThreshold`、`compressionBand`、`minimumLevels`、`minHistoryBars`，含义见下文；旧调用方可忽略 |
+| `qualityConfig` | 当前生效质量时限：`maxMarketAgeMs` 与 `maxResultAgeMs`，均为毫秒；旧调用方可忽略 |
 | `ruleVersion` | 当前为 `live-v1` |
 | `candleMode` / `evaluationMode` | 固定 `live` / `sampled_live`，表示定时采样动态 K |
 | `evaluationIntervalMs` | 配置的采样间隔，毫秒 |
 | `serverTime` | 此次 HTTP 响应时刻，Unix 毫秒 |
 | `runId` | 运行实例标识；重启后变化，客户端不能跨实例沿用旧信号 ID |
-| `snapshotVersion` | 同一实例内的发布版本，重载清空结果时也可增长 |
+| `snapshotVersion` | 同一实例内的采样发布版本，重载清空结果时也可增长；不是完整响应内容版本，见下文 |
 | `evaluatedAt` / `computeDurationMs` | 最近采样时刻 / 该轮耗时；尚未采样时为 `null` / `0` |
 | `configError` | 初始配置错误的脱敏说明，正常为 `null` |
 | `delivery` | 内存投递统计、脱敏错误及最近最多 32 条结果 |
 | `results` | 各品种结构和逐周期数据质量 |
+
+`ruleConfig.extremeThreshold` 是正负共振的显示整数绝对值阈值（默认 `10`），`compressionBand` 是近均线显示整数绝对值上限（默认 `2`）；整数来自原始乖离乘 10 后向零截断，不应将 `2` 等同于原始值精确 `0.2`。`minimumLevels` 是单段所需相邻配置周期数（默认 `5`），`minHistoryBars` 是每周期所需连续已收盘历史数（默认 `60`），不包含当前动态 K。`qualityConfig.maxMarketAgeMs` 同时限制行情事件和接收时间，`maxResultAgeMs` 限制最近采样年龄。客户端应读取实际值，不能根据 `evaluationIntervalMs` 推定这些时限。
+
+元数据与结果属于同一份生效配置。启用、关闭、等待首次采样时均返回；首次配置加载失败时返回安全的默认关闭配置元数据，而非未通过验证的文件内容。成功计算配置重载先替换元数据并清空旧结果，失败重载保留原元数据和结果。这里不返回企业微信地址、凭证或订阅详情。
 
 | 整体 `status` | 语义 |
 | --- | --- |
@@ -364,7 +370,7 @@ GET /api/signals?symbols=BTCUSDT,XAUUSDT
 
 `runs[]` 包含 `direction`、完整 `intervals`、`minAbsValue/maxAbsValue/meanAbsValue`，这些统计量单位为显示整数 `value` 的绝对值。另提供可选 `maxAbsGuaili/meanAbsGuaili`，单位为原始浮点 `guaili` 的绝对值，近均线段排序使用它们保留截断前精度；旧客户端可忽略，旧服务缺少时客户端回退整数统计。ID 随同向同类结构的周期重叠继承；`firstObservedAt` 是首次采样观察时间，`formedAt=null` 表示初次建立基线时已经存在，不能据此推断真实形成时间。`lastChangedAt` 只在周期覆盖形状变化时更新，不代表每次数值变化。
 
-每项 `perIntervalQuality[]` 返回 `interval`、`availability`、`reason`、`value`、原始 `guaili`、`ma`、当前根 `atr14`、`atrRank`、`longTrend/shortTrend`、`historyCount`、`openTime/closeTime`、`marketEventTime`、`isClosed`。这里时间为 Unix 毫秒，区别于旧指标接口的 RFC 3339。信号引擎使用当前动态 K，因此有效证据的 `isClosed=false`。
+每项 `perIntervalQuality[]` 返回 `interval`、`availability`、`reason`、可选的 `reasonCode`、`value`、原始 `guaili`、`ma`、当前根 `atr14`、`atrRank`、`longTrend/shortTrend`、`historyCount`、`openTime/closeTime`、`marketEventTime`、`isClosed`。这里时间为 Unix 毫秒，区别于旧指标接口的 RFC 3339。信号引擎使用当前动态 K，因此有效证据的 `isClosed=false`。
 
 | `availability` | 是否参与结构 / 含义 |
 | --- | --- |
@@ -377,9 +383,27 @@ GET /api/signals?symbols=BTCUSDT,XAUUSDT
 | `recovering` | 不参与；上游断流或聚合状态正在恢复 |
 | `invalid` | 不参与；数据、时间、波动分母或取数无效 |
 
+`reason` 保留面向人的说明，客户端不应解析该英文句子的字面内容。`reasonCode` 是稳定机器原因；当前有效或 ATR 过滤证据通常为 `null`，旧服务可能省略字段。客户端需接受缺失、`null` 和未来未知码，并回退到 `availability` 对应的通用质量说明，未知原因不等于有效数据。
+
+| `reasonCode` | 含义 |
+| --- | --- |
+| `sampling_stale` | 最近采样结果已过期，或采样时间异常 |
+| `market_stale` | 行情事件或接收时间已过期 |
+| `market_recovering` | 上游恢复中，或采样后行情代次发生改变 |
+| `waiting_market` | 尚未取得动态成交快照 |
+| `dynamic_missing` / `dynamic_time_mismatch` | 动态 K 缺失 / 动态桶不覆盖当前行情时间 |
+| `insufficient_history` / `history_gap` | 连续已收盘历史不足 / 历史尾部与动态 K 不连续 |
+| `history_unavailable` | 历史读取失败 |
+| `market_time_invalid` | 行情事件或接收时间异常地处于未来 |
+| `invalid_data` | K 线价格、成交量等输入无效 |
+| `indicator_missing` / `indicator_invalid` | 指标结果缺失 / 指标波动分母或结果无效 |
+| `indicator_warming_up` | 波动排名尚未可用 |
+
 所有不参与周期都会打断相邻区间，不能删掉后再拼接。未知数据不会被解释成信号结束。长周期预热不阻断短周期有效结构；某旧结构的参与周期未知时，运行状态保留其身份用于恢复去重，但查询只返回当前有效的结构。
 
 默认行情时效上限 30 秒、结果时效上限 15 秒。请求时发现最近采样超时会返回 `degraded`，清空 `signals/primarySignal` 并将证据标为 `stale`；不要以旧结果显示持续有效信号。`serverTime` 不等于行情时间，不同品种不保证同一行情事件时刻。成交稀疏品种也会在超过行情时效后暂时隐藏，不能把未更新的旧价格当成实时行情。
+
+GET 对采样时效、包含有效信号品种的当前行情恢复/时效再次校验；这些质量变化及结构清除不发布新的 `snapshotVersion`。因此同一 `runId + snapshotVersion` 的两次响应可能拥有不同的 `status`、`dataStatus`、`signals`、`availability` 和 `reasonCode`。客户端不能仅因版本相同跳过响应，离线后还须按服务器时间及实际质量时限停止把旧结构展示为当前有效信号。无结构的缓存证据也不能当作持续实时更新的行情值。
 
 最小关闭响应示例：
 
@@ -388,6 +412,9 @@ GET /api/signals?symbols=BTCUSDT,XAUUSDT
   "enabled": false,
   "status": "disabled",
   "configHash": "0000000000000000",
+  "indicatorConfig": { "maType": "EMA", "maLength": 20 },
+  "ruleConfig": { "extremeThreshold": 10, "compressionBand": 2, "minimumLevels": 5, "minHistoryBars": 60 },
+  "qualityConfig": { "maxMarketAgeMs": 30000, "maxResultAgeMs": 15000 },
   "ruleVersion": "live-v1",
   "candleMode": "live",
   "evaluationMode": "sampled_live",

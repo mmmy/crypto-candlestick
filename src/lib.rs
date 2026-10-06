@@ -6,6 +6,8 @@ pub mod http;
 pub mod indicators;
 pub mod logging;
 pub mod memory;
+pub mod price_alert_metadata;
+pub mod price_alerts;
 pub mod runtime_health;
 pub mod signals;
 pub mod storage;

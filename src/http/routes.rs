@@ -51,6 +51,29 @@ pub fn router_with_signals(
             get(get_alert).patch(update_alert).delete(delete_alert),
         )
         .route("/api/alerts/:id/events", get(alert_events))
+        .route("/api/price-alerts/market", get(super::price_alerts::market))
+        .route(
+            "/api/price-alerts/market/refresh",
+            axum::routing::post(super::price_alerts::refresh_market),
+        )
+        .route(
+            "/api/price-alerts",
+            get(super::price_alerts::list).post(super::price_alerts::create),
+        )
+        .route(
+            "/api/price-alerts/mutations/:mutationId",
+            get(super::price_alerts::mutation),
+        )
+        .route(
+            "/api/price-alerts/:id",
+            get(super::price_alerts::get)
+                .patch(super::price_alerts::patch)
+                .delete(super::price_alerts::delete),
+        )
+        .route(
+            "/api/price-alerts/:id/events",
+            get(super::price_alerts::events),
+        )
         .with_state(state)
         .merge(super::signals::routes(signals))
 }

@@ -1,5 +1,6 @@
 mod charts;
 mod handlers;
+mod price_alerts;
 mod routes;
 mod signals;
 

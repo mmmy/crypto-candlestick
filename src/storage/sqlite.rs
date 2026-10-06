@@ -12,8 +12,10 @@ const DEFAULT_READ_CONNECTIONS: u32 = 4;
 
 #[derive(Debug, Clone)]
 pub struct SqliteStore {
-    read_pool: SqlitePool,
-    write_pool: SqlitePool,
+    pub(crate) read_pool: SqlitePool,
+    pub(crate) write_pool: SqlitePool,
+    pub(crate) price_alert_runtime: Arc<Mutex<crate::price_alerts::Runtime>>,
+    pub(crate) price_alert_fixture: bool,
     retention_bars: u32,
     prune_pending: Arc<Mutex<HashMap<(String, String), usize>>>,
 }
@@ -184,6 +186,13 @@ async fn upsert_candle_rows(
 }
 
 impl SqliteStore {
+    /// Explicit isolated fixture constructor. No HTTP route can inject metadata.
+    #[doc(hidden)]
+    pub async fn connect_price_alert_fixture(database_url: &str) -> Result<Self, sqlx::Error> {
+        let mut store = Self::connect(database_url).await?;
+        store.price_alert_fixture = true;
+        Ok(store)
+    }
     pub async fn connect(database_url: &str) -> Result<Self, sqlx::Error> {
         Self::connect_with_retention(database_url, DEFAULT_RETENTION_BARS).await
     }
@@ -212,6 +221,8 @@ impl SqliteStore {
             write_pool,
             retention_bars,
             prune_pending: Arc::new(Mutex::new(HashMap::new())),
+            price_alert_runtime: Arc::new(Mutex::new(crate::price_alerts::Runtime::default())),
+            price_alert_fixture: false,
         };
         store.init().await?;
 
@@ -233,6 +244,7 @@ impl SqliteStore {
                 .await?;
         }
 
+        crate::price_alerts::initialize(&store).await?;
         Ok(store)
     }
 
@@ -588,6 +600,7 @@ impl SqliteStore {
     }
 
     pub async fn insert_alert(&self, alert: &Alert) -> Result<Alert, sqlx::Error> {
+        let mut runtime = self.price_alert_runtime.lock().await;
         let result = sqlx::query("INSERT INTO alerts (symbol,interval,price,direction,status,expires_at,webhook_url,message_template,created_at,updated_at,triggered_at,delivery_status,delivery_error) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)")
             .bind(&alert.symbol).bind(&alert.interval).bind(alert.price).bind(&alert.direction)
             .bind(&alert.status).bind(alert.expires_at).bind(&alert.webhook_url).bind(&alert.message_template)
@@ -595,19 +608,27 @@ impl SqliteStore {
             .execute(&self.write_pool).await?;
         let mut created = alert.clone();
         created.id = result.last_insert_rowid();
+        runtime.legacy_insert(created.clone());
         Ok(created)
     }
 
     pub async fn update_alert(&self, alert: &Alert) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query("UPDATE alerts SET symbol=?,interval=?,price=?,direction=?,status=?,expires_at=?,webhook_url=?,message_template=?,updated_at=? WHERE id=?")
+        let mut runtime = self.price_alert_runtime.lock().await;
+        let result = sqlx::query("UPDATE alerts SET symbol=?,interval=?,price=?,direction=?,status=?,expires_at=?,webhook_url=?,message_template=?,updated_at=?,triggered_at=?,delivery_status=?,delivery_error=? WHERE id=?")
             .bind(&alert.symbol).bind(&alert.interval).bind(alert.price).bind(&alert.direction)
             .bind(&alert.status).bind(alert.expires_at).bind(&alert.webhook_url).bind(&alert.message_template)
-            .bind(alert.updated_at).bind(alert.id).execute(&self.write_pool).await?;
+            .bind(alert.updated_at).bind(alert.triggered_at).bind(&alert.delivery_status).bind(&alert.delivery_error).bind(alert.id).execute(&self.write_pool).await?;
+        if result.rows_affected() == 1 {
+            runtime.legacy_insert(alert.clone());
+        }
         Ok(result.rows_affected() == 1)
     }
 
     pub async fn delete_alert(&self, id: i64) -> Result<bool, sqlx::Error> {
+        let mut runtime = self.price_alert_runtime.lock().await;
         let mut tx = self.write_pool.begin().await?;
+        sqlx::query("UPDATE price_alert_outbox SET status='cancelled',error='alert deleted' WHERE kind='v1' AND alert_id=? AND status='pending'")
+            .bind(id).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM alert_events WHERE alert_id=?")
             .bind(id)
             .execute(&mut *tx)
@@ -619,6 +640,7 @@ impl SqliteStore {
             .rows_affected()
             == 1;
         tx.commit().await?;
+        runtime.legacy_remove(id);
         Ok(deleted)
     }
 
@@ -633,8 +655,12 @@ impl SqliteStore {
     }
 
     pub async fn claim_alert(&self, id: i64, now_ms: i64) -> Result<bool, sqlx::Error> {
+        let mut runtime = self.price_alert_runtime.lock().await;
         let result = sqlx::query("UPDATE alerts SET status='triggered',triggered_at=?,updated_at=? WHERE id=? AND status='active' AND (expires_at IS NULL OR expires_at > ?)")
             .bind(now_ms).bind(now_ms).bind(id).bind(now_ms).execute(&self.write_pool).await?;
+        if result.rows_affected() == 1 {
+            runtime.legacy_remove(id);
+        }
         Ok(result.rows_affected() == 1)
     }
 
@@ -645,6 +671,7 @@ impl SqliteStore {
         trigger_price: f64,
         direction: &str,
     ) -> Result<bool, sqlx::Error> {
+        let mut runtime = self.price_alert_runtime.lock().await;
         let mut tx = self.write_pool.begin().await?;
         let result = sqlx::query("UPDATE alerts SET status='triggered',triggered_at=?,updated_at=? WHERE id=? AND status='active' AND (expires_at IS NULL OR expires_at > ?)")
             .bind(now_ms).bind(now_ms).bind(id).bind(now_ms).execute(&mut *tx).await?;
@@ -656,6 +683,7 @@ impl SqliteStore {
             .bind(id).bind(now_ms).bind(trigger_price).bind(direction).bind(Option::<String>::None).bind(Option::<String>::None).bind(now_ms)
             .execute(&mut *tx).await?;
         tx.commit().await?;
+        runtime.legacy_remove(id);
         Ok(true)
     }
 
@@ -665,21 +693,23 @@ impl SqliteStore {
         rows.into_iter().map(alert_event_from_row).collect()
     }
 
-    pub async fn set_alert_delivery(
+    /// Attribute a legacy receipt to its actual event, never the latest event.
+    pub async fn set_alert_event_delivery(
         &self,
-        id: i64,
+        event_id: i64,
         status: &str,
         error: Option<&str>,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE alerts SET delivery_status=?,delivery_error=?,updated_at=? WHERE id=?")
+        let mut tx = self.write_pool.begin().await?;
+        sqlx::query("UPDATE alert_events SET delivery_status=?,delivery_error=? WHERE id=?")
             .bind(status)
             .bind(error)
-            .bind(chrono::Utc::now().timestamp_millis())
-            .bind(id)
-            .execute(&self.write_pool)
+            .bind(event_id)
+            .execute(&mut *tx)
             .await?;
-        sqlx::query("UPDATE alert_events SET delivery_status=?,delivery_error=? WHERE id=(SELECT id FROM alert_events WHERE alert_id=? ORDER BY id DESC LIMIT 1)")
-            .bind(status).bind(error).bind(id).execute(&self.write_pool).await?;
+        sqlx::query("UPDATE alerts SET delivery_status=?,delivery_error=? WHERE id=(SELECT alert_id FROM alert_events WHERE id=?) AND status='triggered' AND triggered_at=(SELECT triggered_at FROM alert_events WHERE id=?) AND ?=(SELECT MAX(id) FROM alert_events WHERE alert_id=alerts.id)")
+            .bind(status).bind(error).bind(event_id).bind(event_id).bind(event_id).execute(&mut *tx).await?;
+        tx.commit().await?;
         Ok(())
     }
 }

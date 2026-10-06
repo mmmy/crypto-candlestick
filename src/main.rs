@@ -37,6 +37,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let store =
         SqliteStore::connect_with_retention(&config.database_url, config.retention_bars).await?;
+    let alert_http_client = crypto_candlestick::price_alerts::pooled_http_client()?;
+    let price_alert_delivery = crypto_candlestick::price_alerts::start_delivery_with_client(
+        store.clone(),
+        alert_http_client.clone(),
+    );
+    let price_alert_metadata = crypto_candlestick::price_alert_metadata::start_metadata(
+        store.clone(),
+        alert_http_client,
+        config
+            .subscriptions
+            .iter()
+            .map(|s| s.symbol.clone())
+            .collect(),
+    )
+    .await;
     let latest = LatestCache::default();
     let memory_series = MemorySeriesStore::new(config.retention_bars as usize);
     let closed_buffer = ClosedKlineBuffer::default();
@@ -121,6 +136,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     signal_task.abort();
+    price_alert_delivery.stop().await;
+    price_alert_metadata.stop().await;
 
     Ok(())
 }

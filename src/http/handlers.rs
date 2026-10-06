@@ -46,6 +46,7 @@ pub struct AlertPatch {
     pub interval: Option<String>,
     pub price: Option<f64>,
     pub direction: Option<String>,
+    #[serde(default, deserialize_with = "crate::price_alerts::nullable")]
     pub expires_at: Option<Option<i64>>,
     pub webhook_url: Option<String>,
     pub message_template: Option<String>,

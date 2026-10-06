@@ -261,7 +261,6 @@ pub struct BinanceWorker {
     // The permanent aggregators contain closed minutes only. Open-minute
     // updates are cumulative replacements applied to a clone for each preview.
     kline_prefix_next: HashMap<(String, String, String), i64>,
-    alert_last_sides: HashMap<i64, i8>,
 }
 
 pub type FlushLock = Arc<Mutex<()>>;
@@ -313,7 +312,6 @@ impl BinanceWorker {
             kline_initialized: BTreeSet::new(),
             kline_cursors: HashMap::new(),
             kline_prefix_next: HashMap::new(),
-            alert_last_sides: HashMap::new(),
         }
     }
 
@@ -338,6 +336,7 @@ impl BinanceWorker {
         let mut backoff_secs = 1u64;
         let mut should_catch_up_on_connect = self.catch_up_on_first_connect;
         loop {
+            self.store.reset_price_alert_baselines(None).await;
             match connect_async(&url).await {
                 Ok((ws, _)) => {
                     tracing::info!("connected to Binance websocket");
@@ -531,10 +530,11 @@ impl BinanceWorker {
         self.kline_cursors.clear();
         self.kline_prefix_next.clear();
         self.reset_kline_aggregators();
-        self.alert_last_sides.clear();
+        self.store.reset_price_alert_baselines(None).await;
     }
 
     async fn begin_trade_recovery(&mut self, symbol: &str) {
+        self.store.reset_price_alert_baselines(Some(symbol)).await;
         let market_lock = self.latest.market_update_lock();
         let _market_guard = market_lock.write().await;
         self.latest.mark_recovering(symbol).await;
@@ -757,7 +757,7 @@ impl BinanceWorker {
         self.publish_trade_snapshot(symbol, live.tick.timestamp_ms)
             .await;
         drop(_guard);
-        self.alert_last_sides.clear();
+        self.store.reset_price_alert_baselines(Some(symbol)).await;
         self.evaluate_price_alerts(symbol, live.tick.price, live.tick.timestamp_ms)
             .await;
         tracing::info!(
@@ -887,7 +887,7 @@ impl BinanceWorker {
         self.publish_trade_snapshot(symbol, live.tick.timestamp_ms)
             .await;
         drop(_market_guard);
-        self.alert_last_sides.clear();
+        self.store.reset_price_alert_baselines(Some(symbol)).await;
         self.evaluate_price_alerts(symbol, live.tick.price, live.tick.timestamp_ms)
             .await;
         tracing::info!(
@@ -1065,6 +1065,8 @@ impl BinanceWorker {
                 candle,
             } => {
                 if interval == "1" && self.accept_kline_event(&symbol, &candle, event_time_ms) {
+                    self.evaluate_price_alerts(&symbol, candle.close, event_time_ms)
+                        .await;
                     self.publish_kline_snapshot(&symbol, Some(&candle), event_time_ms)
                         .await;
                 }
@@ -1080,12 +1082,8 @@ impl BinanceWorker {
                 }
                 if let Ok(source_interval) = Interval::parse(&interval) {
                     let source = source_interval.canonical();
-                    self.evaluate_price_alerts(
-                        &symbol,
-                        candle.close,
-                        chrono::Utc::now().timestamp_millis(),
-                    )
-                    .await;
+                    self.evaluate_price_alerts(&symbol, candle.close, event_time_ms)
+                        .await;
                     self.buffer_closed_candle(&symbol, &source, candle.clone())
                         .await;
                     self.latest.remove(&symbol, &source).await;
@@ -1249,90 +1247,26 @@ impl BinanceWorker {
     }
 
     async fn evaluate_price_alerts(&mut self, symbol: &str, price: f64, now_ms: i64) {
-        let alerts = match self
-            .store
-            .active_alerts_for_symbol(&symbol.to_uppercase(), now_ms)
-            .await
-        {
-            Ok(alerts) => alerts,
-            Err(err) => {
-                tracing::warn!(symbol, "failed to load alerts: {}", err);
-                return;
-            }
-        };
-        for alert in alerts {
-            let side = if price > alert.price {
-                1
-            } else if price < alert.price {
-                -1
-            } else {
-                0
-            };
-            let previous = self.alert_last_sides.insert(alert.id, side).unwrap_or(0);
-            let crossed = side != 0
-                && previous != 0
-                && side != previous
-                && ((alert.direction == "cross_up" && previous < 0 && side > 0)
-                    || (alert.direction == "cross_down" && previous > 0 && side < 0)
-                    || (alert.direction == "cross_any"));
-            if !crossed {
-                continue;
-            }
-            let crossed_direction = if side > previous {
-                "cross_up"
-            } else {
-                "cross_down"
-            };
-            if let Ok(true) = self
+        let mut delay = Duration::from_millis(100);
+        loop {
+            match self
                 .store
-                .claim_alert_with_event(alert.id, now_ms, price, crossed_direction)
+                .evaluate_drawing_alerts(symbol, price, now_ms)
                 .await
             {
-                let store = self.store.clone();
-                tokio::spawn(async move {
-                    let body = render_alert_message(&alert.message_template, &alert, price, now_ms);
-                    let result = match serde_json::from_str::<serde_json::Value>(&body) {
-                        Ok(json) => {
-                            let client = reqwest::Client::new();
-                            let mut result = Err("webhook delivery failed".to_string());
-                            for attempt in 0..3 {
-                                result = client
-                                    .post(&alert.webhook_url)
-                                    .json(&json)
-                                    .timeout(Duration::from_secs(5))
-                                    .send()
-                                    .await
-                                    .map_err(|e| e.to_string())
-                                    .and_then(|response| {
-                                        if response.status().is_success() {
-                                            Ok(response)
-                                        } else {
-                                            Err(format!("webhook returned {}", response.status()))
-                                        }
-                                    });
-                                if result.is_ok() {
-                                    break;
-                                }
-                                if attempt < 2 {
-                                    tokio::time::sleep(Duration::from_millis(250 * (1 << attempt)))
-                                        .await;
-                                }
-                            }
-                            result
-                        }
-                        Err(e) => Err(format!("invalid rendered message JSON: {e}")),
-                    };
-                    match result {
-                        Ok(_) => {
-                            let _ = store.set_alert_delivery(alert.id, "success", None).await;
-                        }
-                        Err(err) => {
-                            let _ = store
-                                .set_alert_delivery(alert.id, "failed", Some(&err))
-                                .await;
-                        }
-                    }
-                });
+                Ok(()) => return,
+                Err(crate::price_alerts::Error::Database(error)) => {
+                    tracing::error!(
+                        symbol,
+                        "price alert persistence blocked; retaining this tick for retry: {error}"
+                    );
+                    sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_secs(1));
+                }
+                Err(error) => {
+                    tracing::error!(symbol, "price alert evaluation blocked: {error}");
+                    return;
+                }
             }
         }
     }
@@ -1508,28 +1442,6 @@ async fn stored_bucket_anchor(
         .collect::<Vec<_>>();
 
     Ok(interval.infer_bucket_anchor_ms(&open_times))
-}
-
-fn render_alert_message(
-    template: &str,
-    alert: &crate::storage::sqlite::Alert,
-    price: f64,
-    now_ms: i64,
-) -> String {
-    let mut rendered = template.to_string();
-    for (key, value) in [
-        ("{{ticker}}", alert.symbol.clone()),
-        ("{{symbol}}", alert.symbol.clone()),
-        ("{{exchange}}", "BINANCE".to_string()),
-        ("{{interval}}", alert.interval.clone()),
-        ("{{price}}", price.to_string()),
-        ("{{close}}", price.to_string()),
-        ("{{alertId}}", alert.id.to_string()),
-        ("{{time}}", now_ms.to_string()),
-    ] {
-        rendered = rendered.replace(key, &value);
-    }
-    rendered
 }
 
 pub async fn flush_closed_buffer(

@@ -1389,7 +1389,7 @@ impl SqliteStore {
         let payload = render(
             &alert.message_template,
             &[
-                ("{{ticker}}", alert.tv_symbol.clone()),
+                ("{{ticker}}", alert.symbol.clone()),
                 ("{{symbol}}", alert.symbol.clone()),
                 ("{{exchange}}", "BINANCE".into()),
                 ("{{interval}}", alert.interval.clone()),

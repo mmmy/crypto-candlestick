@@ -250,11 +250,60 @@ async fn touch_cross_once_keeps_tv_json_types_and_observed_direction() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].direction, "cross_up");
     assert_eq!(events[0].line_price, 100.0);
-    assert_eq!(events[0].payload["symbol"], "BTCUSDT.P");
+    assert_eq!(events[0].payload["symbol"], "BTCUSDT");
     assert_eq!(events[0].payload["price"], "100");
     assert_eq!(events[0].payload["period"], "60");
     assert_eq!(events[0].payload["noConfirm"], false);
     assert_eq!(store.get_price_alert(a.id).await.unwrap().revision, 2);
+}
+
+#[tokio::test]
+async fn ticker_preserves_backend_symbol_without_using_tv_alias() {
+    let store = fixture("sqlite::memory:").await;
+    store
+        .set_price_alert_metadata_fixture("SOXLUSDT", Some("0.01"), None)
+        .await
+        .unwrap();
+    let mut request = create_value("original-backend-ticker", 168.5);
+    request["symbol"] = json!("SOXLUSDT");
+    request["tvSymbol"] = json!("SOXLUSDT.P");
+    request["interval"] = json!("30");
+    request["messageTemplate"] = json!(json!({
+        "des": "{{interval}}底部合约多{{ticker}}下穿{{close}}",
+        "exchange": "BINANCE",
+        "name": "PRE-LONG",
+        "noConfirm": false,
+        "period": "{{interval}}",
+        "price": "{{close}}",
+        "side": "BUY",
+        "symbol": "{{ticker}}"
+    })
+    .to_string());
+    let alert = create(&store, request).await;
+    assert_eq!(alert.tv_symbol, "SOXLUSDT.P");
+    store
+        .evaluate_drawing_alerts("SOXLUSDT", 169.0, 10)
+        .await
+        .unwrap();
+    store
+        .evaluate_drawing_alerts("SOXLUSDT", 168.34, 11)
+        .await
+        .unwrap();
+    let events = store.price_alert_events(alert.id).await.unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].payload,
+        json!({
+            "des": "30底部合约多SOXLUSDT下穿168.34",
+            "exchange": "BINANCE",
+            "name": "PRE-LONG",
+            "noConfirm": false,
+            "period": "30",
+            "price": "168.34",
+            "side": "BUY",
+            "symbol": "SOXLUSDT"
+        })
+    );
 }
 #[tokio::test]
 async fn move_has_fresh_baseline_triggered_rearms_and_appearance_preserves_it() {

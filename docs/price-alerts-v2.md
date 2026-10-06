@@ -1,6 +1,6 @@
 # 绘图绑定价格警报 v2
 
-桌面端使用 `/api/price-alerts`，Android 原有 `/api/alerts` 继续兼容。存储初始化仅增加新表，不重建 K 线或旧警报表。不修改现有警报 JSON 正文；v1 `{{ticker}}` 保持原交易对，v2 `{{ticker}}` 使用 `tvSymbol`，本服务 Binance USDM 默认 `BTCUSDT.P`。
+桌面端使用 `/api/price-alerts`，Android 原有 `/api/alerts` 继续兼容。存储初始化仅增加新表，不重建 K 线或旧警报表。v1 / v2 的 `{{ticker}}` 均使用后端原始 `symbol`，警报消息不自动添加 TV 后缀；`tvSymbol` 保留为绘图配置字段。
 
 ## HTTP 契约
 
@@ -81,7 +81,7 @@ PATCH 可以传创建的可编辑字段和可选 `rearm:true`。`expiresAt:null`
 
 模板为 JSON 对象。字符串值内支持 `{{ticker}}/{{symbol}}/{{exchange}}/{{interval}}/{{price}}/{{close}}/{{alertId}}/{{time}}/{{eventId}}/{{linePrice}}/{{direction}}`，未知或不完整占位符返回 400。在解析后的 JSON 字符串值中替换，保留数字、布尔、数组和嵌套对象的原始类型，替换值按 JSON 正确转义。字符串占位符仍是字符串：`"price":"{{close}}"` 最终为 `"price":"65001"`。
 
-`ticker` 为 tvSymbol，`symbol` 为行情品种；`interval` 为创建时绑定的规范周期，切换桌面图表不修改它；`close/price` 为触发实时样本价；`linePrice` 为对应时刻线价。模板中的 BUY/SELL、PRE-LONG 等固定文本不会因实际上穿/下穿而自动改变。
+`ticker` 和 `symbol` 均为后端原始行情品种代码，不使用 `tvSymbol` 改写名称，也不添加或剥除后缀；例如 `symbol=SOXLUSDT` 时，`{{ticker}}` 输出 `SOXLUSDT`，即使已有绘图的 `tvSymbol=SOXLUSDT.P`。现有模板无需修改；历史已保存的事件正文保持原样。`interval` 为创建时绑定的规范周期，切换桌面图表不修改它；`close/price` 为触发实时样本价；`linePrice` 为对应时刻线价。模板中的 BUY/SELL、PRE-LONG 等固定文本不会因实际上穿/下穿而自动改变。
 
 事件：`id` 全局字符串（数据库持久随机命名空间＋绘图 ID＋布防代次）、`alertId/armGeneration/triggeredAt` 数字、`triggerPrice/linePrice` 数字、`direction`、`payload` 实际 JSON 正文、`deliveryStatus` (`pending/success/failed/cancelled`) 和 `deliveryError` 字符串/null。
 

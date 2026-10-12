@@ -21,6 +21,97 @@ async fn fixture(url: &str) -> SqliteStore {
 }
 
 #[tokio::test]
+async fn classified_active_slots_replace_atomically_and_keep_intent_in_events() {
+    let store = fixture("sqlite::memory:").await;
+    let mut first = create_value("intent-first", 100.0);
+    first["intent"] = json!("open_long");
+    let original = create(&store, first.clone()).await;
+    let mut duplicate = first.clone();
+    duplicate["mutationId"] = json!("intent-duplicate");
+    duplicate["geometry"]["first"]["price"] = json!(110.0);
+    duplicate["geometry"]["second"]["price"] = json!(110.0);
+    assert!(matches!(
+        store
+            .create_price_alert(
+                serde_json::from_value(duplicate.clone()).unwrap(),
+                &duplicate.to_string()
+            )
+            .await,
+        Err(Error::Conflict(_))
+    ));
+    assert_eq!(
+        store.get_price_alert(original.id).await.unwrap().status,
+        "active"
+    );
+    duplicate["replaceActiveId"] = json!(original.id);
+    duplicate["expectedReplaceRevision"] = json!(original.revision + 1);
+    assert!(matches!(
+        store
+            .create_price_alert(
+                serde_json::from_value(duplicate.clone()).unwrap(),
+                &duplicate.to_string()
+            )
+            .await,
+        Err(Error::Conflict(_))
+    ));
+    duplicate["expectedReplaceRevision"] = json!(original.revision);
+    duplicate["messageTemplate"] = json!(r#"{"intent":"{{intent}}"}"#);
+    let replacement = create(&store, duplicate.clone()).await;
+    assert_eq!(
+        store.get_price_alert(original.id).await.unwrap().status,
+        "disabled"
+    );
+    assert_eq!(
+        store.get_price_alert(original.id).await.unwrap().revision,
+        original.revision + 1
+    );
+    assert_eq!(create(&store, duplicate).await.id, replacement.id); // Idempotent replay.
+    let mut other = first.clone();
+    other["mutationId"] = json!("intent-other");
+    other["intent"] = json!("close_long");
+    let close = create(&store, other).await;
+    let patch = json!({"mutationId":"intent-conflicting-edit", "expectedRevision":close.revision,"intent":"open_long"});
+    assert!(matches!(
+        store
+            .patch_price_alert(
+                close.id,
+                serde_json::from_value(patch.clone()).unwrap(),
+                &patch.to_string()
+            )
+            .await,
+        Err(Error::Conflict(_))
+    ));
+    assert_eq!(
+        store.get_price_alert(close.id).await.unwrap().intent,
+        "close_long"
+    );
+    store
+        .evaluate_drawing_alerts("BTCUSDT", 105.0, 1_000)
+        .await
+        .unwrap();
+    store
+        .evaluate_drawing_alerts("BTCUSDT", 115.0, 1_001)
+        .await
+        .unwrap();
+    let events = store.price_alert_events(replacement.id).await.unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].intent, "open_long");
+    assert_eq!(events[0].payload["intent"], "open_long");
+    assert!(store
+        .price_alert_events(original.id)
+        .await
+        .unwrap()
+        .is_empty());
+    let after_trigger = create(&store, first_with_mutation(first, "intent-after-trigger")).await;
+    assert_eq!(after_trigger.status, "active");
+}
+
+fn first_with_mutation(mut value: Value, mutation: &str) -> Value {
+    value["mutationId"] = json!(mutation);
+    value
+}
+
+#[tokio::test]
 async fn decimal_ticks_round_coordinates_and_compare_fractional_trend_lines_exactly() {
     let store = fixture("sqlite::memory:").await;
     store
@@ -883,6 +974,51 @@ async fn http_v2_contract_supports_drawings_filters_null_expiry_and_recovery() {
             .unwrap()
             .status(),
         200
+    );
+    // HTTP callers cannot bypass slot uniqueness, including explicit enable.
+    let mut first = create_value("http-intent-first", 100.0);
+    first["intent"] = json!("open_short");
+    let response = client.post(&base).json(&first).send().await.unwrap();
+    assert_eq!(response.status(), 201);
+    let first_alert: PriceAlert = response.json().await.unwrap();
+    let mut second = first.clone();
+    second["mutationId"] = json!("http-intent-second");
+    assert_eq!(
+        client
+            .post(&base)
+            .json(&second)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        409
+    );
+    second["replaceActiveId"] = json!(first_alert.id);
+    second["expectedReplaceRevision"] = json!(first_alert.revision);
+    let response = client.post(&base).json(&second).send().await.unwrap();
+    assert_eq!(response.status(), 201);
+    let second_alert: PriceAlert = response.json().await.unwrap();
+    let old: PriceAlert = client
+        .get(format!("{base}/{}", first_alert.id))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(old.status, "disabled");
+    assert_eq!(client.patch(format!("{base}/{}", old.id)).json(&json!({"mutationId":"http-intent-reenable", "expectedRevision":old.revision,"status":"active"})).send().await.unwrap().status(), 409);
+    assert_eq!(
+        client
+            .get(format!("{base}/{}", second_alert.id))
+            .send()
+            .await
+            .unwrap()
+            .json::<PriceAlert>()
+            .await
+            .unwrap()
+            .intent,
+        "open_short"
     );
     server.abort();
 }

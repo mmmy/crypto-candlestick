@@ -66,6 +66,8 @@ pub struct PriceAlert {
     pub name: String,
     pub geometry: Geometry,
     pub direction: String,
+    #[serde(default = "unclassified")]
+    pub intent: String,
     pub frequency: String,
     pub status: String,
     pub expires_at: Option<i64>,
@@ -92,6 +94,8 @@ pub struct PriceAlertEvent {
     pub trigger_price: f64,
     pub line_price: f64,
     pub direction: String,
+    #[serde(default = "unclassified")]
+    pub intent: String,
     pub payload: Value,
     pub delivery_status: String,
     pub delivery_error: Option<String>,
@@ -110,6 +114,10 @@ pub struct CreateRequest {
     pub name: String,
     #[serde(default = "cross_any")]
     pub direction: String,
+    #[serde(default = "unclassified")]
+    pub intent: String,
+    pub replace_active_id: Option<i64>,
+    pub expected_replace_revision: Option<i64>,
     #[serde(default = "once")]
     pub frequency: String,
     #[serde(default = "disabled")]
@@ -129,6 +137,9 @@ pub struct CreateRequest {
 }
 fn cross_any() -> String {
     "cross_any".into()
+}
+fn unclassified() -> String {
+    "unclassified".into()
 }
 fn once() -> String {
     "once".into()
@@ -159,6 +170,9 @@ pub struct PatchRequest {
     pub name: Option<String>,
     pub geometry: Option<Geometry>,
     pub direction: Option<String>,
+    pub intent: Option<String>,
+    pub replace_active_id: Option<i64>,
+    pub expected_replace_revision: Option<i64>,
     pub frequency: Option<String>,
     pub status: Option<String>,
     #[serde(default, deserialize_with = "nullable")]
@@ -375,6 +389,7 @@ impl Runtime {
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS price_alerts (id INTEGER PRIMARY KEY AUTOINCREMENT,revision INTEGER NOT NULL,arm_generation INTEGER NOT NULL,status TEXT NOT NULL,data TEXT NOT NULL);
+CREATE UNIQUE INDEX IF NOT EXISTS price_alert_active_intent ON price_alerts(json_extract(data,'$.symbol'),json_extract(data,'$.interval'),json_extract(data,'$.intent')) WHERE status='active' AND json_extract(data,'$.intent') IN ('open_long','open_short','close_long','close_short');
 CREATE TABLE IF NOT EXISTS price_alert_events (event_id TEXT PRIMARY KEY,alert_id INTEGER NOT NULL,arm_generation INTEGER NOT NULL,triggered_at INTEGER NOT NULL,data TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS price_alert_events_alert ON price_alert_events(alert_id,triggered_at DESC);
 CREATE INDEX IF NOT EXISTS price_alert_events_generation ON price_alert_events(alert_id,arm_generation DESC);
@@ -543,6 +558,12 @@ impl SqliteStore {
 }
 
 pub fn validate(alert: &mut PriceAlert) -> Result<(), Error> {
+    if !matches!(
+        alert.intent.as_str(),
+        "unclassified" | "open_long" | "open_short" | "close_long" | "close_short"
+    ) {
+        return Err(Error::Invalid("invalid trading intent".into()));
+    }
     if alert.geometry.first.time_ms > alert.geometry.second.time_ms {
         std::mem::swap(&mut alert.geometry.first, &mut alert.geometry.second);
     }
@@ -662,6 +683,7 @@ fn validate_placeholders(value: &Value) -> Result<(), Error> {
                         | "eventId"
                         | "linePrice"
                         | "direction"
+                        | "intent"
                 ) {
                     return Err(Error::Invalid(format!(
                         "unsupported placeholder: {}",
@@ -737,6 +759,55 @@ async fn persist(
     Ok(())
 }
 
+/// Reserve a classified active slot in the same SQLite transaction as the new
+/// alert. Replacement requires both the observed ID and revision; history stays.
+async fn reserve_active_slot(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    alert: &PriceAlert,
+    replace_id: Option<i64>,
+    replace_revision: Option<i64>,
+    now: i64,
+) -> Result<Vec<PriceAlert>, Error> {
+    if replace_id.is_some() != replace_revision.is_some() {
+        return Err(Error::Invalid(
+            "replacement needs both ID and expected revision".into(),
+        ));
+    }
+    if alert.status != "active" || alert.intent == "unclassified" {
+        if replace_id.is_some() {
+            return Err(Error::Invalid(
+                "replacement requires a classified active alert".into(),
+            ));
+        }
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query_scalar::<_, String>("SELECT data FROM price_alerts WHERE status='active' AND id<>? AND json_extract(data,'$.symbol')=? AND json_extract(data,'$.interval')=? AND json_extract(data,'$.intent')=?")
+        .bind(alert.id).bind(&alert.symbol).bind(&alert.interval).bind(&alert.intent).fetch_all(&mut **tx).await?;
+    let mut retired = Vec::new();
+    let mut replaced = false;
+    for json in rows {
+        let mut existing: PriceAlert = serde_json::from_str(&json)?;
+        if existing.expires_at.is_some_and(|at| at <= now) {
+            existing.status = "expired".into();
+        } else if replace_id == Some(existing.id) && replace_revision == Some(existing.revision) {
+            existing.status = "disabled".into();
+            replaced = true;
+        } else {
+            return Err(Error::Conflict(format!("active alert already exists for {}/{}/{} (id {}, revision {}); edit it or explicitly replace it", alert.symbol, alert.interval, alert.intent, existing.id, existing.revision)));
+        }
+        existing.revision += 1;
+        existing.updated_at = now;
+        persist(tx, &existing).await?;
+        retired.push(existing);
+    }
+    if replace_id.is_some() && !replaced {
+        return Err(Error::Conflict(
+            "replacement target changed; refresh and confirm again".into(),
+        ));
+    }
+    Ok(retired)
+}
+
 impl SqliteStore {
     pub async fn create_price_alert(
         &self,
@@ -768,6 +839,7 @@ impl SqliteStore {
             name: request.name,
             geometry: request.geometry,
             direction: request.direction,
+            intent: request.intent,
             frequency: request.frequency,
             status: request.status,
             expires_at: request.expires_at,
@@ -796,10 +868,19 @@ impl SqliteStore {
         if alert.status == "active" && alert.expires_at.is_some_and(|e| e <= now) {
             alert.status = "expired".into();
         }
+        let retired = reserve_active_slot(
+            &mut tx,
+            &alert,
+            request.replace_active_id,
+            request.expected_replace_revision,
+            now,
+        )
+        .await?;
         alert.id = sqlx::query(
-            "INSERT INTO price_alerts(revision,arm_generation,status,data) VALUES(1,1,?,'')",
+            "INSERT INTO price_alerts(revision,arm_generation,status,data) VALUES(1,1,?,?)",
         )
         .bind(&alert.status)
+        .bind(serde_json::to_string(&alert)?)
         .execute(&mut *tx)
         .await?
         .last_insert_rowid();
@@ -812,6 +893,9 @@ impl SqliteStore {
         )
         .await?;
         tx.commit().await?;
+        for previous in retired {
+            runtime.upsert(previous, false);
+        }
         runtime.upsert(alert.clone(), false);
         Ok(alert)
     }
@@ -852,6 +936,7 @@ impl SqliteStore {
             name,
             geometry,
             direction,
+            intent,
             frequency,
             webhook_url,
             message_template,
@@ -934,6 +1019,14 @@ impl SqliteStore {
             alert.status = "expired".into();
         }
         validate(&mut alert)?;
+        let retired = reserve_active_slot(
+            &mut tx,
+            &alert,
+            patch.replace_active_id,
+            patch.expected_replace_revision,
+            now,
+        )
+        .await?;
         alert.revision += 1;
         alert.updated_at = now;
         persist(&mut tx, &alert).await?;
@@ -945,6 +1038,9 @@ impl SqliteStore {
         )
         .await?;
         tx.commit().await?;
+        for previous in retired {
+            runtime.upsert(previous, false);
+        }
         runtime.upsert(alert.clone(), !rearm && !geometry_changed);
         Ok(alert)
     }
@@ -1400,6 +1496,7 @@ impl SqliteStore {
                 ("{{eventId}}", event_id.clone()),
                 ("{{linePrice}}", line.to_string()),
                 ("{{direction}}", direction.into()),
+                ("{{intent}}", alert.intent.clone()),
             ],
         )?;
         let mut triggered = alert.clone();
@@ -1422,6 +1519,7 @@ impl SqliteStore {
             trigger_price: price,
             line_price: line,
             direction: direction.into(),
+            intent: alert.intent.clone(),
             payload: payload.clone(),
             delivery_status: "pending".into(),
             delivery_error: None,

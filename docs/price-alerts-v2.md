@@ -34,6 +34,7 @@
     "extend": "right"
   },
   "direction": "cross_any",
+  "intent": "open_long",
   "frequency": "once",
   "status": "active",
   "expiresAt": null,
@@ -50,6 +51,16 @@
 响应包含上述配置字段（不含 `mutationId`），加上：`id/revision/armGeneration` 数字、`triggeredAt` 数字或 null、`deliveryStatus/deliveryError` 字符串或 null、`dataStatus`、`createdAt/updatedAt` 数字。
 
 `status` 为 `active/disabled/triggered/expired`。`dataStatus` 为 `waiting_for_metadata/unavailable/waiting_for_range/range_ended/invalid_line/waiting_for_price/live/disconnected`。元数据未加载或不可用时暂停 v2 监测；拿到真实最小价位后第一次行情只建立新基线。时间范围未开始或已结束分别显示 waiting_for_range/range_ended，外推线价非正或超出整数序号范围显示 invalid_line。ready 状态不表示逐笔流质量；超过 60 秒未观察有效价格显示断流。
+
+## 交易意图与启用警报唯一性（2026-10-13）
+
+绘图配置、POST/PATCH 和触发事件新增 `intent`：`open_long`（做多）、`open_short`（做空）、`close_long`（平多）、`close_short`（平空）。旧记录及省略该字段的旧调用方为 `unclassified`（未分类），不按名称、线色、BUY/SELL 或穿越方向推断。PATCH 省略 `intent` 保持原值；非法意图返回 400。穿越 `direction` 与意图独立，意图是配置元数据，不改写已有 Webhook JSON；可在模板字符串使用 `{{intent}}`。事件保存触发当时的意图，后续编辑不回写旧事件。
+
+四种已分类意图中，同品种、同规范化周期、同意图最多一条 `active` 警报；等待价格、精度或线段范围的启用警报同样占用名额。暂停、触发、到期记录不占用名额，历史保留。旧未分类记录继续兼容，分类时才参加该约束。数据库使用部分唯一索引，POST/PATCH 在原保存事务中检查，冲突返回 409；更改绑定周期、意图及重新启用同样检查。
+
+明确替换时同时提交 `replaceActiveId` 和 `expectedReplaceRevision`。目标必须仍是该名额中启用的警报，且版本匹配；否则 409，不自动选择其他警报。服务器在单一事务中暂停旧警报（保留其 ID、历史与布防代次，递增配置版本）并保存/启用新警报，成功后再更新内存规则。已过期的占位记录在同事务中转为到期。任何校验或数据库失败都回滚，`mutationId` 重试沿用原子幂等性。未分类或非启用请求不能附带替换参数。
+
+升级只扩展 v2 JSON 与索引，不自动分类、暂停或删除现有未分类警报；v1 `/api/alerts` 不变。旧客户端可继续省略意图，编辑已分类记录时字段省略不会清除分类。新客户端必须连接支持本契约的后端；旧后端会因未知字段拒绝保存，不应静默丢弃新意图。
 
 ## 最小价位与元数据恢复
 

@@ -663,4 +663,6 @@ nextBefore为输出首根openTimeMs−1，可供旧 `/api/klines` 的endTime向�
 
 ## 绘图绑定价格警报 v2
 
+2026-10-13：v2 新增 `intent`（做多/做空/平多/平空），旧记录保持未分类。同品种、同规范化周期、同已分类意图最多一条启用警报；显式替换通过 `replaceActiveId` 与 `expectedReplaceRevision` 在保存事务中暂停旧警报并启用新警报，保留历史。字段、409 冲突和模板 `{{intent}}` 见下方详细契约。
+
 桌面端使用 /api/price-alerts，参见 [v2 详细 HTTP 契约与触发语义](price-alerts-v2.md)。原有 /api/alerts 保持 Android HTTP 字段兼容，并共享新的内存规则缓存和持久投递队列。

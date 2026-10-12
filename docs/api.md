@@ -126,6 +126,8 @@ GET /api/klines?symbol=BTCUSDT&intervals=1,5,15&limit=200&closedOnly=true
 
 ### 数据合并、缺口与历史查询
 
+上游 REST 限速会延长启动或断流恢复时间：HTTP 429 时行情补数、成交补洞及价格警报元数据共用冷却，等待后重试当前请求；成功历史页保留在 SQLite，下一轮只补剩余缺口，未确认收盘的旧 REST 行仍需补齐闭合值。重连恢复先完成历史补数，再建立 WebSocket；期间 `/api/health/deep` 的 `websocket.connected=false`、`websocket.ok=false`，`lastError` 记录恢复状态或失败原因。HTTP 已开始监听并不代表行情恢复完成；查询仍按下述合并和缺口裁剪规则返回已有数据，秒级历史仍不能通过 REST 回补。冷却与重试细节见 [README](../README.md)。
+
 分钟及以上周期合并 SQLite 与已收盘内存缓冲，同一 `openTime` 优先使用缓冲值；秒级读取内存。`closedOnly=false` 时还会合并当前 K 线缓存。
 
 合并、过滤和数量截取后，接口只保留**最后一个缺口之后的连续片段**。例如有 `00:00、00:01、00:03、00:04` 四根，只返回 `00:03、00:04`。没有补零 K 线；`count < limit` 可能是历史不足、区间限制、缺口或未配置，而不只是请求失败。

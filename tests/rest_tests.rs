@@ -426,3 +426,45 @@ async fn finds_only_missing_ranges_from_sqlite_window() {
         }]
     );
 }
+
+#[tokio::test]
+async fn formerly_dynamic_rest_candle_does_not_complete_closed_history() {
+    let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    let source = KlineSource {
+        symbol: "ETHUSDT".to_owned(),
+        canonical_interval: "1".to_owned(),
+        binance_interval: "1m",
+        interval: Interval::Minutes(1),
+    };
+    for (open_time, is_closed) in [(0, true), (60_000, false), (120_000, true)] {
+        store
+            .upsert_candle(
+                "ETHUSDT",
+                "1",
+                &Candle {
+                    open_time,
+                    close_time: open_time + 59_999,
+                    open: 100.0,
+                    high: 101.0,
+                    low: 99.0,
+                    close: 100.5,
+                    volume: 1.0,
+                    quote_volume: 100.0,
+                    trade_count: 1,
+                    is_closed,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        missing_ranges_for_source(&store, &source, 0, 120_000)
+            .await
+            .unwrap(),
+        vec![MissingKlineRange {
+            start_open_time: 60_000,
+            end_open_time: 60_000,
+            interval_ms: 60_000
+        }]
+    );
+}

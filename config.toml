@@ -52,6 +52,16 @@ symbol = "UNITREEUSDT"
 intervals = ["5", "8", "10", "15", "20", "30", "45", "60", "90", "120", "180", "240", "360", "480", "720", "D", "2D", "3D", "4D", "10D", "W"]
 source = "auto"
 
+[[binance.symbols]]
+symbol = "ETHUSDT"
+intervals = ["1", "2", "3", "5", "8", "10", "15", "20", "30", "45", "60", "90", "120", "180", "240", "360", "480", "720", "D", "2D", "3D", "4D", "10D", "W"]
+source = "auto"
+
+[[binance.symbols]]
+symbol = "SOLUSDT"
+intervals = ["1", "2", "3", "5", "8", "10", "15", "20", "30", "45", "60", "90", "120", "180", "240", "360", "480", "720", "D", "2D", "3D", "4D", "10D", "W"]
+source = "auto"
+
 [realtime]
 flush_interval_secs = 300
 flush_max_rows = 1000

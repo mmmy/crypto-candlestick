@@ -1,3 +1,4 @@
+use super::transport;
 use crate::{
     binance::worker::{KlineSource, SubscriptionPlan},
     domain::{candle::Candle, interval::Interval},
@@ -7,7 +8,6 @@ use crate::{
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::time::Duration;
-use tokio::time::sleep;
 
 const BINANCE_FAPI_BASE: &str = "https://fapi.binance.com";
 const MAX_KLINE_LIMIT: u32 = 1500;
@@ -28,7 +28,7 @@ pub(crate) async fn fetch_aggregate_trade_gap(
     first_id: i64,
     last_id: i64,
 ) -> Result<Vec<AggregateTrade>, RestError> {
-    let client = reqwest::Client::new();
+    let client = transport::client();
     fetch_aggregate_trade_gap_from(&client, BINANCE_FAPI_BASE, symbol, first_id, last_id).await
 }
 
@@ -49,19 +49,20 @@ async fn fetch_aggregate_trade_gap_from(
     let mut trades = Vec::new();
     loop {
         let limit = (last_id - next_id + 1).min(MAX_AGGREGATE_TRADE_LIMIT);
-        let payload = client
-            .get(format!("{base_url}/fapi/v1/aggTrades"))
-            .query(&[
-                ("symbol", symbol.to_string()),
-                ("fromId", next_id.to_string()),
-                ("limit", limit.to_string()),
-            ])
-            .timeout(Duration::from_secs(10))
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<Value>()
-            .await?;
+        let payload = transport::send(
+            client
+                .get(format!("{base_url}/fapi/v1/aggTrades"))
+                .query(&[
+                    ("symbol", symbol.to_string()),
+                    ("fromId", next_id.to_string()),
+                    ("limit", limit.to_string()),
+                ])
+                .timeout(Duration::from_secs(10)),
+            20,
+        )
+        .await?
+        .json::<Value>()
+        .await?;
         let rows = payload.as_array().ok_or(RestError::InvalidPayload)?;
         if rows.is_empty() {
             return Err(RestError::InvalidAggregateTradeGap(next_id));
@@ -89,7 +90,6 @@ async fn fetch_aggregate_trade_gap_from(
             }
             next_id += 1;
         }
-        sleep(Duration::from_millis(250)).await;
     }
 }
 
@@ -232,6 +232,9 @@ pub async fn missing_ranges_for_source(
         .await?;
     let existing_open_times = rows
         .into_iter()
+        // A tail source can have been refreshed before a long cooldown. Its
+        // formerly-current candle is not proof of a complete closed candle.
+        .filter(|row| row.candle.is_closed)
         .map(|row| row.candle.open_time)
         .collect::<Vec<_>>();
 
@@ -245,6 +248,14 @@ pub async fn missing_ranges_for_source(
 
 #[derive(Debug, thiserror::Error)]
 pub enum RestError {
+    #[error("Binance REST rate limited (HTTP {status}, code {code:?}): {message}; shared cooldown remains active")]
+    RateLimited {
+        status: u16,
+        code: Option<i64>,
+        message: String,
+    },
+    #[error("REST request cannot be replayed")]
+    NonReplayableRequest,
     #[error("http error: {0}")]
     Http(#[from] reqwest::Error),
     #[error("json error: {0}")]
@@ -269,8 +280,17 @@ pub async fn sync_native_klines(
     plan: &SubscriptionPlan,
     lookback_bars: u32,
 ) -> Result<(), RestError> {
-    let client = reqwest::Client::new();
+    let client = transport::client();
+    sync_native_klines_from(&client, BINANCE_FAPI_BASE, store, plan, lookback_bars).await
+}
 
+async fn sync_native_klines_from(
+    client: &reqwest::Client,
+    base_url: &str,
+    store: &SqliteStore,
+    plan: &SubscriptionPlan,
+    lookback_bars: u32,
+) -> Result<(), RestError> {
     for source in plan.kline_sources() {
         let now_ms = chrono::Utc::now().timestamp_millis();
         let anchor_ms = source_bucket_anchor(store, &source).await?;
@@ -280,8 +300,9 @@ pub async fn sync_native_klines(
 
         for range in ranges {
             for page in plan_rest_kline_pages(&range) {
-                let candles = fetch_klines_page(
-                    &client,
+                let candles = fetch_klines_page_from(
+                    client,
+                    base_url,
                     &source.symbol,
                     source.binance_interval,
                     page.start_time,
@@ -293,8 +314,6 @@ pub async fn sync_native_klines(
                 store
                     .upsert_candles(&source.symbol, &source.canonical_interval, &candles)
                     .await?;
-
-                sleep(Duration::from_millis(120)).await;
             }
         }
     }
@@ -342,14 +361,70 @@ pub async fn refresh_startup_kline_tail(
     store: &SqliteStore,
     plan: &SubscriptionPlan,
 ) -> Result<(), RestError> {
-    let client = reqwest::Client::new();
+    refresh_startup_kline_tail_from(
+        &transport::client(),
+        BINANCE_FAPI_BASE,
+        store,
+        plan,
+        &mut SyncProgress::default(),
+    )
+    .await
+}
 
+/// Completed tail sources survive failed recovery rounds. Missing historical
+/// pages are already checkpointed by their persisted closed open times.
+#[derive(Debug, Default)]
+pub struct SyncProgress {
+    refreshed_sources: HashSet<(String, String)>,
+}
+
+pub async fn synchronize_market_history(
+    store: &SqliteStore,
+    plan: &SubscriptionPlan,
+    lookback_bars: u32,
+    progress: &mut SyncProgress,
+) -> Result<(), RestError> {
+    synchronize_market_history_from(
+        &transport::client(),
+        BINANCE_FAPI_BASE,
+        store,
+        plan,
+        lookback_bars,
+        progress,
+    )
+    .await
+}
+
+pub(crate) async fn synchronize_market_history_from(
+    client: &reqwest::Client,
+    base_url: &str,
+    store: &SqliteStore,
+    plan: &SubscriptionPlan,
+    lookback_bars: u32,
+    progress: &mut SyncProgress,
+) -> Result<(), RestError> {
+    refresh_startup_kline_tail_from(client, base_url, store, plan, progress).await?;
+    sync_native_klines_from(client, base_url, store, plan, lookback_bars).await
+}
+
+async fn refresh_startup_kline_tail_from(
+    client: &reqwest::Client,
+    base_url: &str,
+    store: &SqliteStore,
+    plan: &SubscriptionPlan,
+    progress: &mut SyncProgress,
+) -> Result<(), RestError> {
     for source in plan.kline_sources() {
+        let key = (source.symbol.clone(), source.canonical_interval.clone());
+        if progress.refreshed_sources.contains(&key) {
+            continue;
+        }
         let now_ms = chrono::Utc::now().timestamp_millis();
         let anchor_ms = source_bucket_anchor(store, &source).await?;
         let page = startup_refresh_window_with_anchor(&source.interval, now_ms, anchor_ms);
-        let mut candles = fetch_klines_page(
-            &client,
+        let mut candles = fetch_klines_page_from(
+            client,
+            base_url,
             &source.symbol,
             source.binance_interval,
             page.start_time,
@@ -393,7 +468,7 @@ pub async fn refresh_startup_kline_tail(
             .upsert_candles(&source.symbol, &source.canonical_interval, &candles)
             .await?;
 
-        sleep(Duration::from_millis(120)).await;
+        progress.refreshed_sources.insert(key);
     }
 
     rebuild_custom_kline_tail(store, plan, chrono::Utc::now().timestamp_millis()).await?;
@@ -412,7 +487,7 @@ pub(crate) async fn refresh_trade_bootstrap_history(
     lookback_bars: u32,
 ) -> Result<(), RestError> {
     refresh_trade_bootstrap_history_from(
-        &reqwest::Client::new(),
+        &transport::client(),
         BINANCE_FAPI_BASE,
         store,
         plan,
@@ -722,26 +797,6 @@ fn aggregate_complete_bucket(
     aggregator.flush()
 }
 
-async fn fetch_klines_page(
-    client: &reqwest::Client,
-    symbol: &str,
-    interval: &str,
-    start_time: i64,
-    end_time: i64,
-    limit: u32,
-) -> Result<Vec<Candle>, RestError> {
-    fetch_klines_page_from(
-        client,
-        BINANCE_FAPI_BASE,
-        symbol,
-        interval,
-        start_time,
-        end_time,
-        limit,
-    )
-    .await
-}
-
 async fn fetch_klines_page_from(
     client: &reqwest::Client,
     base_url: &str,
@@ -751,21 +806,22 @@ async fn fetch_klines_page_from(
     end_time: i64,
     limit: u32,
 ) -> Result<Vec<Candle>, RestError> {
-    let payload = client
-        .get(format!("{base_url}/fapi/v1/klines"))
-        .query(&[
-            ("symbol", symbol.to_string()),
-            ("interval", interval.to_string()),
-            ("startTime", start_time.to_string()),
-            ("endTime", end_time.to_string()),
-            ("limit", limit.min(MAX_KLINE_LIMIT).to_string()),
-        ])
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<Value>()
-        .await?;
+    let payload = transport::send(
+        client
+            .get(format!("{base_url}/fapi/v1/klines"))
+            .query(&[
+                ("symbol", symbol.to_string()),
+                ("interval", interval.to_string()),
+                ("startTime", start_time.to_string()),
+                ("endTime", end_time.to_string()),
+                ("limit", limit.min(MAX_KLINE_LIMIT).to_string()),
+            ])
+            .timeout(Duration::from_secs(10)),
+        transport::kline_weight(limit.min(MAX_KLINE_LIMIT)),
+    )
+    .await?
+    .json::<Value>()
+    .await?;
 
     parse_rest_klines(payload)
 }

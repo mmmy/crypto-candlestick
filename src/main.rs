@@ -1,5 +1,5 @@
 use crypto_candlestick::binance::{
-    rest::{refresh_startup_kline_tail, sync_native_klines},
+    rest::{synchronize_market_history, SyncProgress},
     worker::{flush_closed_buffer, BinanceWorker, FlushLock, SubscriptionPlan},
 };
 use crypto_candlestick::config::AppConfig;
@@ -65,23 +65,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if !plan.streams().is_empty() {
         let mut initial_sync_completed = false;
+        let mut sync_progress = SyncProgress::default();
         if config.sync_on_start {
             tracing::info!("syncing native Binance klines before websocket startup");
-            let tail_refreshed = if let Err(err) = refresh_startup_kline_tail(&store, &plan).await {
-                tracing::warn!("startup tail refresh failed: {}", err);
-                false
-            } else {
-                true
-            };
-            let history_synced = if let Err(err) =
-                sync_native_klines(&store, &plan, config.sync_lookback_bars).await
+            initial_sync_completed = if let Err(err) = synchronize_market_history(
+                &store,
+                &plan,
+                config.sync_lookback_bars,
+                &mut sync_progress,
+            )
+            .await
             {
                 tracing::warn!("startup sync failed: {}", err);
                 false
             } else {
                 true
             };
-            initial_sync_completed = tail_refreshed && history_synced;
         }
 
         let worker = BinanceWorker::new(
@@ -95,7 +94,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             !initial_sync_completed,
             config.realtime_flush_max_rows.max(1),
             flush_lock.clone(),
-        );
+        )
+        .with_sync_progress(sync_progress);
         tokio::spawn(async move {
             worker.run().await;
         });

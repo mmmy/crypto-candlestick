@@ -266,12 +266,14 @@ pub async fn start_metadata(
 }
 
 async fn fetch(client: &reqwest::Client) -> Result<ExchangeInfo, String> {
-    let mut response = client
-        .get("https://fapi.binance.com/fapi/v1/exchangeInfo")
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await
-        .map_err(|e| format!("Binance metadata request failed: {e}"))?;
+    let mut response = crate::binance::transport::send(
+        client
+            .get("https://fapi.binance.com/fapi/v1/exchangeInfo")
+            .timeout(Duration::from_secs(10)),
+        1,
+    )
+    .await
+    .map_err(|e| format!("Binance metadata request failed: {e}"))?;
     if !response.status().is_success() {
         return Err(format!(
             "Binance exchangeInfo returned {}",

@@ -1,8 +1,8 @@
 use super::types::{parse_combined_stream_message, MarketEvent};
 use crate::{
     binance::rest::{
-        fetch_aggregate_trade_gap, refresh_startup_kline_tail, refresh_trade_bootstrap_history,
-        sync_native_klines, AggregateTrade, RestError,
+        fetch_aggregate_trade_gap, refresh_trade_bootstrap_history,
+        synchronize_market_history_from, AggregateTrade, RestError, SyncProgress,
     },
     config::{RealtimeSource, SymbolSubscription},
     domain::{candle::Candle, interval::Interval},
@@ -241,6 +241,7 @@ impl SubscriptionPlan {
 }
 
 pub struct BinanceWorker {
+    sync_progress: SyncProgress,
     store: SqliteStore,
     latest: LatestCache,
     memory_series: MemorySeriesStore,
@@ -294,6 +295,7 @@ impl BinanceWorker {
         }
 
         Self {
+            sync_progress: SyncProgress::default(),
             store,
             latest,
             memory_series,
@@ -315,7 +317,17 @@ impl BinanceWorker {
         }
     }
 
-    pub async fn run(mut self) {
+    pub fn with_sync_progress(mut self, progress: SyncProgress) -> Self {
+        self.sync_progress = progress;
+        self
+    }
+
+    pub async fn run(self) {
+        let url = self.plan.stream_url();
+        self.run_with_endpoints(&url, BINANCE_USDM_REST_BASE).await;
+    }
+
+    async fn run_with_endpoints(mut self, url: &str, rest_base: &str) {
         let streams = self.plan.streams();
         if streams.is_empty() {
             return;
@@ -331,24 +343,28 @@ impl BinanceWorker {
             tracing::warn!("failed to seed trade aggregators: {}", err);
         }
 
-        let url = self.plan.stream_url();
-
         let mut backoff_secs = 1u64;
         let mut should_catch_up_on_connect = self.catch_up_on_first_connect;
         loop {
             self.store.reset_price_alert_baselines(None).await;
-            match connect_async(&url).await {
+            // REST recovery may wait for minutes under IP throttling. Complete
+            // it before connecting so the socket does not queue stale messages
+            // or disconnect while we are blocked on a REST cooldown.
+            if should_catch_up_on_connect {
+                self.runtime_health
+                    .mark_disconnected("recovering Binance history before websocket connect")
+                    .await;
+                if let Err(err) = self.recover_on_connect(rest_base).await {
+                    tracing::warn!("websocket history catch-up pending: {}", err);
+                    self.runtime_health.mark_disconnected(err.to_string()).await;
+                    sleep(Duration::from_secs(backoff_secs)).await;
+                    backoff_secs = (backoff_secs * 2).min(30);
+                    continue;
+                }
+            }
+            match connect_async(url).await {
                 Ok((ws, _)) => {
                     tracing::info!("connected to Binance websocket");
-                    if should_catch_up_on_connect {
-                        if let Err(err) = self.recover_on_connect().await {
-                            tracing::warn!("websocket reconnect kline catch-up failed: {}", err);
-                            self.runtime_health.mark_disconnected(err.to_string()).await;
-                            sleep(Duration::from_secs(backoff_secs)).await;
-                            backoff_secs = (backoff_secs * 2).min(30);
-                            continue;
-                        }
-                    }
                     if self.trade_recovery.is_empty() {
                         self.runtime_health.mark_connected().await;
                         backoff_secs = 1;
@@ -470,6 +486,8 @@ impl BinanceWorker {
                             }
                         }
                     }
+                    // A real stream interruption needs a fresh tail next time.
+                    self.sync_progress = SyncProgress::default();
                 }
                 Err(err) => {
                     tracing::warn!("binance connect failed: {}", err);
@@ -486,15 +504,22 @@ impl BinanceWorker {
         }
     }
 
-    async fn recover_on_connect(&mut self) -> Result<(), RestError> {
+    async fn recover_on_connect(&mut self, rest_base: &str) -> Result<(), RestError> {
         let market_lock = self.latest.market_update_lock();
         let _market_guard = market_lock.write().await;
         for (symbol, _) in self.plan.trade_targets() {
             self.latest.mark_recovering(&symbol).await;
         }
         flush_closed_buffer(&self.store, &self.closed_buffer, &self.flush_lock).await;
-        refresh_startup_kline_tail(&self.store, &self.plan).await?;
-        sync_native_klines(&self.store, &self.plan, self.sync_lookback_bars).await?;
+        synchronize_market_history_from(
+            &super::transport::client(),
+            rest_base,
+            &self.store,
+            &self.plan,
+            self.sync_lookback_bars,
+            &mut self.sync_progress,
+        )
+        .await?;
         self.load_symbol_bucket_anchors().await?;
         self.reset_kline_aggregators();
         self.seed_kline_aggregators().await?;
@@ -629,7 +654,7 @@ impl BinanceWorker {
             let _guard = market_lock.write().await;
             self.latest.mark_recovering(symbol).await;
         }
-        let client = reqwest::Client::new();
+        let client = super::transport::client();
         {
             let market_lock = self.latest.market_update_lock();
             let _guard = market_lock.write().await;
@@ -1380,20 +1405,21 @@ async fn fetch_first_minute_trade_id(
     live: AggregateTrade,
 ) -> Result<i64, RestError> {
     let minute_start = Interval::Minutes(1).bucket_start_ms(live.tick.timestamp_ms);
-    let payload = client
-        .get(format!("{base_url}/fapi/v1/aggTrades"))
-        .query(&[
-            ("symbol", symbol.to_string()),
-            ("startTime", minute_start.to_string()),
-            ("endTime", live.tick.timestamp_ms.to_string()),
-            ("limit", "1".to_string()),
-        ])
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<serde_json::Value>()
-        .await?;
+    let payload = super::transport::send(
+        client
+            .get(format!("{base_url}/fapi/v1/aggTrades"))
+            .query(&[
+                ("symbol", symbol.to_string()),
+                ("startTime", minute_start.to_string()),
+                ("endTime", live.tick.timestamp_ms.to_string()),
+                ("limit", "1".to_string()),
+            ])
+            .timeout(Duration::from_secs(10)),
+        20,
+    )
+    .await?
+    .json::<serde_json::Value>()
+    .await?;
     let first = payload
         .as_array()
         .and_then(|rows| rows.first())
@@ -1468,6 +1494,205 @@ pub async fn flush_closed_buffer(
 mod tests {
     use super::*;
     use crate::config::{RealtimeSource, SymbolSubscription};
+
+    #[tokio::test]
+    async fn rate_limited_recovery_resumes_pages_before_opening_websocket() {
+        use axum::{
+            extract::Query, http::StatusCode, response::IntoResponse, routing::get, Json, Router,
+        };
+        use futures_util::SinkExt;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Mutex as StdMutex,
+        };
+
+        let requests = Arc::new(StdMutex::new(Vec::<(String, i64, u32)>::new()));
+        let sol_tail_attempts = Arc::new(AtomicUsize::new(0));
+        let eth_history_attempts = Arc::new(AtomicUsize::new(0));
+        let failed_page = Arc::new(StdMutex::new(None));
+        let (limited, mut limit_events) = tokio::sync::mpsc::unbounded_channel();
+        let app = Router::new().route(
+            "/fapi/v1/klines",
+            get({
+                let requests = requests.clone();
+                let sol_attempts = sol_tail_attempts.clone();
+                let eth_attempts = eth_history_attempts.clone();
+                let failed_page = failed_page.clone();
+                move |Query(query): Query<HashMap<String, String>>| {
+                    let requests = requests.clone();
+                    let sol_attempts = sol_attempts.clone();
+                    let eth_attempts = eth_attempts.clone();
+                    let failed_page = failed_page.clone();
+                    let limited = limited.clone();
+                    async move {
+                        let symbol = query["symbol"].clone();
+                        let start: i64 = query["startTime"].parse().unwrap();
+                        let limit: u32 = query["limit"].parse().unwrap();
+                        let key = (symbol.clone(), start, limit);
+                        requests.lock().unwrap().push(key.clone());
+                        let tail = query["endTime"].parse::<i64>().unwrap() % 60_000 != 59_999;
+                        let fail_tail = symbol == "SOLUSDT"
+                            && tail
+                            && sol_attempts.fetch_add(1, Ordering::SeqCst) < 5;
+                        let fail_page = symbol == "ETHUSDT"
+                            && !tail
+                            && eth_attempts.fetch_add(1, Ordering::SeqCst) == 1;
+                        if fail_page {
+                            *failed_page.lock().unwrap() = Some(key);
+                        }
+                        if fail_tail || fail_page {
+                            limited.send(()).unwrap();
+                            return (
+                                StatusCode::TOO_MANY_REQUESTS,
+                                [("retry-after", "0")],
+                                Json(
+                                    serde_json::json!({"code": -1003, "msg": "IP weight exceeded"}),
+                                ),
+                            )
+                                .into_response();
+                        }
+                        Json(serde_json::Value::Array(
+                            (0..limit)
+                                .map(|index| {
+                                    let open = start + i64::from(index) * 60_000;
+                                    serde_json::json!([
+                                        open,
+                                        "100",
+                                        "110",
+                                        "90",
+                                        "105",
+                                        "2",
+                                        open + 59_999,
+                                        "200",
+                                        3
+                                    ])
+                                })
+                                .collect(),
+                        ))
+                        .into_response()
+                    }
+                }
+            }),
+        );
+        let rest_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rest_url = format!("http://{}", rest_listener.local_addr().unwrap());
+        let rest_task = tokio::spawn(async move {
+            axum::serve(rest_listener, app).await.unwrap();
+        });
+        let ws_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ws_url = format!("ws://{}", ws_listener.local_addr().unwrap());
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let health = RuntimeHealth::default();
+        let worker = BinanceWorker::new(
+            store.clone(),
+            LatestCache::default(),
+            MemorySeriesStore::default(),
+            ClosedKlineBuffer::default(),
+            health.clone(),
+            SubscriptionPlan::from_subscriptions(
+                ["ETHUSDT", "SOLUSDT"]
+                    .into_iter()
+                    .map(|symbol| {
+                        SymbolSubscription::new(
+                            symbol,
+                            vec![Interval::Minutes(1)],
+                            RealtimeSource::Kline1m,
+                        )
+                    })
+                    .collect(),
+            ),
+            3000,
+            true,
+            usize::MAX,
+            Arc::new(Mutex::new(())),
+        );
+        let worker_task = tokio::spawn(async move {
+            worker.run_with_endpoints(&ws_url, &rest_url).await;
+        });
+        timeout(Duration::from_secs(3), limit_events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            timeout(Duration::from_millis(200), ws_listener.accept())
+                .await
+                .is_err(),
+            "REST cooldown must not create a websocket reconnect cycle"
+        );
+        let during = health.websocket_snapshot().await;
+        assert!(!during.connected && !during.ok);
+        assert_eq!(during.reconnect_count, 0);
+
+        let (socket, _) = timeout(Duration::from_secs(15), ws_listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let ws_task = tokio::spawn(async move {
+            let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+            ws.send(Message::Ping(Vec::new())).await.unwrap();
+            while ws.next().await.is_some() {}
+        });
+        timeout(Duration::from_secs(3), async {
+            loop {
+                let snapshot = health.websocket_snapshot().await;
+                if snapshot.connected && snapshot.last_message_at.is_some() {
+                    assert!(snapshot.ok);
+                    assert_eq!(snapshot.reconnect_count, 0);
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            sol_tail_attempts.load(Ordering::SeqCst),
+            6,
+            "five limited attempts then resume the pending source"
+        );
+        let recorded = requests.lock().unwrap().clone();
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|(symbol, _, limit)| symbol == "ETHUSDT" && *limit == 3)
+                .count(),
+            1,
+            "successful tail source must survive the exhausted retry round"
+        );
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|(symbol, _, limit)| symbol == "ETHUSDT" && *limit == 1500)
+                .count(),
+            1,
+            "successful historical page must not be downloaded again"
+        );
+        let failed = failed_page.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            recorded.iter().filter(|key| **key == failed).count(),
+            2,
+            "retry precisely the failed page"
+        );
+        for symbol in ["ETHUSDT", "SOLUSDT"] {
+            let rows = store
+                .query_klines(symbol, "1", None, None, 3100)
+                .await
+                .unwrap();
+            assert!(rows.iter().filter(|row| row.candle.is_closed).count() >= 3000);
+            assert!(rows
+                .windows(2)
+                .all(|pair| pair[1].candle.open_time - pair[0].candle.open_time == 60_000));
+        }
+        assert!(
+            timeout(Duration::from_millis(100), ws_listener.accept())
+                .await
+                .is_err(),
+            "only one websocket connection after recovery"
+        );
+        worker_task.abort();
+        ws_task.abort();
+        rest_task.abort();
+    }
 
     async fn recovery_worker() -> BinanceWorker {
         BinanceWorker::new(

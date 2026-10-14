@@ -294,20 +294,22 @@ impl SignalService {
                 symbol.signals.clear();
                 symbol.primary_signal = None;
                 for evidence in &mut symbol.per_interval_quality {
-                    evidence.availability = Availability::Stale;
-                    evidence.reason = Some("signal sampling result is stale".into());
-                    evidence.reason_code = Some(EvidenceReasonCode::SamplingStale);
-                    evidence.clear_values();
+                    evidence.invalidate(
+                        Availability::Stale,
+                        EvidenceReasonCode::SamplingStale,
+                        "signal sampling result is stale",
+                    );
                 }
             }
         }
         if control.config.enabled {
             for symbol in &mut result.results {
-                if !symbol
-                    .per_interval_quality
-                    .iter()
-                    .any(|e| e.value.is_some())
-                {
+                if !symbol.per_interval_quality.iter().any(|e| {
+                    e.value.is_some()
+                        || e.guaili_evidence
+                            .as_ref()
+                            .is_some_and(|g| g.value.is_some())
+                }) {
                     continue;
                 }
                 let live = self.inner.data.latest.live_snapshot(&symbol.symbol).await;
@@ -324,20 +326,19 @@ impl SignalService {
                     symbol.signals.clear();
                     symbol.primary_signal = None;
                     for evidence in &mut symbol.per_interval_quality {
-                        evidence.availability = if unavailable {
-                            Availability::Recovering
-                        } else {
-                            Availability::Stale
-                        };
-                        evidence.reason = Some(
-                            "current market state no longer validates the sampled result".into(),
+                        evidence.invalidate(
+                            if unavailable {
+                                Availability::Recovering
+                            } else {
+                                Availability::Stale
+                            },
+                            if unavailable {
+                                EvidenceReasonCode::MarketRecovering
+                            } else {
+                                EvidenceReasonCode::MarketStale
+                            },
+                            "current market state no longer validates the sampled result",
                         );
-                        evidence.reason_code = Some(if unavailable {
-                            EvidenceReasonCode::MarketRecovering
-                        } else {
-                            EvidenceReasonCode::MarketStale
-                        });
-                        evidence.clear_values();
                     }
                     result.status = "degraded".into();
                 }
@@ -526,9 +527,11 @@ impl SignalService {
                 result.generation = latest.as_ref().map(|live| live.generation);
                 result.market_sequence = latest.as_ref().map(|live| live.sequence);
                 for evidence in &mut result.per_interval_quality {
-                    evidence.availability = Availability::Recovering;
-                    evidence.reason = Some("market generation changed during evaluation".into());
-                    evidence.reason_code = Some(EvidenceReasonCode::MarketRecovering);
+                    evidence.invalidate(
+                        Availability::Recovering,
+                        EvidenceReasonCode::MarketRecovering,
+                        "market generation changed during evaluation",
+                    );
                 }
                 result.missing_intervals = result
                     .per_interval_quality
@@ -785,6 +788,18 @@ fn blank_envelope(
     }
 }
 
+fn unavailable(
+    mut result: IntervalEvidence,
+    availability: Availability,
+    reason_code: EvidenceReasonCode,
+    reason: &str,
+) -> IntervalEvidence {
+    result.availability = availability;
+    result.reason = Some(reason.into());
+    result.reason_code = Some(reason_code);
+    result
+}
+
 fn evaluate_series(
     config: &SignalConfig,
     interval: &str,
@@ -796,15 +811,6 @@ fn evaluate_series(
     let mut result = IntervalEvidence {
         interval: interval.into(),
         ..Default::default()
-    };
-    let unavailable = |mut result: IntervalEvidence,
-                       availability: Availability,
-                       reason_code: EvidenceReasonCode,
-                       reason: &str| {
-        result.availability = availability;
-        result.reason = Some(reason.into());
-        result.reason_code = Some(reason_code);
-        result
     };
     let Some(live) = live else {
         return unavailable(
@@ -865,7 +871,7 @@ fn evaluate_series(
         );
     }
     current.is_closed = false;
-    let Ok(mut candles) = history else {
+    let Ok(candles) = history else {
         return unavailable(
             result,
             Availability::Invalid,
@@ -889,13 +895,26 @@ fn evaluate_series(
         );
     }
     if candles.len() < config.rules.min_history_bars {
-        return unavailable(
-            result,
+        let mut signal = unavailable(
+            result.clone(),
             Availability::WarmingUp,
             EvidenceReasonCode::InsufficientHistory,
             "insufficient contiguous closed history",
         );
+        signal.guaili_evidence = Some(Box::new(evaluate_indicator(
+            config, result, candles, current,
+        )));
+        return signal;
     }
+    evaluate_indicator(config, result, candles, current)
+}
+
+fn evaluate_indicator(
+    config: &SignalConfig,
+    mut result: IntervalEvidence,
+    mut candles: Vec<Candle>,
+    current: Candle,
+) -> IntervalEvidence {
     candles.push(current);
     let points = compute_guaili(&candles, config.indicator.to_guaili_config());
     let Some(point) = points.last() else {

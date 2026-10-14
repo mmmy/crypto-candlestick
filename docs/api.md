@@ -391,6 +391,10 @@ GET /api/signals?symbols=BTCUSDT,XAUUSDT
 
 每项 `perIntervalQuality[]` 返回 `interval`、`availability`、`reason`、可选的 `reasonCode`、`value`、原始 `guaili`、`ma`、当前根 `atr14`、`atrRank`、`longTrend/shortTrend`、`historyCount`、`openTime/closeTime`、`marketEventTime`、`isClosed`。这里时间为 Unix 毫秒，区别于旧指标接口的 RFC 3339。信号引擎使用当前动态 K，因此有效证据的 `isClosed=false`。
 
+回调观察与信号历史门槛分开：连续历史不足 `ruleConfig.minHistoryBars` 时，外层证据仍为 `warming_up / insufficient_history`，数值为空并阻断原有信号规则；额外返回可选 `guailiEvidence`，字段与周期证据相同，来自同一次采样、同一组历史和当前动态 K，仅按指标自身预热及有效性判断。回调使用其有效数值，不再额外要求 60 根；真正未预热、过滤、缺口、过期、恢复或无效数据仍不参与回调。满足信号历史门槛的周期不重复返回该对象，回调直接使用外层证据。旧后端没有此字段时沿用外层证据；V2、信号投递和 `missingIntervals` 语义保持不变。
+
+例如 44 根周线已完成指标预热时，外层 `guaili=null`，`guailiEvidence` 可为 `ready` 并包含有效乖离。采样停滞、行情过期或恢复代次变化时，两者同步失效并清空数值。该对象不包含更深层的 `guailiEvidence`，客户端只在外层仅因信号历史门槛不可用时使用它，不能绕过行情质量检查。
+
 | `availability` | 是否参与结构 / 含义 |
 | --- | --- |
 | `ready` | 参与；动态 K、连续历史、时效和指标有效，ATR rank 通过 |

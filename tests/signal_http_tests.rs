@@ -71,6 +71,107 @@ impl Fixture {
             .await
             .unwrap()
     }
+
+    async fn seed_history(&self, count: i64) -> i64 {
+        use crypto_candlestick::domain::{candle::Candle, interval::Interval};
+        let now = now_ms();
+        let mut current = std::collections::HashMap::new();
+        for value in ["1", "2", "3", "5", "8"] {
+            let interval = Interval::parse(value).unwrap();
+            let duration = interval.as_millis() as i64;
+            let start = interval.bucket_start_ms(now);
+            let candle = |open_time, is_closed| Candle {
+                open_time,
+                close_time: open_time + duration - 1,
+                open: 100.0,
+                high: 101.0,
+                low: 99.0,
+                close: 100.0,
+                volume: 10.0,
+                quote_volume: 1000.0,
+                trade_count: 10,
+                is_closed,
+            };
+            for index in 1..=count {
+                self.data
+                    .store
+                    .upsert_candle("BTCUSDT", value, &candle(start - index * duration, true))
+                    .await
+                    .unwrap();
+            }
+            current.insert(value.to_string(), candle(start, false));
+        }
+        self.data
+            .latest
+            .publish_live_symbol("BTCUSDT", current, now, now)
+            .await;
+        self.service.sample_once_at(now).await;
+        now
+    }
+}
+
+#[tokio::test]
+async fn guaili_below_sixty_bars_is_available_without_enabling_signals() {
+    let fixture = Fixture::new(Some("enabled=true\nsymbols=['BTCUSDT']\n")).await;
+    fixture.seed_history(30).await;
+    let short: serde_json::Value = fixture.get("").await.json().await.unwrap();
+    assert_eq!(short["ruleConfig"]["minHistoryBars"], 60);
+    let row = &short["results"][0];
+    assert_eq!(row["dataStatus"], "warming_up");
+    assert_eq!(row["signals"], serde_json::json!([]));
+    assert_eq!(row["missingIntervals"].as_array().unwrap().len(), 5);
+    for evidence in row["perIntervalQuality"].as_array().unwrap() {
+        assert_eq!(evidence["availability"], "warming_up");
+        assert_eq!(evidence["reasonCode"], "insufficient_history");
+        assert!(evidence["value"].is_null() && evidence["guaili"].is_null());
+        let g = &evidence["guailiEvidence"];
+        assert_eq!(g["availability"], "ready");
+        assert_eq!(g["historyCount"], 30);
+        assert_eq!(g["guaili"], 0.0);
+        assert_eq!(g["value"], 0);
+        assert_eq!(g["marketEventTime"], evidence["marketEventTime"]);
+        assert_eq!(g["isClosed"], false);
+        assert!(g.get("guailiEvidence").is_none());
+    }
+
+    // A fresh fixture has no cached 30-bar history. The unchanged signal rule
+    // becomes eligible at 60 bars and produces the original compression signal.
+    let mature = Fixture::new(Some("enabled=true\nsymbols=['BTCUSDT']\n")).await;
+    mature.seed_history(60).await;
+    let full: serde_json::Value = mature.get("").await.json().await.unwrap();
+    assert_eq!(full["results"][0]["dataStatus"], "ready");
+    assert_eq!(full["results"][0]["signals"][0]["kind"], "compression");
+    for evidence in full["results"][0]["perIntervalQuality"].as_array().unwrap() {
+        assert_eq!(evidence["availability"], "ready");
+        assert!(evidence.get("guailiEvidence").is_none());
+    }
+}
+
+#[tokio::test]
+async fn short_history_guaili_still_requires_indicator_warmup_and_fresh_market() {
+    let uninitialized = Fixture::new(Some("enabled=true\nsymbols=['BTCUSDT']\n")).await;
+    uninitialized.seed_history(10).await;
+    let startup: serde_json::Value = uninitialized.get("").await.json().await.unwrap();
+    let g = &startup["results"][0]["perIntervalQuality"][0]["guailiEvidence"];
+    assert_eq!(g["availability"], "warming_up");
+    assert!(g["guaili"].is_null());
+
+    let fixture = Fixture::new(Some("enabled=true\nsymbols=['BTCUSDT']\n")).await;
+    let now = fixture.seed_history(30).await;
+    let expired = fixture.service.snapshot_at(now + 15_001).await;
+    let evidence = &expired.results[0].per_interval_quality[0];
+    assert_eq!(
+        evidence.availability,
+        crypto_candlestick::signals::model::Availability::Stale
+    );
+    assert!(evidence.guaili_evidence.as_ref().unwrap().guaili.is_none());
+
+    fixture.data.latest.mark_recovering("BTCUSDT").await;
+    let recovering: serde_json::Value = fixture.get("").await.json().await.unwrap();
+    let evidence = &recovering["results"][0]["perIntervalQuality"][0];
+    assert_eq!(evidence["availability"], "recovering");
+    assert_eq!(evidence["guailiEvidence"]["availability"], "recovering");
+    assert!(evidence["guailiEvidence"]["guaili"].is_null());
 }
 
 impl Drop for Fixture {

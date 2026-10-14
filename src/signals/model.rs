@@ -79,6 +79,10 @@ pub struct IntervalEvidence {
     pub close_time: Option<i64>,
     pub market_event_time: Option<i64>,
     pub is_closed: Option<bool>,
+    /// Indicator-valid evidence below the signal engine's history threshold.
+    /// Signal consumers continue to use the outer availability and values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guaili_evidence: Option<Box<IntervalEvidence>>,
 }
 
 impl IntervalEvidence {
@@ -91,6 +95,24 @@ impl IntervalEvidence {
         self.atr_rank = None;
         self.long_trend = None;
         self.short_trend = None;
+        if let Some(evidence) = &mut self.guaili_evidence {
+            evidence.clear_values();
+        }
+    }
+
+    pub fn invalidate(
+        &mut self,
+        availability: Availability,
+        reason_code: EvidenceReasonCode,
+        reason: &str,
+    ) {
+        self.availability = availability;
+        self.reason_code = Some(reason_code);
+        self.reason = Some(reason.into());
+        self.clear_values();
+        if let Some(evidence) = &mut self.guaili_evidence {
+            evidence.invalidate(availability, reason_code, reason);
+        }
     }
 }
 
